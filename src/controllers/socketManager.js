@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
+import { registerRandomCallHandlers } from "./randomCallManager.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "engaze_super_secret_jwt_key_2026_dev_secure";
 
@@ -48,7 +49,12 @@ export const connectToSocket = (server) => {
 
     io.on("connection", (socket) => {
         // ==========================================
-        // 1. MATCH-BASED PRIVATE CHAT EVENTS
+        // 1. RANDOM 1-TO-1 VIDEO MATCHMAKING EVENTS
+        // ==========================================
+        registerRandomCallHandlers(io, socket);
+
+        // ==========================================
+        // 2. MATCH-BASED PRIVATE CHAT EVENTS
         // ==========================================
 
         // Event: Join a private match conversation room
