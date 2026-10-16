@@ -12,9 +12,26 @@ let messages = {};
 let timeOnline = {};
 
 export const connectToSocket = (server) => {
+    const allowedSocketOrigins = [
+        "https://engaze-com.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        process.env.CLIENT_URL,
+    ].filter(Boolean);
+
     const io = new Server(server, {
         cors: {
-            origin: "*",
+            origin: (origin, callback) => {
+                if (!origin) return callback(null, true);
+                if (
+                    allowedSocketOrigins.includes(origin) ||
+                    origin.endsWith(".vercel.app") ||
+                    process.env.NODE_ENV !== "production"
+                ) {
+                    return callback(null, true);
+                }
+                return callback(null, true);
+            },
             methods: ["GET", "POST"],
             allowedHeaders: ["*"],
             credentials: true,
