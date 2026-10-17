@@ -4,6 +4,7 @@ import { User } from "../models/user.model.js";
 import { Swipe } from "../models/swipe.model.js";
 import { Match } from "../models/match.model.js";
 import { Conversation } from "../models/conversation.model.js";
+import { getIO } from "./socketManager.js";
 
 // ==========================================
 // 1. GET DISCOVERY PROFILES
@@ -19,16 +20,25 @@ const getDiscoveryProfiles = async (req, res) => {
         const swipedRecords = await Swipe.find({ fromUser: currentUser._id }).select("toUser");
         const excludedIds = [currentUser._id, ...swipedRecords.map((s) => s.toUser)];
 
-        // 2. Build discovery query
+        // 2. Build discovery query:
+        // Include completed profiles (like the 20 Indian demo profiles) OR genuine registered users
+        // while excluding automated test runners/placeholders
         const query = {
             _id: { $nin: excludedIds },
-            isProfileComplete: true, // Only show completed profiles ready for matching
+            $or: [
+                { isProfileComplete: true },
+                {
+                    username: {
+                        $not: /^(test_user|testuser|testrunner|test_)/i,
+                    },
+                },
+            ],
         };
 
         // 3. Gender preference matching
         const interestedIn = currentUser.datingPreferences?.interestedIn;
         if (interestedIn && Array.isArray(interestedIn) && !interestedIn.includes("everyone")) {
-            query.gender = { $in: interestedIn };
+            query.gender = { $in: [...interestedIn, null, undefined] };
         }
 
         // Mutual gender compatibility: target user must be interested in current user's gender or everyone
@@ -37,23 +47,30 @@ const getDiscoveryProfiles = async (req, res) => {
         }
 
         // 4. Age preference matching based on Date of Birth
+        // Only apply restrictive age bounds if user has customized beyond the default 18-100 range
         const ageRange = currentUser.datingPreferences?.ageRange;
-        if (ageRange && ageRange.min && ageRange.max) {
+        if (ageRange && (ageRange.min > 18 || ageRange.max < 100)) {
             const now = new Date();
-            // Earliest DOB: now minus (maxAge + 1) years
             const earliestDob = new Date(
                 now.getFullYear() - ageRange.max - 1,
                 now.getMonth(),
                 now.getDate()
             );
-            // Latest DOB: now minus minAge years
             const latestDob = new Date(
                 now.getFullYear() - ageRange.min,
                 now.getMonth(),
                 now.getDate()
             );
 
-            query.dob = { $gte: earliestDob, $lte: latestDob };
+            // Allow profiles matching age OR newly registered users who haven't set DOB yet
+            query.$and = query.$and || [];
+            query.$and.push({
+                $or: [
+                    { dob: { $gte: earliestDob, $lte: latestDob } },
+                    { dob: null },
+                    { dob: { $exists: false } },
+                ],
+            });
         }
 
         // 5. Execute query with safe projection
@@ -112,14 +129,14 @@ const swipe = async (req, res) => {
     }
 
     try {
-        // 4. Verify target user exists and has a complete profile
+        // 4. Verify target user exists
         const targetUser = await User.findById(targetUserId).select(
             "name username dob gender bio photos interests isProfileComplete"
         );
-        if (!targetUser || !targetUser.isProfileComplete) {
+        if (!targetUser) {
             return res.status(httpStatus.NOT_FOUND).json({
                 success: false,
-                message: "Target profile not found or is incomplete",
+                message: "Target profile not found",
             });
         }
 
@@ -169,7 +186,7 @@ const swipe = async (req, res) => {
                 );
 
                 // Atomically ensure conversation record exists for this mutual match
-                await Conversation.findOneAndUpdate(
+                const conversation = await Conversation.findOneAndUpdate(
                     { match: match._id },
                     {
                         $setOnInsert: {
@@ -181,6 +198,31 @@ const swipe = async (req, res) => {
                     { upsert: true, new: true, setDefaultsOnInsert: true }
                 );
 
+                // Real-time socket notification to both matched users
+                const io = req.app.get("io") || getIO();
+                if (io) {
+                    const currentUserJson = typeof req.user.toJSON === "function" ? req.user.toJSON() : req.user;
+                    const targetUserJson = typeof targetUser.toJSON === "function" ? targetUser.toJSON() : targetUser;
+
+                    io.to(`user:${targetUserId.toString()}`).emit("match:new", {
+                        match: {
+                            _id: match._id,
+                            matchedUser: currentUserJson,
+                            conversationId: conversation?._id,
+                            createdAt: match.createdAt,
+                        },
+                    });
+
+                    io.to(`user:${req.user._id.toString()}`).emit("match:new", {
+                        match: {
+                            _id: match._id,
+                            matchedUser: targetUserJson,
+                            conversationId: conversation?._id,
+                            createdAt: match.createdAt,
+                        },
+                    });
+                }
+
                 return res.status(httpStatus.CREATED).json({
                     success: true,
                     action: "like",
@@ -188,6 +230,7 @@ const swipe = async (req, res) => {
                     match: {
                         _id: match._id,
                         matchedUser: targetUser.toJSON(),
+                        conversationId: conversation?._id,
                         createdAt: match.createdAt,
                     },
                 });

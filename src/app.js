@@ -30,7 +30,8 @@ if (!process.env.JWT_SECRET) {
 
 const app = express();
 const server = createServer(app);
-connectToSocket(server);
+const io = connectToSocket(server);
+app.set("io", io);
 
 app.set("port", process.env.PORT || 8000);
 

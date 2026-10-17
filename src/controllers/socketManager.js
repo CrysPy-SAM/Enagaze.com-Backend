@@ -10,6 +10,9 @@ const JWT_SECRET = process.env.JWT_SECRET || "engaze_super_secret_jwt_key_2026_d
 let connections = {};
 let messages = {};
 let timeOnline = {};
+let ioInstance = null;
+
+export const getIO = () => ioInstance;
 
 export const connectToSocket = (server) => {
     const allowedSocketOrigins = [
@@ -64,7 +67,14 @@ export const connectToSocket = (server) => {
         next();
     });
 
+    ioInstance = io;
+
     io.on("connection", (socket) => {
+        // Automatically join authenticated user room for real-time delivery and match notifications
+        if (socket.userId) {
+            socket.join(`user:${socket.userId.toString()}`);
+        }
+
         // ==========================================
         // 1. RANDOM 1-TO-1 VIDEO MATCHMAKING EVENTS
         // ==========================================
@@ -211,9 +221,15 @@ export const connectToSocket = (server) => {
                 await newMsg.populate({ path: "sender", select: "name username photos" });
                 const messageJson = newMsg.toJSON();
 
-                // Broadcast exclusively to participants in this conversation room
+                // Broadcast to conversation room AND all participant user rooms (deduplicated by socket.io)
                 const roomName = `conversation:${conversationId}`;
-                io.to(roomName).emit("chat:new-message", messageJson);
+                let broadcast = io.to(roomName);
+                if (Array.isArray(conversation.participants)) {
+                    for (const p of conversation.participants) {
+                        broadcast = broadcast.to(`user:${p.toString()}`);
+                    }
+                }
+                broadcast.emit("chat:new-message", messageJson);
 
                 if (typeof ack === "function") {
                     ack({ success: true, message: messageJson });
