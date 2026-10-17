@@ -279,7 +279,13 @@ const markConversationAsRead = async (req, res) => {
         const io = req.app?.get("io") || getIO();
         if (io) {
             const roomName = `conversation:${conversationId}`;
-            io.to(roomName).emit("chat:read", {
+            let broadcast = io.to(roomName);
+            if (Array.isArray(conversation.participants)) {
+                for (const p of conversation.participants) {
+                    broadcast = broadcast.to(`user:${p.toString()}`);
+                }
+            }
+            broadcast.emit("chat:read", {
                 conversationId,
                 readerId: req.user._id,
             });

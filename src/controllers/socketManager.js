@@ -282,7 +282,15 @@ export const connectToSocket = (server) => {
                 );
 
                 const roomName = `conversation:${conversationId}`;
-                socket.to(roomName).emit("chat:read", {
+                let broadcast = socket.to(roomName);
+                if (Array.isArray(conversation.participants)) {
+                    for (const p of conversation.participants) {
+                        if (p.toString() !== socket.userId.toString()) {
+                            broadcast = broadcast.to(`user:${p.toString()}`);
+                        }
+                    }
+                }
+                broadcast.emit("chat:read", {
                     conversationId,
                     readerId: socket.userId,
                 });
