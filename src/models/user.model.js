@@ -18,9 +18,30 @@ const userSchema = new Schema(
             maxlength: [30, "Username cannot exceed 30 characters"],
             match: [/^[a-zA-Z0-9_.-]+$/, "Username can only contain alphanumeric characters, dots, underscores, and dashes"]
         },
+        email: {
+            type: String,
+            sparse: true,
+            trim: true,
+            lowercase: true,
+        },
+        googleId: {
+            type: String,
+            sparse: true,
+            unique: true,
+        },
+        authProvider: {
+            type: String,
+            enum: ["local", "google"],
+            default: "local",
+        },
         password: { 
             type: String, 
-            required: [true, "Password is required"],
+            required: [
+                function() {
+                    return !this.googleId && this.authProvider !== "google";
+                },
+                "Password is required"
+            ],
             minlength: [6, "Password must be at least 6 characters"]
         },
         token: { 

@@ -1,6 +1,7 @@
 import httpStatus from "http-status";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { OAuth2Client } from "google-auth-library";
 import { User } from "../models/user.model.js";
 import { Meeting } from "../models/meeting.model.js";
 
@@ -452,11 +453,155 @@ const addToHistory = async (req, res) => {
     }
 };
 
+// Helper: Generate a unique, sanitized username for new Google users
+const generateUniqueUsername = async (candidate) => {
+    let clean = (candidate || "user")
+        .toLowerCase()
+        .replace(/[^a-zA-Z0-9_.-]/g, "")
+        .replace(/^[^a-zA-Z0-9]+/, "")
+        .slice(0, 20);
+
+    if (clean.length < 3) {
+        clean = `user_${Math.random().toString(36).substring(2, 7)}`;
+    }
+
+    let username = clean;
+    let counter = 1;
+    while (await User.findOne({ username })) {
+        const suffix = `_${counter}`;
+        username = `${clean.slice(0, 30 - suffix.length)}${suffix}`;
+        counter++;
+    }
+    return username;
+};
+
+// ==========================================
+// 6. GOOGLE AUTHENTICATION (LOGIN & SIGNUP)
+// ==========================================
+const googleLogin = async (req, res) => {
+    const { idToken } = req.body;
+
+    if (!idToken) {
+        return res.status(httpStatus.BAD_REQUEST).json({
+            success: false,
+            message: "Google ID token is required",
+        });
+    }
+
+    const configuredClientId = process.env.GOOGLE_CLIENT_ID;
+    if (!configuredClientId) {
+        console.error("GOOGLE_CLIENT_ID is not configured in backend environment variables.");
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Google Authentication is not configured on the server",
+        });
+    }
+
+    try {
+        const client = new OAuth2Client(configuredClientId);
+        const ticket = await client.verifyIdToken({
+            idToken,
+            audience: configuredClientId,
+        });
+
+        const payload = ticket.getPayload();
+        if (!payload || !payload.sub) {
+            return res.status(httpStatus.UNAUTHORIZED).json({
+                success: false,
+                message: "Invalid Google token payload",
+            });
+        }
+
+        const googleId = payload.sub;
+        const email = payload.email ? payload.email.toLowerCase().trim() : null;
+        const name = payload.name || payload.given_name || "Google User";
+        const picture = payload.picture || null;
+
+        // 1. Check if user already exists with this verified googleId
+        let user = await User.findOne({ googleId });
+
+        if (user) {
+            const token = generateToken(user);
+            user.token = token;
+            if ((!user.photos || user.photos.length === 0) && picture) {
+                user.photos = [picture];
+            }
+            await user.save();
+
+            return res.status(httpStatus.OK).json({
+                success: true,
+                message: "Google authentication successful",
+                token,
+                user: user.toJSON(),
+            });
+        }
+
+        // 2. Safe account linking: prevent collision with existing password-based accounts
+        if (email) {
+            const existingEmailUser = await User.findOne({ email });
+            if (existingEmailUser) {
+                if (existingEmailUser.googleId && existingEmailUser.googleId !== googleId) {
+                    return res.status(httpStatus.CONFLICT).json({
+                        success: false,
+                        message: "This email is associated with a different Google account.",
+                    });
+                }
+                // Do not automatically link if account was registered with password
+                if (!existingEmailUser.googleId) {
+                    return res.status(httpStatus.CONFLICT).json({
+                        success: false,
+                        message: "An account with this email already exists using password sign-in. Please log in with your username and password.",
+                    });
+                }
+            }
+        }
+
+        // 3. New Google User Signup: Create user record
+        const baseCandidate = email ? email.split("@")[0] : name;
+        const username = await generateUniqueUsername(baseCandidate);
+
+        const newUser = new User({
+            name: name.slice(0, 100),
+            username,
+            email: email || undefined,
+            googleId,
+            authProvider: "google",
+            photos: picture ? [picture] : [],
+            isProfileComplete: false,
+        });
+
+        const token = generateToken(newUser);
+        newUser.token = token;
+        await newUser.save();
+
+        return res.status(httpStatus.CREATED).json({
+            success: true,
+            message: "Google account created successfully",
+            token,
+            user: newUser.toJSON(),
+        });
+    } catch (err) {
+        console.error("Google authentication error:", err.message);
+        if (err.code === "ENOTFOUND" || err.code === "ETIMEDOUT" || err.code === "ECONNREFUSED") {
+            return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+                success: false,
+                message: "Unable to reach Google authentication servers. Please try again later.",
+            });
+        }
+
+        return res.status(httpStatus.UNAUTHORIZED).json({
+            success: false,
+            message: "Google token verification failed or expired. Please try again.",
+        });
+    }
+};
+
 export {
     login,
     register,
     getMyProfile,
     updateMyProfile,
     getUserHistory,
-    addToHistory
+    addToHistory,
+    googleLogin
 };

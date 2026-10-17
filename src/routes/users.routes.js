@@ -5,7 +5,8 @@ import {
     getMyProfile,
     updateMyProfile,
     getUserHistory,
-    addToHistory
+    addToHistory,
+    googleLogin
 } from "../controllers/user.controller.js";
 import { protect } from "../middlewares/auth.middleware.js";
 
@@ -14,6 +15,7 @@ const router = Router();
 // Public auth endpoints
 router.route("/login").post(login);
 router.route("/register").post(register);
+router.route("/google-login").post(googleLogin);
 
 // Protected profile endpoints
 router.route("/profile/me")
