@@ -40,10 +40,17 @@ function endActiveCall(callId, initiatorSocketId, reason, io) {
     const call = activeCalls.get(callId);
     if (!call) return null;
 
-    // Notify partner peer if still connected
+    const roomName = `random-call:${callId}`;
+
+    // Notify partner peer if still connected and leave room
     for (const peer of call.peers) {
         socketToCall.delete(peer.socketId);
         userToCall.delete(peer.userId);
+
+        const peerSocket = io.sockets.sockets.get(peer.socketId);
+        if (peerSocket) {
+            peerSocket.leave(roomName);
+        }
 
         if (peer.socketId !== initiatorSocketId) {
             io.to(peer.socketId).emit("random:call-ended", {
@@ -78,6 +85,109 @@ async function getPublicProfile(userId) {
 }
 
 /**
+ * Atomically match a socket with a waiting peer or insert into the matchmaking queue
+ */
+async function matchOrQueueUser(io, socket, ack) {
+    const userIdStr = socket.userId.toString();
+
+    // Prevent duplicate queue entries for the same user or socket
+    removeFromQueue(socket.id, userIdStr);
+
+    // Fetch user profile for matchmaking card
+    const userProfile = await getPublicProfile(socket.userId);
+
+    // Atomic candidate search: Find eligible peer already waiting in queue
+    let candidate = null;
+    while (matchmakingQueue.length > 0) {
+        const nextInLine = matchmakingQueue.shift();
+
+        // Self-matching prevention
+        if (nextInLine.userId === userIdStr || nextInLine.socketId === socket.id) {
+            continue; // Skip and discard duplicate self-entries
+        }
+
+        // Verify candidate socket is still connected
+        const candidateSocket = io.sockets.sockets.get(nextInLine.socketId);
+        if (candidateSocket && candidateSocket.connected) {
+            candidate = nextInLine;
+            break;
+        }
+        // Disconnected candidate automatically discarded
+    }
+
+    if (candidate) {
+        // MATCH FOUND! Atomically create private 2-person call session
+        const callId = `call_${crypto.randomUUID()}`;
+        const roomName = `random-call:${callId}`;
+
+        const peerA = {
+            socketId: candidate.socketId,
+            userId: candidate.userId,
+            userProfile: candidate.userProfile,
+            isInitiator: true, // Caller: creates offer
+        };
+        const peerB = {
+            socketId: socket.id,
+            userId: userIdStr,
+            userProfile: userProfile,
+            isInitiator: false, // Callee: awaits offer, responds with answer
+        };
+
+        const callSession = {
+            callId,
+            peers: [peerA, peerB],
+            startedAt: Date.now(),
+        };
+
+        activeCalls.set(callId, callSession);
+        socketToCall.set(peerA.socketId, callId);
+        socketToCall.set(peerB.socketId, callId);
+        userToCall.set(peerA.userId, callId);
+        userToCall.set(peerB.userId, callId);
+
+        // Join isolated Socket.io room
+        const candidateSocket = io.sockets.sockets.get(candidate.socketId);
+        if (candidateSocket) candidateSocket.join(roomName);
+        socket.join(roomName);
+
+        // Notify candidate (Initiator)
+        io.to(peerA.socketId).emit("random:matched", {
+            callId,
+            isInitiator: true,
+            partner: peerB.userProfile,
+        });
+
+        // Notify current socket (Receiver)
+        io.to(peerB.socketId).emit("random:matched", {
+            callId,
+            isInitiator: false,
+            partner: peerA.userProfile,
+        });
+
+        if (typeof ack === "function") {
+            ack({ success: true, status: "matched", callId });
+        }
+    } else {
+        // No eligible partner waiting: Add to queue
+        matchmakingQueue.push({
+            socketId: socket.id,
+            userId: userIdStr,
+            userProfile,
+            joinedAt: Date.now(),
+        });
+
+        socket.emit("random:queue-joined", {
+            status: "waiting",
+            message: "Looking for an available match...",
+        });
+
+        if (typeof ack === "function") {
+            ack({ success: true, status: "waiting" });
+        }
+    }
+}
+
+/**
  * Register all Random 1-to-1 Video Matchmaking event handlers on a socket
  */
 export function registerRandomCallHandlers(io, socket) {
@@ -100,106 +210,7 @@ export function registerRandomCallHandlers(io, socket) {
             endActiveCall(currentCallId, socket.id, "started_new_search", io);
         }
 
-        // Prevent duplicate queue entries for the same user or socket
-        if (isUserInQueue(socket.id, userIdStr)) {
-            const err = { message: "You are already in the matchmaking queue" };
-            socket.emit("random:error", err);
-            if (typeof ack === "function") ack({ success: false, ...err });
-            return;
-        }
-
-        // Fetch user profile for matchmaking card
-        const userProfile = await getPublicProfile(socket.userId);
-
-        // Atomic candidate search: Find eligible peer already waiting in queue
-        let candidate = null;
-        while (matchmakingQueue.length > 0) {
-            const nextInLine = matchmakingQueue.shift();
-
-            // Self-matching prevention
-            if (nextInLine.userId === userIdStr || nextInLine.socketId === socket.id) {
-                continue; // Skip and discard duplicate self-entries
-            }
-
-            // Verify candidate socket is still connected
-            const candidateSocket = io.sockets.sockets.get(nextInLine.socketId);
-            if (candidateSocket && candidateSocket.connected) {
-                candidate = nextInLine;
-                break;
-            }
-            // Disconnected candidate automatically discarded
-        }
-
-        if (candidate) {
-            // MATCH FOUND! Atomically create private 2-person call session
-            const callId = `call_${crypto.randomUUID()}`;
-            const roomName = `random-call:${callId}`;
-
-            const peerA = {
-                socketId: candidate.socketId,
-                userId: candidate.userId,
-                userProfile: candidate.userProfile,
-                isInitiator: true, // Caller: creates offer
-            };
-            const peerB = {
-                socketId: socket.id,
-                userId: userIdStr,
-                userProfile: userProfile,
-                isInitiator: false, // Callee: awaits offer, responds with answer
-            };
-
-            const callSession = {
-                callId,
-                peers: [peerA, peerB],
-                startedAt: Date.now(),
-            };
-
-            activeCalls.set(callId, callSession);
-            socketToCall.set(peerA.socketId, callId);
-            socketToCall.set(peerB.socketId, callId);
-            userToCall.set(peerA.userId, callId);
-            userToCall.set(peerB.userId, callId);
-
-            // Join isolated Socket.io room
-            const candidateSocket = io.sockets.sockets.get(candidate.socketId);
-            if (candidateSocket) candidateSocket.join(roomName);
-            socket.join(roomName);
-
-            // Notify candidate (Initiator)
-            io.to(peerA.socketId).emit("random:matched", {
-                callId,
-                isInitiator: true,
-                partner: peerB.userProfile,
-            });
-
-            // Notify current socket (Receiver)
-            io.to(peerB.socketId).emit("random:matched", {
-                callId,
-                isInitiator: false,
-                partner: peerA.userProfile,
-            });
-
-            if (typeof ack === "function") {
-                ack({ success: true, status: "matched", callId });
-            }
-        } else {
-            // No eligible partner waiting: Add to queue
-            matchmakingQueue.push({
-                socketId: socket.id,
-                userId: userIdStr,
-                userProfile,
-                joinedAt: Date.now(),
-            });
-
-            socket.emit("random:queue-joined", {
-                status: "waiting",
-                message: "Looking for an available match...",
-            });
-
-            if (typeof ack === "function") {
-                ack({ success: true, status: "waiting" });
-            }
-        }
+        await matchOrQueueUser(io, socket, ack);
     });
 
     // -------------------------------------------------------------
@@ -293,16 +304,20 @@ export function registerRandomCallHandlers(io, socket) {
     // 5. Next Match (Skip to next user)
     // -------------------------------------------------------------
     socket.on("random:next", async (data, ack) => {
+        if (!socket.userId) {
+            const err = { message: "Authentication required to find next match" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
         const callId = data?.callId || socketToCall.get(socket.id);
         if (callId) {
             endActiveCall(callId, socket.id, "skipped_by_partner", io);
         }
 
-        // Immediately rejoin queue
-        socket.emit("random:rejoin-queue");
-        if (typeof ack === "function") {
-            ack({ success: true });
-        }
+        // Atomically match with a waiting partner or re-enter the queue
+        await matchOrQueueUser(io, socket, ack);
     });
 
     // -------------------------------------------------------------

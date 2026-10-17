@@ -16,9 +16,19 @@ const getDiscoveryProfiles = async (req, res) => {
         const limit = Math.min(30, Math.max(1, parseInt(req.query.limit, 10) || 10));
         const skip = (page - 1) * limit;
 
-        // 1. Fetch IDs of profiles the user has already swiped on (liked or passed)
-        const swipedRecords = await Swipe.find({ fromUser: currentUser._id }).select("toUser");
-        const excludedIds = [currentUser._id, ...swipedRecords.map((s) => s.toUser)];
+        // 1. Fetch IDs of profiles the user has already swiped on (liked or passed) AND already matched users
+        const [swipedRecords, existingMatches] = await Promise.all([
+            Swipe.find({ fromUser: currentUser._id }).select("toUser"),
+            Match.find({ users: currentUser._id }).select("users"),
+        ]);
+        const matchedUserIds = existingMatches.flatMap((m) =>
+            m.users.filter((u) => u && u.toString() !== currentUser._id.toString())
+        );
+        const excludedIds = [
+            currentUser._id,
+            ...swipedRecords.map((s) => s.toUser),
+            ...matchedUserIds,
+        ];
 
         // 2. Build discovery query:
         // Include completed profiles (like the 20 Indian demo profiles) OR genuine registered users
@@ -37,13 +47,28 @@ const getDiscoveryProfiles = async (req, res) => {
 
         // 3. Gender preference matching
         const interestedIn = currentUser.datingPreferences?.interestedIn;
-        if (interestedIn && Array.isArray(interestedIn) && !interestedIn.includes("everyone")) {
-            query.gender = { $in: [...interestedIn, null, undefined] };
+        if (interestedIn && Array.isArray(interestedIn) && !interestedIn.includes("everyone") && interestedIn.length > 0) {
+            query.$and = query.$and || [];
+            query.$and.push({
+                $or: [
+                    { gender: { $in: interestedIn } },
+                    { gender: null },
+                    { gender: { $exists: false } },
+                ],
+            });
         }
 
-        // Mutual gender compatibility: target user must be interested in current user's gender or everyone
+        // Mutual gender compatibility: target user must be interested in current user's gender, everyone, or unconfigured
         if (currentUser.gender) {
-            query["datingPreferences.interestedIn"] = { $in: [currentUser.gender, "everyone"] };
+            query.$and = query.$and || [];
+            query.$and.push({
+                $or: [
+                    { "datingPreferences.interestedIn": { $in: [currentUser.gender, "everyone"] } },
+                    { "datingPreferences.interestedIn": { $exists: false } },
+                    { "datingPreferences.interestedIn": null },
+                    { "datingPreferences.interestedIn": { $size: 0 } },
+                ],
+            });
         }
 
         // 4. Age preference matching based on Date of Birth
@@ -281,7 +306,12 @@ const getMatches = async (req, res) => {
                 select: "name username dob gender bio photos interests",
             });
 
-        // Format each match with safe profile summary of the OTHER participant
+        // Fetch corresponding conversation IDs for these matches
+        const matchIds = matches.map((m) => m._id);
+        const conversations = await Conversation.find({ match: { $in: matchIds } }).select("_id match");
+        const matchToConvMap = new Map(conversations.map((c) => [c.match.toString(), c._id]));
+
+        // Format each match with safe profile summary of the OTHER participant and its conversationId
         const formattedMatches = matches
             .map((m) => {
                 const otherUser = m.users.find(
@@ -291,6 +321,7 @@ const getMatches = async (req, res) => {
 
                 return {
                     _id: m._id,
+                    conversationId: matchToConvMap.get(m._id.toString()) || null,
                     matchedUser: otherUser.toJSON(),
                     createdAt: m.createdAt,
                 };

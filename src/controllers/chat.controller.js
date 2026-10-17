@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
 import { Match } from "../models/match.model.js";
+import { getIO } from "./socketManager.js";
 
 // ==========================================
 // 1. GET ALL CONVERSATIONS FOR CURRENT USER
@@ -274,6 +275,22 @@ const markConversationAsRead = async (req, res) => {
             }
         );
 
+        // Real-time notification to conversation room and participants
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            const roomName = `conversation:${conversationId}`;
+            let broadcast = io.to(roomName);
+            if (Array.isArray(conversation.participants)) {
+                for (const p of conversation.participants) {
+                    broadcast = broadcast.to(`user:${p.toString()}`);
+                }
+            }
+            broadcast.emit("chat:read", {
+                conversationId,
+                readerId: req.user._id,
+            });
+        }
+
         return res.status(httpStatus.OK).json({
             success: true,
             message: "Messages marked as read",
@@ -368,10 +385,24 @@ const sendMessageRest = async (req, res) => {
         await conversation.save();
 
         await newMessage.populate({ path: "sender", select: "name username photos" });
+        const messageJson = newMessage.toJSON();
+
+        // Broadcast to conversation room AND all participant user rooms
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            const roomName = `conversation:${conversationId}`;
+            let broadcast = io.to(roomName);
+            if (Array.isArray(conversation.participants)) {
+                for (const p of conversation.participants) {
+                    broadcast = broadcast.to(`user:${p.toString()}`);
+                }
+            }
+            broadcast.emit("chat:new-message", messageJson);
+        }
 
         return res.status(httpStatus.CREATED).json({
             success: true,
-            message: newMessage,
+            message: messageJson,
         });
     } catch (e) {
         // Catch duplicate key error if concurrent retry
