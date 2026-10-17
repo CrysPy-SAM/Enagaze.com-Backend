@@ -271,5 +271,28 @@ const getMatches = async (req, res) => {
     }
 };
 
-export { getDiscoveryProfiles, swipe, getMatches };
+// ==========================================
+// 4. RESET DISCOVERY SWIPES (RE-DISCOVER)
+// ==========================================
+const resetDiscoverySwipes = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        // Delete only 'pass' swipes so genuine mutual matches and likes are preserved
+        const result = await Swipe.deleteMany({ fromUser: userId, action: "pass" });
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            message: "Passed profiles have been reset. You can explore them again!",
+            resetCount: result.deletedCount,
+        });
+    } catch (e) {
+        console.error("Reset discovery swipes error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to reset discovery swipes",
+        });
+    }
+};
+
+export { getDiscoveryProfiles, swipe, getMatches, resetDiscoverySwipes };
 
