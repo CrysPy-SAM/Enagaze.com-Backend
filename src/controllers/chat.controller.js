@@ -11,6 +11,28 @@ const getConversations = async (req, res) => {
     try {
         const userId = req.user._id;
 
+        // Auto-sync: Ensure all mutual matches for this user have a conversation record
+        const userMatches = await Match.find({ users: userId }).select("_id users createdAt");
+        if (userMatches.length > 0) {
+            const matchIds = userMatches.map((m) => m._id);
+            const existingConvs = await Conversation.find({ match: { $in: matchIds } }).select("match");
+            const existingMatchIdSet = new Set(existingConvs.map((c) => c.match.toString()));
+
+            const missingMatches = userMatches.filter((m) => !existingMatchIdSet.has(m._id.toString()));
+            if (missingMatches.length > 0) {
+                const newConvs = missingMatches.map((m) => ({
+                    match: m._id,
+                    participants: m.users,
+                    lastMessageAt: m.createdAt || new Date(),
+                }));
+                try {
+                    await Conversation.insertMany(newConvs, { ordered: false });
+                } catch (insertErr) {
+                    // Ignore duplicate key race conditions
+                }
+            }
+        }
+
         const conversations = await Conversation.find({ participants: userId })
             .sort({ lastMessageAt: -1 })
             .populate({
@@ -37,11 +59,19 @@ const getConversations = async (req, res) => {
                     readBy: { $ne: userId },
                 });
 
+                const otherJson = typeof otherParticipant.toJSON === "function"
+                    ? otherParticipant.toJSON()
+                    : otherParticipant;
+
+                const lastMsgJson = conv.lastMessage
+                    ? (typeof conv.lastMessage.toJSON === "function" ? conv.lastMessage.toJSON() : conv.lastMessage)
+                    : null;
+
                 return {
                     _id: conv._id,
                     match: conv.match,
-                    otherParticipant: otherParticipant.toJSON(),
-                    lastMessage: conv.lastMessage ? conv.lastMessage.toJSON() : null,
+                    otherParticipant: otherJson,
+                    lastMessage: lastMsgJson,
                     lastMessageAt: conv.lastMessageAt,
                     unreadCount,
                 };

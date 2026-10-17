@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { User } from "../models/user.model.js";
 import { Swipe } from "../models/swipe.model.js";
 import { Match } from "../models/match.model.js";
+import { Conversation } from "../models/conversation.model.js";
 
 // ==========================================
 // 1. GET DISCOVERY PROFILES
@@ -162,6 +163,19 @@ const swipe = async (req, res) => {
                         $setOnInsert: {
                             users: [req.user._id, targetUserId],
                             userPair,
+                        },
+                    },
+                    { upsert: true, new: true, setDefaultsOnInsert: true }
+                );
+
+                // Atomically ensure conversation record exists for this mutual match
+                await Conversation.findOneAndUpdate(
+                    { match: match._id },
+                    {
+                        $setOnInsert: {
+                            match: match._id,
+                            participants: [req.user._id, targetUserId],
+                            lastMessageAt: match.createdAt || new Date(),
                         },
                     },
                     { upsert: true, new: true, setDefaultsOnInsert: true }
