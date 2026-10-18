@@ -12,6 +12,9 @@ import userRoutes from "./routes/users.routes.js";
 import discoveryRoutes from "./routes/discovery.routes.js";
 import matchRoutes from "./routes/matches.routes.js";
 import chatRoutes from "./routes/chat.routes.js";
+import { validateJwtConfig } from "./config/jwt.js";
+import { corsOptions } from "./config/cors.js";
+import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
 
 // ✅ Ensure .env loads properly even in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -23,10 +26,8 @@ if (!process.env.MONGO_URI) {
   console.warn("⚠️ Warning: MONGO_URI is not set in environment variables.");
 }
 
-// Ensure JWT secret is configured in production
-if (!process.env.JWT_SECRET) {
-  console.warn("⚠️ Warning: JWT_SECRET is not set in environment variables. Using development fallback.");
-}
+// Validate JWT configuration (fails startup immediately in production if invalid)
+validateJwtConfig({ exitOnError: true });
 
 const app = express();
 const server = createServer(app);
@@ -35,33 +36,13 @@ app.set("io", io);
 
 app.set("port", process.env.PORT || 8000);
 
-// Explicit CORS configuration supporting Vercel production frontend and local dev
-const allowedOrigins = [
-  "https://engaze-com.vercel.app",
-  "http://localhost:3000",
-  "http://localhost:5173",
-  process.env.CLIENT_URL,
-].filter(Boolean);
+// Render deployment topology operates behind a reverse-proxy load balancer.
+// Trusting the first proxy hop (1) ensures Express resolves req.ip from Render's X-Forwarded-For
+// without blindly trusting arbitrary spoofed upstream client headers.
+app.set("trust proxy", 1);
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
-      if (!origin) return callback(null, true);
-      if (
-        allowedOrigins.includes(origin) ||
-        origin.endsWith(".vercel.app") ||
-        process.env.NODE_ENV !== "production"
-      ) {
-        return callback(null, true);
-      }
-      return callback(null, true);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+// Centralized CORS configuration with exact-origin allowlist
+app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "40kb" }));
 app.use(express.urlencoded({ limit: "40kb", extended: true }));
@@ -84,6 +65,9 @@ app.get("/api/v1/health", (req, res) => {
   });
 });
 
+// Global rate limiting on API routes (bypassed for root and /health)
+app.use("/api/v1", globalApiLimiter);
+
 app.use("/api/v1/users", userRoutes);
 app.use("/api/v1/discovery", discoveryRoutes);
 app.use("/api/v1/matches", matchRoutes);
@@ -101,4 +85,13 @@ const start = async () => {
   }
 };
 
-start();
+const isMainModule = Boolean(
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+);
+
+if (isMainModule) {
+  start();
+}
+
+export { app, server, start };

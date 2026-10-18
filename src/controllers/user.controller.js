@@ -4,15 +4,13 @@ import jwt from "jsonwebtoken";
 import { OAuth2Client } from "google-auth-library";
 import { User } from "../models/user.model.js";
 import { Meeting } from "../models/meeting.model.js";
-
-const JWT_SECRET = process.env.JWT_SECRET || "engaze_super_secret_jwt_key_2026_dev_secure";
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
+import { getJwtSecret, JWT_EXPIRES_IN } from "../config/jwt.js";
 
 // Helper: Generate JWT token
 const generateToken = (user) => {
     return jwt.sign(
         { id: user._id, username: user.username },
-        JWT_SECRET,
+        getJwtSecret(),
         { expiresIn: JWT_EXPIRES_IN }
     );
 };

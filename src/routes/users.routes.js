@@ -9,13 +9,19 @@ import {
     googleLogin
 } from "../controllers/user.controller.js";
 import { protect } from "../middlewares/auth.middleware.js";
+import {
+    loginIpLimiter,
+    loginAccountLimiter,
+    registerLimiter,
+    googleLoginLimiter,
+} from "../middlewares/rateLimiter.middleware.js";
 
 const router = Router();
 
-// Public auth endpoints
-router.route("/login").post(login);
-router.route("/register").post(register);
-router.route("/google-login").post(googleLogin);
+// Public auth endpoints with differentiated brute-force protection
+router.route("/login").post(loginIpLimiter, loginAccountLimiter, login);
+router.route("/register").post(registerLimiter, register);
+router.route("/google-login").post(googleLoginLimiter, googleLogin);
 
 // Protected profile endpoints
 router.route("/profile/me")

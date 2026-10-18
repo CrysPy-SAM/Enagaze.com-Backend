@@ -4,8 +4,8 @@ import mongoose from "mongoose";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
 import { registerRandomCallHandlers } from "./randomCallManager.js";
-
-const JWT_SECRET = process.env.JWT_SECRET || "engaze_super_secret_jwt_key_2026_dev_secure";
+import { getJwtSecret } from "../config/jwt.js";
+import { corsOptions } from "../config/cors.js";
 
 let connections = {};
 let messages = {};
@@ -15,30 +15,8 @@ let ioInstance = null;
 export const getIO = () => ioInstance;
 
 export const connectToSocket = (server) => {
-    const allowedSocketOrigins = [
-        "https://engaze-com.vercel.app",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        process.env.CLIENT_URL,
-    ].filter(Boolean);
-
     const io = new Server(server, {
-        cors: {
-            origin: (origin, callback) => {
-                if (!origin) return callback(null, true);
-                if (
-                    allowedSocketOrigins.includes(origin) ||
-                    origin.endsWith(".vercel.app") ||
-                    process.env.NODE_ENV !== "production"
-                ) {
-                    return callback(null, true);
-                }
-                return callback(null, true);
-            },
-            methods: ["GET", "POST"],
-            allowedHeaders: ["*"],
-            credentials: true,
-        },
+        cors: corsOptions,
     });
 
     // Handshake middleware for JWT authentication
@@ -53,7 +31,7 @@ export const connectToSocket = (server) => {
 
         if (token) {
             try {
-                const decoded = jwt.verify(token, JWT_SECRET);
+                const decoded = jwt.verify(token, getJwtSecret());
                 socket.userId = decoded.id;
                 socket.username = decoded.username;
             } catch (err) {

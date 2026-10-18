@@ -1,8 +1,7 @@
 import jwt from "jsonwebtoken";
 import httpStatus from "http-status";
 import { User } from "../models/user.model.js";
-
-const JWT_SECRET = process.env.JWT_SECRET || "engaze_super_secret_jwt_key_2026_dev_secure";
+import { getJwtSecret } from "../config/jwt.js";
 
 export const protect = async (req, res, next) => {
     let token = null;
@@ -26,7 +25,7 @@ export const protect = async (req, res, next) => {
     }
 
     try {
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const decoded = jwt.verify(token, getJwtSecret());
 
         const user = await User.findById(decoded.id).select("-password");
         if (!user) {
