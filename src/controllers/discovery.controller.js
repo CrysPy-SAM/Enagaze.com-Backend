@@ -6,6 +6,7 @@ import { Match } from "../models/match.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { getIO } from "./socketManager.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
+import { checkUserEligibility } from "../services/eligibility.service.js";
 
 // ==========================================
 // 1. GET DISCOVERY PROFILES
@@ -13,11 +14,23 @@ import { toPublicProfile } from "../serializers/profile.serializer.js";
 const getDiscoveryProfiles = async (req, res) => {
     try {
         const currentUser = req.user;
+
+        // 1. Authoritative check: Viewing user must be 18+ and have a complete profile
+        const viewerEligibility = checkUserEligibility(currentUser);
+        if (!viewerEligibility.isEligible) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: viewerEligibility.code,
+                message: viewerEligibility.reason,
+                missingFields: viewerEligibility.missingFields,
+            });
+        }
+
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(30, Math.max(1, parseInt(req.query.limit, 10) || 10));
         const skip = (page - 1) * limit;
 
-        // 1. Fetch IDs of profiles the user has already swiped on (liked or passed) AND already matched users
+        // 2. Fetch IDs of profiles the user has already swiped on (liked or passed) AND already matched users
         const [swipedRecords, existingMatches] = await Promise.all([
             Swipe.find({ fromUser: currentUser._id }).select("toUser"),
             Match.find({ users: currentUser._id }).select("users"),
@@ -31,35 +44,44 @@ const getDiscoveryProfiles = async (req, res) => {
             ...matchedUserIds,
         ];
 
-        // 2. Build discovery query:
-        // Include completed profiles (like the 20 Indian demo profiles) OR genuine registered users
-        // while excluding automated test runners/placeholders
+        // 3. Candidate Age Boundaries based on UTC calendar dates
+        // User must be at least 18 (or customized minAge) and at most 120 (or customized maxAge)
+        const now = new Date();
+        const prefMin = currentUser.datingPreferences?.ageRange?.min;
+        const prefMax = currentUser.datingPreferences?.ageRange?.max;
+
+        const effectiveMinAge = prefMin && prefMin > 18 ? prefMin : 18;
+        const effectiveMaxAge = prefMax && prefMax < 100 ? prefMax : 120;
+
+        const latestEligibleDob = new Date(Date.UTC(
+            now.getUTCFullYear() - effectiveMinAge,
+            now.getUTCMonth(),
+            now.getUTCDate(),
+            23, 59, 59, 999
+        ));
+        const earliestEligibleDob = new Date(Date.UTC(
+            now.getUTCFullYear() - effectiveMaxAge - 1,
+            now.getUTCMonth(),
+            now.getUTCDate(),
+            0, 0, 0, 0
+        ));
+
+        // 4. Base Discovery Query:
+        // Candidates MUST strictly have isProfileComplete: true and an adult DOB within bounds.
+        // Profiles with null DOB or missing DOB are completely excluded from adult discovery.
         const query = {
             _id: { $nin: excludedIds },
-            $or: [
-                { isProfileComplete: true },
-                {
-                    username: {
-                        $not: /^(test_user|testuser|testrunner|test_)/i,
-                    },
-                },
-            ],
+            isProfileComplete: true,
+            dob: { $gte: earliestEligibleDob, $lte: latestEligibleDob },
         };
 
-        // 3. Gender preference matching
+        // 5. Gender preference matching
         const interestedIn = currentUser.datingPreferences?.interestedIn;
         if (interestedIn && Array.isArray(interestedIn) && !interestedIn.includes("everyone") && interestedIn.length > 0) {
-            query.$and = query.$and || [];
-            query.$and.push({
-                $or: [
-                    { gender: { $in: interestedIn } },
-                    { gender: null },
-                    { gender: { $exists: false } },
-                ],
-            });
+            query.gender = { $in: interestedIn };
         }
 
-        // Mutual gender compatibility: target user must be interested in current user's gender, everyone, or unconfigured
+        // Mutual gender compatibility: target user must be interested in current user's gender or everyone
         if (currentUser.gender) {
             query.$and = query.$and || [];
             query.$and.push({
@@ -72,34 +94,7 @@ const getDiscoveryProfiles = async (req, res) => {
             });
         }
 
-        // 4. Age preference matching based on Date of Birth
-        // Only apply restrictive age bounds if user has customized beyond the default 18-100 range
-        const ageRange = currentUser.datingPreferences?.ageRange;
-        if (ageRange && (ageRange.min > 18 || ageRange.max < 100)) {
-            const now = new Date();
-            const earliestDob = new Date(
-                now.getFullYear() - ageRange.max - 1,
-                now.getMonth(),
-                now.getDate()
-            );
-            const latestDob = new Date(
-                now.getFullYear() - ageRange.min,
-                now.getMonth(),
-                now.getDate()
-            );
-
-            // Allow profiles matching age OR newly registered users who haven't set DOB yet
-            query.$and = query.$and || [];
-            query.$and.push({
-                $or: [
-                    { dob: { $gte: earliestDob, $lte: latestDob } },
-                    { dob: null },
-                    { dob: { $exists: false } },
-                ],
-            });
-        }
-
-        // 5. Execute query with safe projection
+        // 6. Execute query with safe projection
         const total = await User.countDocuments(query);
         const profiles = await User.find(query)
             .select("name dob gender bio photos interests isProfileComplete")
@@ -138,6 +133,17 @@ const swipe = async (req, res) => {
         });
     }
 
+    // 0. Verify swiper eligibility
+    const swiperEligibility = checkUserEligibility(req.user);
+    if (!swiperEligibility.isEligible) {
+        return res.status(httpStatus.FORBIDDEN).json({
+            success: false,
+            code: swiperEligibility.code,
+            message: swiperEligibility.reason,
+            missingFields: swiperEligibility.missingFields,
+        });
+    }
+
     // 2. Reject self-swiping
     if (targetUserId.toString() === req.user._id.toString()) {
         return res.status(httpStatus.BAD_REQUEST).json({
@@ -155,7 +161,7 @@ const swipe = async (req, res) => {
     }
 
     try {
-        // 4. Verify target user exists
+        // 4. Verify target user exists and is eligible
         const targetUser = await User.findById(targetUserId).select(
             "name dob gender bio photos interests isProfileComplete"
         );
@@ -163,6 +169,15 @@ const swipe = async (req, res) => {
             return res.status(httpStatus.NOT_FOUND).json({
                 success: false,
                 message: "Target profile not found",
+            });
+        }
+
+        const targetEligibility = checkUserEligibility(targetUser);
+        if (!targetEligibility.isEligible) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "TARGET_INELIGIBLE",
+                message: "Target profile is not eligible for discovery interactions.",
             });
         }
 
@@ -291,6 +306,16 @@ const swipe = async (req, res) => {
 // ==========================================
 const getMatches = async (req, res) => {
     try {
+        const viewerEligibility = checkUserEligibility(req.user);
+        if (!viewerEligibility.isEligible) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: viewerEligibility.code,
+                message: viewerEligibility.reason,
+                missingFields: viewerEligibility.missingFields,
+            });
+        }
+
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
         const skip = (page - 1) * limit;
@@ -319,6 +344,9 @@ const getMatches = async (req, res) => {
                     (u) => u && u._id.toString() !== req.user._id.toString()
                 );
                 if (!otherUser) return null;
+
+                const otherEligibility = checkUserEligibility(otherUser);
+                if (!otherEligibility.isEligible) return null;
 
                 return {
                     _id: m._id,
@@ -351,6 +379,16 @@ const getMatches = async (req, res) => {
 // ==========================================
 const resetDiscoverySwipes = async (req, res) => {
     try {
+        const viewerEligibility = checkUserEligibility(req.user);
+        if (!viewerEligibility.isEligible) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: viewerEligibility.code,
+                message: viewerEligibility.reason,
+                missingFields: viewerEligibility.missingFields,
+            });
+        }
+
         const userId = req.user._id;
         // Delete only 'pass' swipes so genuine mutual matches and likes are preserved
         const result = await Swipe.deleteMany({ fromUser: userId, action: "pass" });
@@ -370,4 +408,5 @@ const resetDiscoverySwipes = async (req, res) => {
 };
 
 export { getDiscoveryProfiles, swipe, getMatches, resetDiscoverySwipes };
+
 

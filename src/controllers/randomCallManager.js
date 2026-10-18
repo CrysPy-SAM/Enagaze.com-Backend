@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { User } from "../models/user.model.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
+import { checkUserEligibility } from "../services/eligibility.service.js";
 
 // In-memory matchmaking state
 const matchmakingQueue = [];
@@ -87,8 +88,22 @@ async function matchOrQueueUser(io, socket, ack) {
     // Prevent duplicate queue entries for the same user or socket
     removeFromQueue(socket.id, userIdStr);
 
+    // Verify authoritative user eligibility before queue mutation or matching
+    const user = await User.findById(socket.userId).select("name dob gender bio photos interests isProfileComplete");
+    const eligibility = checkUserEligibility(user);
+    if (!eligibility.isEligible) {
+        const err = {
+            code: eligibility.code,
+            message: eligibility.reason || "Complete your profile and confirm age to join random video matchmaking",
+            missingFields: eligibility.missingFields,
+        };
+        socket.emit("random:error", err);
+        if (typeof ack === "function") ack({ success: false, ...err });
+        return;
+    }
+
     // Fetch user profile for matchmaking card
-    const userProfile = await getPublicProfile(socket.userId);
+    const userProfile = toPublicProfile(user);
 
     // Atomic candidate search: Find eligible peer already waiting in queue
     let candidate = null;
@@ -103,6 +118,12 @@ async function matchOrQueueUser(io, socket, ack) {
         // Verify candidate socket is still connected
         const candidateSocket = io.sockets.sockets.get(nextInLine.socketId);
         if (candidateSocket && candidateSocket.connected) {
+            // Verify candidate user remains eligible
+            const candUser = await User.findById(nextInLine.userId).select("name dob gender bio photos interests isProfileComplete");
+            const candElig = checkUserEligibility(candUser);
+            if (!candElig.isEligible) {
+                continue; // Discard ineligible candidate from queue
+            }
             candidate = nextInLine;
             break;
         }

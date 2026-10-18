@@ -1,12 +1,14 @@
 import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
+import { User } from "../models/user.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
 import { registerRandomCallHandlers } from "./randomCallManager.js";
 import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
 import { toMessageDto } from "../serializers/profile.serializer.js";
+import { checkUserEligibility } from "../services/eligibility.service.js";
 
 let connections = {};
 let messages = {};
@@ -74,6 +76,20 @@ export const connectToSocket = (server) => {
                 return;
             }
 
+            // Authoritative eligibility check
+            const callerUser = await User.findById(socket.userId).select("name dob gender bio photos interests isProfileComplete");
+            const eligibility = checkUserEligibility(callerUser);
+            if (!eligibility.isEligible) {
+                const err = {
+                    code: eligibility.code,
+                    message: eligibility.reason || "Complete your profile and confirm age to join chat",
+                    missingFields: eligibility.missingFields,
+                };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
             if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) {
                 const err = { message: "Invalid conversation ID" };
                 socket.emit("chat:error", err);
@@ -121,6 +137,20 @@ export const connectToSocket = (server) => {
 
             if (!socket.userId) {
                 const err = { message: "Authentication required to send messages" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            // Authoritative eligibility check
+            const callerUser = await User.findById(socket.userId).select("name dob gender bio photos interests isProfileComplete");
+            const eligibility = checkUserEligibility(callerUser);
+            if (!eligibility.isEligible) {
+                const err = {
+                    code: eligibility.code,
+                    message: eligibility.reason || "Complete your profile and confirm age to send messages",
+                    missingFields: eligibility.missingFields,
+                };
                 socket.emit("chat:error", err);
                 if (typeof ack === "function") ack({ success: false, ...err });
                 return;

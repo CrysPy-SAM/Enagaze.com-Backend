@@ -5,6 +5,7 @@ import { Message } from "../models/message.model.js";
 import { Match } from "../models/match.model.js";
 import { getIO } from "./socketManager.js";
 import { toPublicProfile, toSenderProfile, toMessageDto } from "../serializers/profile.serializer.js";
+import { checkUserEligibility } from "../services/eligibility.service.js";
 
 // ==========================================
 // 1. GET ALL CONVERSATIONS FOR CURRENT USER
@@ -140,12 +141,28 @@ const getOrCreateConversationByMatch = async (req, res) => {
             (u) => u && u._id.toString() !== req.user._id.toString()
         );
 
+        if (!otherParticipant) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "Conversation partner profile not found",
+            });
+        }
+
+        const otherEligibility = checkUserEligibility(otherParticipant);
+        if (!otherEligibility.isEligible) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "PARTNER_INELIGIBLE",
+                message: "Conversation partner is no longer eligible for messaging.",
+            });
+        }
+
         return res.status(httpStatus.OK).json({
             success: true,
             conversation: {
                 _id: conversation._id,
                 match: match._id,
-                otherParticipant: otherParticipant ? toPublicProfile(otherParticipant) : null,
+                otherParticipant: toPublicProfile(otherParticipant),
                 lastMessage: conversation.lastMessage,
                 lastMessageAt: conversation.lastMessageAt,
             },

@@ -1,4 +1,5 @@
 import mongoose, { Schema } from "mongoose";
+import { calculateExactAge } from "../services/eligibility.service.js";
 
 const userSchema = new Schema(
     {
@@ -51,16 +52,11 @@ const userSchema = new Schema(
             type: Date,
             validate: {
                 validator: function(value) {
-                    if (!value) return true; // Optional initially until profile setup
-                    const today = new Date();
-                    let age = today.getFullYear() - value.getFullYear();
-                    const m = today.getMonth() - value.getMonth();
-                    if (m < 0 || (m === 0 && today.getDate() < value.getDate())) {
-                        age--;
-                    }
-                    return age >= 18;
+                    if (!value) return true; // Optional initially until onboarding profile setup
+                    const age = calculateExactAge(value);
+                    return age !== null && age >= 18 && age <= 120;
                 },
-                message: "You must be at least 18 years old."
+                message: "You must be at least 18 years old to use Engaze."
             }
         },
         gender: {
@@ -123,13 +119,8 @@ const userSchema = new Schema(
 // Virtual property to calculate age from dob dynamically
 userSchema.virtual("age").get(function() {
     if (!this.dob) return undefined;
-    const today = new Date();
-    let age = today.getFullYear() - this.dob.getFullYear();
-    const m = today.getMonth() - this.dob.getMonth();
-    if (m < 0 || (m === 0 && today.getDate() < this.dob.getDate())) {
-        age--;
-    }
-    return age;
+    const calculated = calculateExactAge(this.dob);
+    return calculated !== null ? calculated : undefined;
 });
 
 const User = mongoose.model("User", userSchema);

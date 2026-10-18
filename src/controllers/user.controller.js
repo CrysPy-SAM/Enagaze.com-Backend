@@ -5,6 +5,7 @@ import { OAuth2Client } from "google-auth-library";
 import { User } from "../models/user.model.js";
 import { Meeting } from "../models/meeting.model.js";
 import { getJwtSecret, JWT_EXPIRES_IN } from "../config/jwt.js";
+import { calculateExactAge, checkUserEligibility } from "../services/eligibility.service.js";
 
 // Helper: Generate JWT token
 const generateToken = (user) => {
@@ -13,21 +14,6 @@ const generateToken = (user) => {
         getJwtSecret(),
         { expiresIn: JWT_EXPIRES_IN }
     );
-};
-
-// Helper: Calculate age from Date of Birth
-const calculateAge = (dob) => {
-    if (!dob) return null;
-    const birthDate = new Date(dob);
-    if (isNaN(birthDate.getTime())) return null;
-
-    const today = new Date();
-    let age = today.getFullYear() - birthDate.getFullYear();
-    const monthDiff = today.getMonth() - birthDate.getMonth();
-    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
-        age--;
-    }
-    return age;
 };
 
 // ==========================================
@@ -84,7 +70,7 @@ const login = async (req, res) => {
 // 2. REGISTER
 // ==========================================
 const register = async (req, res) => {
-    const { name, username, password } = req.body;
+    const { name, username, password, dob } = req.body;
 
     if (!name || !username || !password) {
         return res.status(httpStatus.BAD_REQUEST).json({
@@ -125,6 +111,32 @@ const register = async (req, res) => {
         });
     }
 
+    // Optional DOB validation during registration if provided
+    let parsedDob = undefined;
+    if (dob !== undefined && dob !== null && dob !== "") {
+        const parsed = new Date(dob);
+        if (isNaN(parsed.getTime())) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "Invalid date of birth format"
+            });
+        }
+        const age = calculateExactAge(parsed);
+        if (age === null || age < 18) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "You must be at least 18 years old to use Engaze."
+            });
+        }
+        if (age > 120) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "Please enter a valid date of birth."
+            });
+        }
+        parsedDob = parsed;
+    }
+
     try {
         const existingUser = await User.findOne({ username: normalizedUsername });
         if (existingUser) {
@@ -139,8 +151,13 @@ const register = async (req, res) => {
         const newUser = new User({
             name: trimmedName,
             username: normalizedUsername,
-            password: hashedPassword
+            password: hashedPassword,
+            dob: parsedDob,
+            isProfileComplete: false
         });
+
+        // Evaluate eligibility based on available profile fields
+        newUser.isProfileComplete = checkUserEligibility(newUser).isEligible;
 
         const token = generateToken(newUser);
         newUser.token = token;
@@ -243,7 +260,7 @@ const updateMyProfile = async (req, res) => {
                     });
                 }
 
-                const age = calculateAge(parsedDate);
+                const age = calculateExactAge(parsedDate);
                 if (age === null || age < 18) {
                     return res.status(httpStatus.BAD_REQUEST).json({
                         success: false,
@@ -373,16 +390,8 @@ const updateMyProfile = async (req, res) => {
             }
         }
 
-        // Automatic profile completion check
-        const isComplete = Boolean(
-            user.name &&
-            user.dob &&
-            user.gender &&
-            user.bio &&
-            user.photos &&
-            user.photos.length > 0
-        );
-        user.isProfileComplete = isComplete;
+        // Automatic profile completion check using central eligibility service
+        user.isProfileComplete = checkUserEligibility(user).isEligible;
 
         await user.save();
 
