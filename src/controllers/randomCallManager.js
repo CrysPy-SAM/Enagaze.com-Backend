@@ -2,6 +2,12 @@ import crypto from "crypto";
 import { User } from "../models/user.model.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
+import {
+    isPlainObject,
+    isValidSignalPayload,
+    checkSocketRateLimit,
+    clearSocketRateLimits,
+} from "../utils/socketValidator.js";
 
 // In-memory matchmaking state
 const matchmakingQueue = [];
@@ -217,6 +223,21 @@ export function registerRandomCallHandlers(io, socket) {
             return;
         }
 
+        if (data !== undefined && data !== null && !isPlainObject(data)) {
+            const err = { message: "Invalid payload format: plain object expected" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Abuse throttle: max 5 queue join attempts per 2 seconds
+        if (!checkSocketRateLimit(`${socket.id}:join-queue`, 5, 2000)) {
+            const err = { message: "Queue join rate limit exceeded. Please wait a moment." };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
         const userIdStr = socket.userId.toString();
 
         // If user is currently in an active call, terminate it first
@@ -232,7 +253,21 @@ export function registerRandomCallHandlers(io, socket) {
     // 2. Cancel / Leave Matchmaking Queue
     // -------------------------------------------------------------
     socket.on("random:leave-queue", (data, ack) => {
-        const userIdStr = socket.userId ? socket.userId.toString() : null;
+        if (!socket.userId) {
+            const err = { message: "Authentication required" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (data !== undefined && data !== null && !isPlainObject(data)) {
+            const err = { message: "Invalid payload format" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const userIdStr = socket.userId.toString();
         const removed = removeFromQueue(socket.id, userIdStr);
 
         socket.emit("random:queue-left", { success: true });
@@ -245,8 +280,6 @@ export function registerRandomCallHandlers(io, socket) {
     // 3. WebRTC Signaling (Offer, Answer, ICE Candidates)
     // -------------------------------------------------------------
     socket.on("random:signal", (data, ack) => {
-        const { callId, signalData } = data || {};
-
         if (!socket.userId) {
             const err = { message: "Authentication required for signaling" };
             socket.emit("random:error", err);
@@ -254,8 +287,34 @@ export function registerRandomCallHandlers(io, socket) {
             return;
         }
 
-        if (!callId || !signalData) {
-            const err = { message: "Invalid signaling payload" };
+        // Throttle high-frequency signaling: max 60 signals per 2 seconds per socket
+        if (!checkSocketRateLimit(`${socket.id}:signal`, 60, 2000)) {
+            const err = { message: "Signaling rate limit exceeded. Please slow down." };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (!isPlainObject(data)) {
+            const err = { message: "Invalid signaling payload: plain object required" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const { callId, signalData, recipientId } = data;
+
+        // Validate callId format: must start with call_ and contain alphanumeric/dashes
+        if (!callId || typeof callId !== "string" || !/^call_[0-9a-fA-F-]+$/.test(callId)) {
+            const err = { message: "Invalid call ID format" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Validate signalData structure and size (<= 64KB, no oversized or malformed payloads)
+        if (!isValidSignalPayload(signalData, 65536)) {
+            const err = { message: "Invalid or oversized signaling payload" };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
             return;
@@ -263,18 +322,26 @@ export function registerRandomCallHandlers(io, socket) {
 
         const call = activeCalls.get(callId);
         if (!call) {
-            const err = { message: "Active call session not found" };
+            const err = { message: "Active call session not found or has ended" };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
             return;
         }
 
-        // Verify that the transmitting socket is an authorized participant
-        const isParticipant = call.peers.some(
-            (p) => p.socketId === socket.id || p.userId === socket.userId.toString()
+        // Verify that transmitting socket is a registered participant in this active call
+        const callerPeer = call.peers.find(
+            (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
         );
-        if (!isParticipant) {
-            const err = { message: "Unauthorized signaling attempt: not a call participant" };
+        if (!callerPeer) {
+            const err = { message: "Unauthorized signaling attempt: not an active call participant" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Verify that caller's state machine mappings match this active call
+        if (socketToCall.get(socket.id) !== callId || userToCall.get(socket.userId.toString()) !== callId) {
+            const err = { message: "Mismatched or stale call session" };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
             return;
@@ -289,7 +356,26 @@ export function registerRandomCallHandlers(io, socket) {
             return;
         }
 
-        // Transmit private signaling data only to partner socket
+        // Anti-spoofing: if client supplied recipientId, verify it matches the actual partner
+        if (recipientId && recipientId !== partner.userId && recipientId !== partner.socketId) {
+            const err = { message: "Unauthorized recipient mismatch" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Verify partner socket is still connected
+        const partnerSocket = io.sockets.sockets.get(partner.socketId);
+        if (!partnerSocket || !partnerSocket.connected) {
+            endActiveCall(callId, socket.id, "partner_disconnected", io);
+            const err = { message: "Partner disconnected" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Transmit private signaling data strictly to partner socket
+        // Identity is derived server-side from socket.userId (never trust client-supplied sender)
         io.to(partner.socketId).emit("random:signal", {
             callId,
             signalData,
@@ -305,13 +391,39 @@ export function registerRandomCallHandlers(io, socket) {
     // 4. End Call / Hangup
     // -------------------------------------------------------------
     socket.on("random:end-call", (data, ack) => {
-        const callId = data?.callId || socketToCall.get(socket.id);
-        if (callId) {
-            endActiveCall(callId, socket.id, "ended_by_user", io);
+        if (!socket.userId) {
+            const err = { message: "Authentication required" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
         }
 
+        if (data !== undefined && data !== null && !isPlainObject(data)) {
+            const err = { message: "Invalid payload format" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const activeCallId = socketToCall.get(socket.id);
+        if (!activeCallId) {
+            // Idempotent: already ended or not in call
+            if (typeof ack === "function") ack({ success: true, wasActive: false });
+            return;
+        }
+
+        // If client supplied a callId, make sure it matches their current active call
+        if (data?.callId && data.callId !== activeCallId) {
+            const err = { message: "Cannot end a call you are not participating in" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        endActiveCall(activeCallId, socket.id, "ended_by_user", io);
+
         if (typeof ack === "function") {
-            ack({ success: true });
+            ack({ success: true, wasActive: true });
         }
     });
 
@@ -326,9 +438,31 @@ export function registerRandomCallHandlers(io, socket) {
             return;
         }
 
-        const callId = data?.callId || socketToCall.get(socket.id);
-        if (callId) {
-            endActiveCall(callId, socket.id, "skipped_by_partner", io);
+        if (data !== undefined && data !== null && !isPlainObject(data)) {
+            const err = { message: "Invalid payload format" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Rate limit next skips: max 5 per 2 seconds
+        if (!checkSocketRateLimit(`${socket.id}:next`, 5, 2000)) {
+            const err = { message: "Next match rate limit exceeded. Please slow down." };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const activeCallId = socketToCall.get(socket.id);
+        if (data?.callId && activeCallId && data.callId !== activeCallId) {
+            const err = { message: "Cannot skip a call you are not participating in" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (activeCallId) {
+            endActiveCall(activeCallId, socket.id, "skipped_by_partner", io);
         }
 
         // Atomically match with a waiting partner or re-enter the queue
@@ -347,6 +481,9 @@ export function registerRandomCallHandlers(io, socket) {
         if (callId) {
             endActiveCall(callId, socket.id, "partner_disconnected", io);
         }
+
+        // 3. Clear rate limits for this socket
+        clearSocketRateLimits(socket.id);
     });
 }
 
@@ -354,6 +491,8 @@ export function registerRandomCallHandlers(io, socket) {
 export const _testing = {
     getQueue: () => [...matchmakingQueue],
     getActiveCalls: () => new Map(activeCalls),
+    getSocketToCall: () => new Map(socketToCall),
+    getUserToCall: () => new Map(userToCall),
     clearAll: () => {
         matchmakingQueue.length = 0;
         activeCalls.clear();
