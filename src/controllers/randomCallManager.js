@@ -49,6 +49,10 @@ function endActiveCall(callId, initiatorSocketId, reason, io) {
     const call = activeCalls.get(callId);
     if (!call) return null;
 
+    call.state = "ended";
+    if (call.consentedUsers) call.consentedUsers.clear();
+    if (call.mediaReadyUsers) call.mediaReadyUsers.clear();
+
     const roomName = `random-call:${callId}`;
 
     // Notify partner peer if still connected and leave room
@@ -172,7 +176,10 @@ export async function matchOrQueueUser(io, socket, ack) {
 
         const callSession = {
             callId,
+            state: "consent_pending",
             peers: [peerA, peerB],
+            consentedUsers: new Set(),
+            mediaReadyUsers: new Set(),
             startedAt: Date.now(),
         };
 
@@ -192,6 +199,7 @@ export async function matchOrQueueUser(io, socket, ack) {
             callId,
             isInitiator: true,
             partner: peerB.userProfile,
+            requiresConsent: true,
         });
 
         // Notify current socket (Receiver)
@@ -199,6 +207,7 @@ export async function matchOrQueueUser(io, socket, ack) {
             callId,
             isInitiator: false,
             partner: peerA.userProfile,
+            requiresConsent: true,
         });
 
         if (typeof ack === "function") {
@@ -293,7 +302,269 @@ export function registerRandomCallHandlers(io, socket) {
     });
 
     // -------------------------------------------------------------
-    // 3. WebRTC Signaling (Offer, Answer, ICE Candidates)
+    // 3. User Consent Gate
+    // -------------------------------------------------------------
+    socket.on("random:consent", async (data, ack) => {
+        if (!socket.userId) {
+            const err = { message: "Authentication required" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Rate limit consent attempts: max 10 per 2 seconds
+        if (!checkSocketRateLimit(`${socket.id}:consent`, 10, 2000)) {
+            const err = { message: "Consent rate limit exceeded. Please wait a moment." };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (!isPlainObject(data)) {
+            const err = { message: "Invalid payload format: plain object expected" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const { callId, consent } = data;
+
+        if (!callId || typeof callId !== "string" || !/^call_[0-9a-fA-F-]+$/.test(callId)) {
+            const err = { message: "Invalid call ID format" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (typeof consent !== "boolean") {
+            const err = { message: "Invalid consent parameter: boolean expected" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const call = activeCalls.get(callId);
+        if (!call) {
+            const err = { message: "Active call session not found or has ended" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const callerPeer = call.peers.find(
+            (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
+        );
+        if (!callerPeer) {
+            const err = { message: "Unauthorized consent attempt: not an active call participant" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Verify that caller's state machine mappings match this active call
+        if (socketToCall.get(socket.id) !== callId || userToCall.get(socket.userId.toString()) !== callId) {
+            const err = { message: "Mismatched or stale call session" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (consent === false) {
+            // User explicitly declined match
+            socket.emit("random:call-ended", {
+                callId,
+                reason: "declined_by_user",
+            });
+            endActiveCall(callId, socket.id, "declined_by_partner", io);
+            if (typeof ack === "function") ack({ success: true, status: "declined" });
+            return;
+        }
+
+        // Idempotency: If call already transitioned beyond consent_pending, do not re-trigger both-consented
+        if (call.state !== "consent_pending") {
+            if (typeof ack === "function") ack({ success: true, status: call.state });
+            return;
+        }
+
+        // User consented (consent === true)
+        call.consentedUsers.add(socket.userId.toString());
+
+        const partner = call.peers.find((p) => p.socketId !== socket.id);
+        const partnerConsented = partner && call.consentedUsers.has(partner.userId);
+
+        if (partnerConsented) {
+            call.state = "media_setup";
+            for (const peer of call.peers) {
+                io.to(peer.socketId).emit("random:both-consented", { callId });
+            }
+            if (typeof ack === "function") ack({ success: true, status: "both_consented" });
+        } else {
+            socket.emit("random:waiting-for-partner-consent", { callId });
+            if (partner) {
+                io.to(partner.socketId).emit("random:partner-consented", { callId });
+            }
+            if (typeof ack === "function") ack({ success: true, status: "waiting_for_partner" });
+        }
+    });
+
+    // -------------------------------------------------------------
+    // 4. Local Media Readiness Confirmation
+    // -------------------------------------------------------------
+    socket.on("random:media-ready", async (data, ack) => {
+        if (!socket.userId) {
+            const err = { message: "Authentication required" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Rate limit media-ready attempts: max 10 per 2 seconds
+        if (!checkSocketRateLimit(`${socket.id}:media-ready`, 10, 2000)) {
+            const err = { message: "Media readiness rate limit exceeded. Please wait a moment." };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (!isPlainObject(data)) {
+            const err = { message: "Invalid payload format: plain object expected" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const { callId } = data;
+
+        if (!callId || typeof callId !== "string" || !/^call_[0-9a-fA-F-]+$/.test(callId)) {
+            const err = { message: "Invalid call ID format" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const call = activeCalls.get(callId);
+        if (!call) {
+            const err = { message: "Active call session not found or has ended" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const callerPeer = call.peers.find(
+            (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
+        );
+        if (!callerPeer) {
+            const err = { message: "Unauthorized media-ready attempt: not an active call participant" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Verify that caller's state machine mappings match this active call
+        if (socketToCall.get(socket.id) !== callId || userToCall.get(socket.userId.toString()) !== callId) {
+            const err = { message: "Mismatched or stale call session" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (call.state === "consent_pending") {
+            const err = { message: "Mutual consent required before media setup" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Idempotency: If call already reached media_ready, do not re-broadcast media-start
+        if (call.state === "media_ready") {
+            if (typeof ack === "function") ack({ success: true, status: "media_ready" });
+            return;
+        }
+
+        call.mediaReadyUsers.add(socket.userId.toString());
+
+        const partner = call.peers.find((p) => p.socketId !== socket.id);
+        const partnerReady = partner && call.mediaReadyUsers.has(partner.userId);
+
+        if (partnerReady) {
+            call.state = "media_ready";
+            const initiator = call.peers.find((p) => p.isInitiator);
+            for (const peer of call.peers) {
+                io.to(peer.socketId).emit("random:media-start", {
+                    callId,
+                    initiatorId: initiator?.userId,
+                    isInitiator: peer.isInitiator,
+                });
+            }
+            if (typeof ack === "function") ack({ success: true, status: "media_ready" });
+        } else {
+            socket.emit("random:waiting-for-partner-media", { callId });
+            if (typeof ack === "function") ack({ success: true, status: "waiting_for_partner" });
+        }
+    });
+
+    // -------------------------------------------------------------
+    // 5. Media Failure Reporting (Permission Denied / Device Error)
+    // -------------------------------------------------------------
+    socket.on("random:media-failed", async (data, ack) => {
+        if (!socket.userId) {
+            const err = { message: "Authentication required" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (!isPlainObject(data)) {
+            const err = { message: "Invalid payload format: plain object expected" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const { callId } = data;
+
+        if (!callId || typeof callId !== "string" || !/^call_[0-9a-fA-F-]+$/.test(callId)) {
+            const err = { message: "Invalid call ID format" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        const call = activeCalls.get(callId);
+        if (!call) {
+            if (typeof ack === "function") ack({ success: true, wasActive: false });
+            return;
+        }
+
+        const callerPeer = call.peers.find(
+            (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
+        );
+        if (!callerPeer) {
+            const err = { message: "Unauthorized media-failed attempt: not an active call participant" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Verify that caller's state machine mappings match this active call
+        if (socketToCall.get(socket.id) !== callId || userToCall.get(socket.userId.toString()) !== callId) {
+            if (typeof ack === "function") ack({ success: true, wasActive: false });
+            return;
+        }
+
+        socket.emit("random:call-ended", {
+            callId,
+            reason: "media_failed",
+        });
+        endActiveCall(callId, socket.id, "partner_media_failed", io);
+
+        if (typeof ack === "function") {
+            ack({ success: true, status: "media_failed" });
+        }
+    });
+
+    // -------------------------------------------------------------
+    // 6. WebRTC Signaling (Offer, Answer, ICE Candidates)
     // -------------------------------------------------------------
     socket.on("random:signal", async (data, ack) => {
         if (!socket.userId) {
@@ -358,6 +629,17 @@ export function registerRandomCallHandlers(io, socket) {
         // Verify that caller's state machine mappings match this active call
         if (socketToCall.get(socket.id) !== callId || userToCall.get(socket.userId.toString()) !== callId) {
             const err = { message: "Mismatched or stale call session" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Enforce Server-Side Consent & Media Readiness Gate
+        if (call.state !== "media_ready") {
+            const err = {
+                code: "SIGNAL_GATE_RESTRICTED",
+                message: "Signaling forbidden: both participants must consent and finish media setup before WebRTC signaling",
+            };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
             return;
@@ -540,19 +822,27 @@ export const _testing = {
     getActiveCalls: () => new Map(activeCalls),
     getSocketToCall: () => new Map(socketToCall),
     getUserToCall: () => new Map(userToCall),
+    getCallState: (callId) => activeCalls.get(callId)?.state,
     setActiveCall: (callId, callData) => {
+        const user1 = callData.user1 || (callData.peers && callData.peers[0]) || { userId: "user1", socketId: "sock1" };
+        const user2 = callData.user2 || (callData.peers && callData.peers[1]) || { userId: "user2", socketId: "sock2" };
+        const consentedUsers = new Set(callData.consentedUsers || [user1.userId, user2.userId]);
+        const mediaReadyUsers = new Set(callData.mediaReadyUsers || [user1.userId, user2.userId]);
         activeCalls.set(callId, {
             callId,
+            state: callData.state || "media_ready",
             peers: [
-                { userId: callData.user1.userId, socketId: callData.user1.socketId },
-                { userId: callData.user2.userId, socketId: callData.user2.socketId },
+                { userId: user1.userId, socketId: user1.socketId, isInitiator: true },
+                { userId: user2.userId, socketId: user2.socketId, isInitiator: false },
             ],
-            createdAt: callData.startedAt || new Date(),
+            consentedUsers,
+            mediaReadyUsers,
+            startedAt: callData.startedAt || new Date(),
         });
-        userToCall.set(callData.user1.userId, callId);
-        userToCall.set(callData.user2.userId, callId);
-        socketToCall.set(callData.user1.socketId, callId);
-        socketToCall.set(callData.user2.socketId, callId);
+        userToCall.set(user1.userId, callId);
+        userToCall.set(user2.userId, callId);
+        socketToCall.set(user1.socketId, callId);
+        socketToCall.set(user2.socketId, callId);
     },
     clearAll: () => {
         matchmakingQueue.length = 0;

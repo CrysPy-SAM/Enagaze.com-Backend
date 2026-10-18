@@ -631,6 +631,20 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
             assert.equal(matchA.partner.name, mockUserB.name);
             assert.equal(matchB.partner.name, mockUserA.name);
 
+            // Both participants provide explicit consent
+            const bothConsentedA = new Promise((res) => clientA.once("random:both-consented", res));
+            const bothConsentedB = new Promise((res) => clientB.once("random:both-consented", res));
+            await new Promise((res) => clientA.emit("random:consent", { callId: matchA.callId, consent: true }, res));
+            await new Promise((res) => clientB.emit("random:consent", { callId: matchB.callId, consent: true }, res));
+            await Promise.all([bothConsentedA, bothConsentedB]);
+
+            // Both participants report local media ready
+            const mediaStartA = new Promise((res) => clientA.once("random:media-start", res));
+            const mediaStartB = new Promise((res) => clientB.once("random:media-start", res));
+            await new Promise((res) => clientA.emit("random:media-ready", { callId: matchA.callId }, res));
+            await new Promise((res) => clientB.emit("random:media-ready", { callId: matchB.callId }, res));
+            await Promise.all([mediaStartA, mediaStartB]);
+
             // User A signals User B with WebRTC offer
             const signalBPromise = new Promise((res) => clientB.once("random:signal", res));
             const offerAck = await new Promise((res) => {
