@@ -6,7 +6,7 @@ import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import { io as ioClient } from "socket.io-client";
 
-import { connectToSocket } from "../src/controllers/socketManager.js";
+import { connectToSocket, _testingLegacy } from "../src/controllers/socketManager.js";
 import { _testing as randomTesting } from "../src/controllers/randomCallManager.js";
 import { _testingRateLimits } from "../src/utils/socketValidator.js";
 import { getJwtSecret } from "../src/config/jwt.js";
@@ -114,6 +114,7 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
 
     beforeEach(() => {
         randomTesting.clearAll();
+        _testingLegacy.clearAll();
         _testingRateLimits.clearAll();
 
         // Stub User.findById
@@ -176,6 +177,7 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
         Message.updateMany = originalMsgUpdateMany;
         Message.prototype.save = originalMsgSave;
         randomTesting.clearAll();
+        _testingLegacy.clearAll();
         _testingRateLimits.clearAll();
     });
 
@@ -700,6 +702,130 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
             assert.equal(randomTesting.getSocketToCall().size, 0);
             assert.equal(randomTesting.getUserToCall().size, 0);
 
+            clientB.disconnect();
+        });
+    });
+
+    // =========================================================================
+    // 9. Check 1: Random Video Frontend Authentication Contract & Reconnects
+    // =========================================================================
+    describe("Check 1: Random Video Frontend Auth Contract", () => {
+        it("connects using the exact frontend contract { auth: { token: authToken } }", async () => {
+            const tokenA = makeToken({ id: mockUserA._id, username: mockUserA.username });
+            // Exact frontend contract from randomVideo.jsx line 402: io(server, { auth: { token: authToken }, transports: ["websocket", "polling"] })
+            const { client, error } = await connectClient(port, {
+                auth: { token: tokenA },
+                transports: ["websocket", "polling"],
+            });
+
+            assert.equal(error, null, "Frontend contract { auth: { token } } MUST be accepted");
+            assert.ok(client.connected);
+
+            // Verify queue join works under this contract
+            const queueAck = await new Promise((res) => {
+                client.emit("random:join-queue", {}, res);
+            });
+            assert.equal(queueAck.success, true);
+            assert.equal(queueAck.status, "waiting");
+
+            client.disconnect();
+        });
+
+        it("reconnects authenticate with the token contract and do not permit unauthenticated sessions", async () => {
+            const tokenA = makeToken({ id: mockUserA._id, username: mockUserA.username });
+            const client = ioClient(`http://127.0.0.1:${port}`, {
+                transports: ["polling"],
+                auth: { token: tokenA },
+                reconnection: true,
+                reconnectionAttempts: 1,
+            });
+
+            await new Promise((resolve) => client.once("connect", resolve));
+            assert.ok(client.connected);
+
+            // Manually simulate reconnect by disconnecting transport and reconnecting
+            client.io.engine.close();
+
+            await new Promise((resolve) => client.once("connect", resolve));
+            assert.ok(client.connected, "Reconnection MUST successfully authenticate with the auth token");
+
+            client.disconnect();
+        });
+    });
+
+    // =========================================================================
+    // 10. Check 2: Legacy Meeting Room Authorization & Cross-Room Signaling
+    // =========================================================================
+    describe("Check 2: Legacy Meeting Room Authorization & Cross-Room Signaling", () => {
+        it("unauthenticated sockets cannot join any legacy meeting room", async () => {
+            const { client, error } = await connectClient(port, { auth: {} });
+            assert.ok(error, "Handshake MUST reject unauthenticated client before join-call can be invoked");
+            assert.equal(Object.keys(_testingLegacy.getConnections()).length, 0);
+            client.disconnect();
+        });
+
+        it("authenticated users in Room A cannot signal sockets in Room B (cross-room signaling injection blocked)", async () => {
+            const tokenA = makeToken({ id: mockUserA._id, username: mockUserA.username });
+            const tokenB = makeToken({ id: mockUserB._id, username: mockUserB.username });
+
+            const { client: clientA } = await connectClient(port, { auth: { token: tokenA } });
+            const { client: clientB } = await connectClient(port, { auth: { token: tokenB } });
+
+            // User A joins Room A
+            clientA.emit("join-call", "http://localhost:3000/room-alpha");
+            // User B joins Room B
+            clientB.emit("join-call", "http://localhost:3000/room-beta");
+
+            // Allow event loop to process joins
+            await new Promise((r) => setTimeout(r, 50));
+
+            // Verify room isolation in server connections map
+            const conns = _testingLegacy.getConnections();
+            assert.ok(conns["http://localhost:3000/room-alpha"]?.includes(clientA.id));
+            assert.ok(conns["http://localhost:3000/room-beta"]?.includes(clientB.id));
+
+            // User A attempts to inject signal to User B across rooms
+            let receivedSignal = null;
+            clientB.on("signal", (fromId, data) => {
+                receivedSignal = { fromId, data };
+            });
+
+            clientA.emit("signal", clientB.id, { type: "malicious-cross-room-signal" });
+
+            await new Promise((r) => setTimeout(r, 60));
+            assert.equal(receivedSignal, null, "Cross-room signaling injection MUST be blocked");
+
+            clientA.disconnect();
+            clientB.disconnect();
+        });
+
+        it("legacy chat-message overrides client-supplied sender with server-verified token identity", async () => {
+            const tokenA = makeToken({ id: mockUserA._id, username: mockUserA.username });
+            const tokenB = makeToken({ id: mockUserB._id, username: mockUserB.username });
+
+            const { client: clientA } = await connectClient(port, { auth: { token: tokenA } });
+            const { client: clientB } = await connectClient(port, { auth: { token: tokenB } });
+
+            const commonRoom = "http://localhost:3000/common-meet";
+            clientA.emit("join-call", commonRoom);
+            clientB.emit("join-call", commonRoom);
+
+            await new Promise((r) => setTimeout(r, 50));
+
+            const msgPromise = new Promise((resolve) => {
+                clientB.once("chat-message", (data, sender, socketId) => {
+                    resolve({ data, sender, socketId });
+                });
+            });
+
+            // Alice tries to spoof sender name as "Admin" or "Bob"
+            clientA.emit("chat-message", "Hello everyone", "SpoofedAdminName");
+
+            const received = await msgPromise;
+            assert.equal(received.data, "Hello everyone");
+            assert.equal(received.sender, mockUserA.username, "Sender name MUST be verified username, not client-supplied spoofed name");
+
+            clientA.disconnect();
             clientB.disconnect();
         });
     });

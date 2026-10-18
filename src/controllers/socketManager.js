@@ -588,3 +588,13 @@ export const connectToSocket = (server) => {
 
     return io;
 };
+
+// Test inspection helpers for legacy meeting state
+export const _testingLegacy = {
+    getConnections: () => connections,
+    clearAll: () => {
+        connections = {};
+        messages = {};
+        timeOnline = {};
+    },
+};
