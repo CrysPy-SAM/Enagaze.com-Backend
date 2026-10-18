@@ -3,7 +3,6 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { OAuth2Client } from "google-auth-library";
 import { User } from "../models/user.model.js";
-import { Meeting } from "../models/meeting.model.js";
 import { getJwtSecret, JWT_EXPIRES_IN } from "../config/jwt.js";
 import { calculateExactAge, evaluateProfileCompleteness, checkUserEligibility } from "../services/eligibility.service.js";
 
@@ -410,57 +409,6 @@ const updateMyProfile = async (req, res) => {
     }
 };
 
-// ==========================================
-// 5. GET USER HISTORY (Protected)
-// ==========================================
-const getUserHistory = async (req, res) => {
-    try {
-        const meetings = await Meeting.find({ user_id: req.user.username }).sort({ date: -1 });
-        return res.status(httpStatus.OK).json(meetings);
-    } catch (e) {
-        console.error("Get user history error:", e);
-        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
-            success: false,
-            message: "Failed to retrieve meeting history"
-        });
-    }
-};
-
-// ==========================================
-// 6. ADD TO HISTORY (Protected)
-// ==========================================
-const addToHistory = async (req, res) => {
-    const { meeting_code } = req.body;
-
-    if (!meeting_code || !String(meeting_code).trim()) {
-        return res.status(httpStatus.BAD_REQUEST).json({
-            success: false,
-            message: "Meeting code is required"
-        });
-    }
-
-    try {
-        const newMeeting = new Meeting({
-            user_id: req.user.username,
-            meetingCode: String(meeting_code).trim()
-        });
-
-        await newMeeting.save();
-
-        return res.status(httpStatus.CREATED).json({
-            success: true,
-            message: "Added code to history",
-            meeting: newMeeting
-        });
-    } catch (e) {
-        console.error("Add to history error:", e);
-        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
-            success: false,
-            message: "Failed to record meeting activity"
-        });
-    }
-};
-
 // Helper: Generate a unique, sanitized username for new Google users
 const generateUniqueUsername = async (candidate) => {
     let clean = (candidate || "user")
@@ -609,7 +557,5 @@ export {
     register,
     getMyProfile,
     updateMyProfile,
-    getUserHistory,
-    addToHistory,
     googleLogin
 };

@@ -13,14 +13,10 @@ import {
     isPlainObject,
     isValidObjectId,
     sanitizeString,
-    isValidSignalPayload,
     checkSocketRateLimit,
     clearSocketRateLimits,
 } from "../utils/socketValidator.js";
 
-let connections = {};
-let messages = {};
-let timeOnline = {};
 let ioInstance = null;
 
 export const getIO = () => ioInstance;
@@ -473,128 +469,11 @@ export const connectToSocket = (server) => {
             }
         });
 
-        // ==========================================
-        // 3. EXISTING WEBRTC SIGNALING (LEGACY)
-        // ==========================================
-        socket.on("join-call", (path) => {
-            if (!socket.userId) return;
-            if (typeof path !== "string" || !path.trim() || path.length > 256) return;
-            if (!checkSocketRateLimit(`${socket.id}:legacy:join-call`, 10, 2000)) return;
-
-            if (connections[path] === undefined) {
-                connections[path] = [];
-            }
-            connections[path].push(socket.id);
-
-            timeOnline[socket.id] = new Date();
-
-            for (let a = 0; a < connections[path].length; a++) {
-                io.to(connections[path][a]).emit("user-joined", socket.id, connections[path]);
-            }
-
-            if (messages[path] !== undefined) {
-                for (let a = 0; a < messages[path].length; ++a) {
-                    io.to(socket.id).emit(
-                        "chat-message",
-                        messages[path][a]["data"],
-                        messages[path][a]["sender"],
-                        messages[path][a]["socket-id-sender"]
-                    );
-                }
-            }
-        });
-
-        socket.on("signal", (toId, message) => {
-            if (!socket.userId) return;
-            if (typeof toId !== "string" || toId.length > 64) return;
-            if (!isValidSignalPayload(message, 65536)) return;
-            if (!checkSocketRateLimit(`${socket.id}:legacy:signal`, 60, 2000)) return;
-
-            // Enforce room isolation: verify target socket is in at least one common legacy room
-            const senderRooms = Object.entries(connections)
-                .filter(([_, sockets]) => Array.isArray(sockets) && sockets.includes(socket.id))
-                .map(([roomKey]) => roomKey);
-
-            const isTargetInSameRoom = senderRooms.some(
-                (roomKey) => Array.isArray(connections[roomKey]) && connections[roomKey].includes(toId)
-            );
-
-            if (!isTargetInSameRoom) {
-                return; // Prevent cross-room signaling injection
-            }
-
-            io.to(toId).emit("signal", socket.id, message);
-        });
-
-        socket.on("chat-message", (data, sender) => {
-            if (!socket.userId) return;
-            if (typeof data !== "string" || data.length > 2000) return;
-            if (!checkSocketRateLimit(`${socket.id}:legacy:chat`, 15, 2000)) return;
-
-            const [matchingRoom, found] = Object.entries(connections).reduce(
-                ([room, isFound], [roomKey, roomValue]) => {
-                    if (!isFound && roomValue.includes(socket.id)) {
-                        return [roomKey, true];
-                    }
-                    return [room, isFound];
-                },
-                ["", false]
-            );
-
-            if (found === true) {
-                if (messages[matchingRoom] === undefined) {
-                    messages[matchingRoom] = [];
-                }
-
-                // Security: sender identity derived from authenticated socket, ignoring client-supplied parameter
-                const authenticatedSender = socket.username || socket.userId;
-
-                messages[matchingRoom].push({
-                    sender: authenticatedSender,
-                    data: data,
-                    "socket-id-sender": socket.id,
-                });
-
-                connections[matchingRoom].forEach((elem) => {
-                    io.to(elem).emit("chat-message", data, authenticatedSender, socket.id);
-                });
-            }
-        });
-
         socket.on("disconnect", () => {
-            for (const [k, v] of JSON.parse(JSON.stringify(Object.entries(connections)))) {
-                for (let a = 0; a < v.length; ++a) {
-                    if (v[a] === socket.id) {
-                        const key = k;
-
-                        for (let a = 0; a < connections[key].length; ++a) {
-                            io.to(connections[key][a]).emit("user-left", socket.id);
-                        }
-
-                        const index = connections[key].indexOf(socket.id);
-                        connections[key].splice(index, 1);
-
-                        if (connections[key].length === 0) {
-                            delete connections[key];
-                        }
-                    }
-                }
-            }
-
             // Clean up rate limits on socket disconnect
             clearSocketRateLimits(socket.id);
         });
     });
 
     return io;
-};
-
-// Test inspection helpers for legacy meeting state
-export const _testingLegacy = {
-    getConnections: () => connections,
-    clearAll: () => {
-        connections = {};
-        messages = {};
-        timeOnline = {};
-    },
 };

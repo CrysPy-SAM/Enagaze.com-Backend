@@ -53,7 +53,7 @@ The core backend service for **Engaze.com** — a modern dating and social disco
 - **Persistent Private Chat:** One-to-one conversation threads stored in MongoDB with unread message counts, chronological message history, read receipts, and idempotent message delivery via `clientTempId`.
 - **Real-Time WebSocket Messaging:** Instant message broadcasting and read receipt synchronization across isolated Socket.IO conversation rooms.
 - **Random 1-to-1 WebRTC Video Matchmaking:** Queue-based matching engine pairing two available users atomically with self-matching prevention, private room signaling (offer, answer, ICE candidates), skip-to-next, and disconnect cleanup.
-- **Legacy Multi-Party Video Meetings:** Preserved room-based WebRTC signaling endpoints (`join-call`, `signal`, `chat-message`) for instant video calls.
+- **Legacy Meeting Subsystem Safely Retired:** Obsolete room-based WebRTC meeting handlers and activity endpoints safely removed to eliminate unauthenticated URL-guessing access while preserving historical database records.
 - **Health Check & Observability:** Dedicated root and `/api/v1/health` monitoring endpoints reporting MongoDB connection readiness and process uptime.
 - **Configurable Cross-Origin Resource Sharing (CORS):** Dynamic origin validation supporting Vercel production domains, Vercel preview URLs (`*.vercel.app`), and local development environments.
 
@@ -90,14 +90,14 @@ backend/
     │   ├── chat.controller.js       # Conversations, message pagination, read receipts
     │   ├── discovery.controller.js  # Candidate feed, swipes, mutual matches
     │   ├── randomCallManager.js     # Random video matchmaking queue & WebRTC signaling
-    │   ├── socketManager.js         # Socket.IO initialization, JWT auth, chat & room events
-    │   └── user.controller.js       # Register, login, profile CRUD, meeting history
+    │   ├── socketManager.js         # Socket.IO initialization, JWT auth, private chat rooms
+    │   └── user.controller.js       # Register, login, profile CRUD & Google Auth
     ├── middlewares/
     │   └── auth.middleware.js       # JWT extraction and validation middleware (`protect`)
     ├── models/
     │   ├── conversation.model.js    # Chat conversation metadata model
     │   ├── match.model.js           # Mutual dating match model
-    │   ├── meeting.model.js         # Meeting room activity history model
+    │   ├── meeting.model.js         # Historical meeting activity model (preserved)
     │   ├── message.model.js         # Persistent chat message model with idempotency key
     │   ├── swipe.model.js           # Swipe action model (like/pass)
     │   └── user.model.js            # User account & dating profile schema
@@ -340,9 +340,8 @@ All application endpoints are served under the `/api/v1` prefix.
 - **Validation Rules:** Age must be $\ge 18$ years if `dob` is provided. Automatically computes `isProfileComplete: true` when `gender`, `photos` (at least 1), and `dob` are populated.
 - **Response `200 OK`:** Returns updated profile object.
 
-#### 7. User Meeting History
-- **`GET /api/v1/users/get_all_activity`:** Returns array of historical video meeting codes logged by the authenticated user.
-- **`POST /api/v1/users/add_to_activity`:** Body: `{ "meeting_code": "engaze-meet-123" }`. Records video meeting code to user history.
+#### 7. User Meeting History (Retired)
+- **`GET /api/v1/users/get_all_activity`** & **`POST /api/v1/users/add_to_activity`:** Safely retired (HTTP 404). Existing MongoDB records and schema preserved.
 
 ---
 

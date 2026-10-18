@@ -6,7 +6,7 @@ import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import { io as ioClient } from "socket.io-client";
 
-import { connectToSocket, _testingLegacy } from "../src/controllers/socketManager.js";
+import { connectToSocket } from "../src/controllers/socketManager.js";
 import { _testing as randomTesting } from "../src/controllers/randomCallManager.js";
 import { _testingRateLimits } from "../src/utils/socketValidator.js";
 import { getJwtSecret } from "../src/config/jwt.js";
@@ -114,7 +114,6 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
 
     beforeEach(() => {
         randomTesting.clearAll();
-        _testingLegacy.clearAll();
         _testingRateLimits.clearAll();
 
         // Stub User.findById
@@ -177,7 +176,6 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
         Message.updateMany = originalMsgUpdateMany;
         Message.prototype.save = originalMsgSave;
         randomTesting.clearAll();
-        _testingLegacy.clearAll();
         _testingRateLimits.clearAll();
     });
 
@@ -754,79 +752,44 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
     });
 
     // =========================================================================
-    // 10. Check 2: Legacy Meeting Room Authorization & Cross-Room Signaling
+    // 10. Check 2: Legacy Meeting Room Subsystem Retirement & Inertness
     // =========================================================================
-    describe("Check 2: Legacy Meeting Room Authorization & Cross-Room Signaling", () => {
-        it("unauthenticated sockets cannot join any legacy meeting room", async () => {
-            const { client, error } = await connectClient(port, { auth: {} });
-            assert.ok(error, "Handshake MUST reject unauthenticated client before join-call can be invoked");
-            assert.equal(Object.keys(_testingLegacy.getConnections()).length, 0);
-            client.disconnect();
-        });
-
-        it("authenticated users in Room A cannot signal sockets in Room B (cross-room signaling injection blocked)", async () => {
+    describe("Check 2: Legacy Meeting Room Subsystem Retirement & Inertness", () => {
+        it("legacy events ('join-call', 'signal', 'chat-message') are completely retired and produce no state or events", async () => {
             const tokenA = makeToken({ id: mockUserA._id, username: mockUserA.username });
             const tokenB = makeToken({ id: mockUserB._id, username: mockUserB.username });
 
             const { client: clientA } = await connectClient(port, { auth: { token: tokenA } });
             const { client: clientB } = await connectClient(port, { auth: { token: tokenB } });
 
-            // User A joins Room A
+            let receivedUserJoined = false;
+            let receivedSignal = false;
+            let receivedChatMessage = false;
+
+            clientB.on("user-joined", () => { receivedUserJoined = true; });
+            clientB.on("signal", () => { receivedSignal = true; });
+            clientB.on("chat-message", () => { receivedChatMessage = true; });
+
+            // Attempt to invoke legacy meeting events
             clientA.emit("join-call", "http://localhost:3000/room-alpha");
-            // User B joins Room B
-            clientB.emit("join-call", "http://localhost:3000/room-beta");
+            clientB.emit("join-call", "http://localhost:3000/room-alpha");
+            clientA.emit("signal", clientB.id, { type: "test-legacy-signal" });
+            clientA.emit("chat-message", "legacy message", "UserA");
 
-            // Allow event loop to process joins
-            await new Promise((r) => setTimeout(r, 50));
+            await new Promise((r) => setTimeout(r, 80));
 
-            // Verify room isolation in server connections map
-            const conns = _testingLegacy.getConnections();
-            assert.ok(conns["http://localhost:3000/room-alpha"]?.includes(clientA.id));
-            assert.ok(conns["http://localhost:3000/room-beta"]?.includes(clientB.id));
-
-            // User A attempts to inject signal to User B across rooms
-            let receivedSignal = null;
-            clientB.on("signal", (fromId, data) => {
-                receivedSignal = { fromId, data };
-            });
-
-            clientA.emit("signal", clientB.id, { type: "malicious-cross-room-signal" });
-
-            await new Promise((r) => setTimeout(r, 60));
-            assert.equal(receivedSignal, null, "Cross-room signaling injection MUST be blocked");
+            assert.equal(receivedUserJoined, false, "Retired join-call must NOT broadcast user-joined");
+            assert.equal(receivedSignal, false, "Retired legacy signal must NOT forward signals");
+            assert.equal(receivedChatMessage, false, "Retired chat-message must NOT broadcast messages");
 
             clientA.disconnect();
             clientB.disconnect();
         });
 
-        it("legacy chat-message overrides client-supplied sender with server-verified token identity", async () => {
-            const tokenA = makeToken({ id: mockUserA._id, username: mockUserA.username });
-            const tokenB = makeToken({ id: mockUserB._id, username: mockUserB.username });
-
-            const { client: clientA } = await connectClient(port, { auth: { token: tokenA } });
-            const { client: clientB } = await connectClient(port, { auth: { token: tokenB } });
-
-            const commonRoom = "http://localhost:3000/common-meet";
-            clientA.emit("join-call", commonRoom);
-            clientB.emit("join-call", commonRoom);
-
-            await new Promise((r) => setTimeout(r, 50));
-
-            const msgPromise = new Promise((resolve) => {
-                clientB.once("chat-message", (data, sender, socketId) => {
-                    resolve({ data, sender, socketId });
-                });
-            });
-
-            // Alice tries to spoof sender name as "Admin" or "Bob"
-            clientA.emit("chat-message", "Hello everyone", "SpoofedAdminName");
-
-            const received = await msgPromise;
-            assert.equal(received.data, "Hello everyone");
-            assert.equal(received.sender, mockUserA.username, "Sender name MUST be verified username, not client-supplied spoofed name");
-
-            clientA.disconnect();
-            clientB.disconnect();
+        it("unauthenticated sockets cannot establish connection to invoke any socket operations", async () => {
+            const { client, error } = await connectClient(port, { auth: {} });
+            assert.ok(error, "Handshake MUST reject unauthenticated client");
+            client.disconnect();
         });
     });
 });
