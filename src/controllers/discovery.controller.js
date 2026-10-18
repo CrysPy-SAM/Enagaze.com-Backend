@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { User } from "../models/user.model.js";
 import { Swipe } from "../models/swipe.model.js";
 import { Match } from "../models/match.model.js";
+import { Block } from "../models/block.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { getIO } from "./socketManager.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
@@ -30,10 +31,11 @@ const getDiscoveryProfiles = async (req, res) => {
         const limit = Math.min(30, Math.max(1, parseInt(req.query.limit, 10) || 10));
         const skip = (page - 1) * limit;
 
-        // 2. Fetch IDs of profiles the user has already swiped on (liked or passed) AND already matched users
-        const [swipedRecords, existingMatches] = await Promise.all([
+        // 2. Fetch IDs of profiles the user has already swiped on, matched users, and blocked users
+        const [swipedRecords, existingMatches, blockedIds] = await Promise.all([
             Swipe.find({ fromUser: currentUser._id }).select("toUser"),
             Match.find({ users: currentUser._id }).select("users"),
+            Block.getBlockedUserIds(currentUser._id),
         ]);
         const matchedUserIds = existingMatches.flatMap((m) =>
             m.users.filter((u) => u && u.toString() !== currentUser._id.toString())
@@ -42,6 +44,7 @@ const getDiscoveryProfiles = async (req, res) => {
             currentUser._id,
             ...swipedRecords.map((s) => s.toUser),
             ...matchedUserIds,
+            ...blockedIds,
         ];
 
         // 3. Candidate Age Boundaries based on UTC calendar dates
@@ -178,6 +181,28 @@ const swipe = async (req, res) => {
                 success: false,
                 code: "TARGET_INELIGIBLE",
                 message: "Target profile is not eligible for discovery interactions.",
+            });
+        }
+
+        // 4b. Enforce bidirectional block check
+        const isBlocked = await Block.isBlockedBidirectional(req.user._id, targetUserId);
+        if (isBlocked) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "BLOCKED_USER",
+                message: "Interaction not permitted.",
+            });
+        }
+
+        // 4c. Verify not previously unmatched
+        const existingMatchRecord = await Match.findOne({
+            userPair: Match.getCanonicalPair(req.user._id, targetUserId),
+        });
+        if (existingMatchRecord && existingMatchRecord.status === "unmatched") {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "MATCH_UNMATCHED",
+                message: "This profile was previously unmatched.",
             });
         }
 
@@ -320,7 +345,13 @@ const getMatches = async (req, res) => {
         const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
         const skip = (page - 1) * limit;
 
-        const filter = { users: req.user._id };
+        const blockedUserIds = await Block.getBlockedUserIds(req.user._id);
+        const blockedIdStrings = new Set(blockedUserIds.map((id) => id.toString()));
+
+        const filter = {
+            users: blockedUserIds.length > 0 ? { $all: [req.user._id], $nin: blockedUserIds } : req.user._id,
+            status: "active",
+        };
         const total = await Match.countDocuments(filter);
 
         const matches = await Match.find(filter)
@@ -344,6 +375,7 @@ const getMatches = async (req, res) => {
                     (u) => u && u._id.toString() !== req.user._id.toString()
                 );
                 if (!otherUser) return null;
+                if (blockedIdStrings.has(otherUser._id.toString())) return null;
 
                 const otherEligibility = checkUserEligibility(otherUser);
                 if (!otherEligibility.isEligible) return null;

@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
 import { Match } from "../models/match.model.js";
+import { Block } from "../models/block.model.js";
 import { getIO } from "./socketManager.js";
 import { toPublicProfile, toSenderProfile, toMessageDto } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
@@ -14,8 +15,11 @@ const getConversations = async (req, res) => {
     try {
         const userId = req.user._id;
 
-        // Auto-sync: Ensure all mutual matches for this user have a conversation record
-        const userMatches = await Match.find({ users: userId }).select("_id users createdAt");
+        const blockedUserIds = await Block.getBlockedUserIds(userId);
+        const blockedSet = new Set(blockedUserIds.map((id) => id.toString()));
+
+        // Auto-sync: Ensure all active mutual matches for this user have a conversation record
+        const userMatches = await Match.find({ users: userId, status: "active" }).select("_id users createdAt");
         if (userMatches.length > 0) {
             const matchIds = userMatches.map((m) => m._id);
             const existingConvs = await Conversation.find({ match: { $in: matchIds } }).select("match");
@@ -39,6 +43,10 @@ const getConversations = async (req, res) => {
         const conversations = await Conversation.find({ participants: userId })
             .sort({ lastMessageAt: -1 })
             .populate({
+                path: "match",
+                select: "status",
+            })
+            .populate({
                 path: "participants",
                 select: "name photos dob gender bio interests isProfileComplete",
             })
@@ -51,11 +59,21 @@ const getConversations = async (req, res) => {
         // Compute unread counts and format other participant
         const formatted = await Promise.all(
             conversations.map(async (conv) => {
+                // If match is unmatched, exclude from active conversation list
+                if (conv.match && conv.match.status === "unmatched") {
+                    return null;
+                }
+
                 const otherParticipant = conv.participants.find(
                     (p) => p && p._id.toString() !== userId.toString()
                 );
 
                 if (!otherParticipant) return null;
+
+                // If either has blocked the other, exclude from active conversation list
+                if (blockedSet.has(otherParticipant._id.toString())) {
+                    return null;
+                }
 
                 const unreadCount = await Message.countDocuments({
                     conversation: conv._id,
@@ -67,7 +85,7 @@ const getConversations = async (req, res) => {
 
                 return {
                     _id: conv._id,
-                    match: conv.match,
+                    match: conv.match?._id || conv.match,
                     otherParticipant: toPublicProfile(otherParticipant),
                     lastMessage: lastMsgDto,
                     lastMessageAt: conv.lastMessageAt,
@@ -126,6 +144,14 @@ const getOrCreateConversationByMatch = async (req, res) => {
             });
         }
 
+        if (match.status === "unmatched") {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "MATCH_UNMATCHED",
+                message: "This match has been unmatched.",
+            });
+        }
+
         // Find or create conversation
         let conversation = await Conversation.findOne({ match: match._id });
         if (!conversation) {
@@ -154,6 +180,15 @@ const getOrCreateConversationByMatch = async (req, res) => {
                 success: false,
                 code: "PARTNER_INELIGIBLE",
                 message: "Conversation partner is no longer eligible for messaging.",
+            });
+        }
+
+        const isBlocked = await Block.isBlockedBidirectional(req.user._id, otherParticipant._id);
+        if (isBlocked) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "BLOCKED_USER",
+                message: "You cannot message this user.",
             });
         }
 
@@ -207,6 +242,31 @@ const getMessages = async (req, res) => {
                 success: false,
                 message: "You are not authorized to view messages in this conversation",
             });
+        }
+
+        const otherParticipantId = conversation.participants.find(
+            (p) => p.toString() !== req.user._id.toString()
+        );
+        if (otherParticipantId) {
+            const isBlocked = await Block.isBlockedBidirectional(req.user._id, otherParticipantId);
+            if (isBlocked) {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "BLOCKED_USER",
+                    message: "You cannot access messages for this user.",
+                });
+            }
+        }
+
+        if (conversation.match) {
+            const match = await Match.findById(conversation.match).select("status");
+            if (match && match.status === "unmatched") {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "MATCH_UNMATCHED",
+                    message: "This match has been unmatched.",
+                });
+            }
         }
 
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -275,6 +335,31 @@ const markConversationAsRead = async (req, res) => {
                 success: false,
                 message: "You are not authorized to perform this action",
             });
+        }
+
+        const otherParticipantId = conversation.participants.find(
+            (p) => p.toString() !== req.user._id.toString()
+        );
+        if (otherParticipantId) {
+            const isBlocked = await Block.isBlockedBidirectional(req.user._id, otherParticipantId);
+            if (isBlocked) {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "BLOCKED_USER",
+                    message: "Action not permitted.",
+                });
+            }
+        }
+
+        if (conversation.match) {
+            const match = await Match.findById(conversation.match).select("status");
+            if (match && match.status === "unmatched") {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "MATCH_UNMATCHED",
+                    message: "This match has been unmatched.",
+                });
+            }
         }
 
         const updateResult = await Message.updateMany(
@@ -364,6 +449,42 @@ const sendMessageRest = async (req, res) => {
                 success: false,
                 message: "You are not authorized to send messages in this conversation",
             });
+        }
+
+        // Authoritative caller eligibility check
+        const callerEligibility = checkUserEligibility(req.user);
+        if (!callerEligibility.isEligible) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: callerEligibility.code,
+                message: callerEligibility.reason,
+                missingFields: callerEligibility.missingFields,
+            });
+        }
+
+        const otherParticipantId = conversation.participants.find(
+            (p) => p.toString() !== req.user._id.toString()
+        );
+        if (otherParticipantId) {
+            const isBlocked = await Block.isBlockedBidirectional(req.user._id, otherParticipantId);
+            if (isBlocked) {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "BLOCKED_USER",
+                    message: "You cannot message this user.",
+                });
+            }
+        }
+
+        if (conversation.match) {
+            const match = await Match.findById(conversation.match).select("status");
+            if (match && match.status === "unmatched") {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "MATCH_UNMATCHED",
+                    message: "This match has been unmatched.",
+                });
+            }
         }
 
         // Check for idempotency key to prevent duplicates

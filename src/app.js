@@ -12,6 +12,8 @@ import userRoutes from "./routes/users.routes.js";
 import discoveryRoutes from "./routes/discovery.routes.js";
 import matchRoutes from "./routes/matches.routes.js";
 import chatRoutes from "./routes/chat.routes.js";
+import safetyRoutes from "./routes/safety.routes.js";
+import moderationRoutes from "./routes/moderation.routes.js";
 import { validateJwtConfig } from "./config/jwt.js";
 import { corsOptions } from "./config/cors.js";
 import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
@@ -72,6 +74,8 @@ app.use("/api/v1/users", userRoutes);
 app.use("/api/v1/discovery", discoveryRoutes);
 app.use("/api/v1/matches", matchRoutes);
 app.use("/api/v1/conversations", chatRoutes);
+app.use("/api/v1/safety", safetyRoutes);
+app.use("/api/v1/moderation", moderationRoutes);
 
 const start = async () => {
   try {

@@ -4,6 +4,8 @@ import mongoose from "mongoose";
 import { User } from "../models/user.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
+import { Match } from "../models/match.model.js";
+import { Block } from "../models/block.model.js";
 import { registerRandomCallHandlers } from "./randomCallManager.js";
 import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
@@ -139,6 +141,31 @@ export const connectToSocket = (server) => {
                     return;
                 }
 
+                // Verify neither participant has blocked the other
+                const otherParticipantId = conversation.participants.find(
+                    (p) => p.toString() !== socket.userId.toString()
+                );
+                if (otherParticipantId) {
+                    const isBlocked = await Block.isBlockedBidirectional(socket.userId, otherParticipantId);
+                    if (isBlocked) {
+                        const err = { code: "BLOCKED_USER", message: "You cannot access this conversation" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
+                // Verify match status if conversation is linked to a match
+                if (conversation.match && mongoose.connection.readyState !== 0) {
+                    const match = await Match.findById(conversation.match).select("status");
+                    if (match && match.status === "unmatched") {
+                        const err = { code: "MATCH_UNMATCHED", message: "This match has been unmatched" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
                 // Authorize socket to join the isolated conversation room
                 const roomName = `conversation:${conversationId}`;
                 socket.join(roomName);
@@ -236,6 +263,31 @@ export const connectToSocket = (server) => {
                     socket.emit("chat:error", err);
                     if (typeof ack === "function") ack({ success: false, ...err });
                     return;
+                }
+
+                // Verify neither participant has blocked the other
+                const otherParticipantId = conversation.participants.find(
+                    (p) => p.toString() !== socket.userId.toString()
+                );
+                if (otherParticipantId) {
+                    const isBlocked = await Block.isBlockedBidirectional(socket.userId, otherParticipantId);
+                    if (isBlocked) {
+                        const err = { code: "BLOCKED_USER", message: "You cannot message this user" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
+                // Verify match status if conversation is linked to a match
+                if (conversation.match && mongoose.connection.readyState !== 0) {
+                    const match = await Match.findById(conversation.match).select("status");
+                    if (match && match.status === "unmatched") {
+                        const err = { code: "MATCH_UNMATCHED", message: "This match has been unmatched" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
                 }
 
                 // Check for duplicate retry using sanitizedTempId
@@ -353,6 +405,30 @@ export const connectToSocket = (server) => {
                     return;
                 }
 
+                // Verify neither participant has blocked the other
+                const otherParticipantId = conversation.participants.find(
+                    (p) => p.toString() !== socket.userId.toString()
+                );
+                if (otherParticipantId) {
+                    const isBlocked = await Block.isBlockedBidirectional(socket.userId, otherParticipantId);
+                    if (isBlocked) {
+                        const err = { code: "BLOCKED_USER", message: "Action not permitted" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
+                if (conversation.match && mongoose.connection.readyState !== 0) {
+                    const match = await Match.findById(conversation.match).select("status");
+                    if (match && match.status === "unmatched") {
+                        const err = { code: "MATCH_UNMATCHED", message: "This match has been unmatched" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
                 // Security: Updates strictly apply to the authenticated socket user's read state
                 // Reader identity cannot be spoofed to alter another participant's read status
                 const updateRes = await Message.updateMany(
@@ -438,6 +514,26 @@ export const connectToSocket = (server) => {
                     socket.emit("chat:error", err);
                     if (typeof ack === "function") ack({ success: false, ...err });
                     return;
+                }
+
+                // Verify neither participant has blocked the other
+                const otherParticipantId = conversation.participants.find(
+                    (p) => p.toString() !== socket.userId.toString()
+                );
+                if (otherParticipantId) {
+                    const isBlocked = await Block.isBlockedBidirectional(socket.userId, otherParticipantId);
+                    if (isBlocked) {
+                        if (typeof ack === "function") ack({ success: false, code: "BLOCKED_USER" });
+                        return;
+                    }
+                }
+
+                if (conversation.match && mongoose.connection.readyState !== 0) {
+                    const match = await Match.findById(conversation.match).select("status");
+                    if (match && match.status === "unmatched") {
+                        if (typeof ack === "function") ack({ success: false, code: "MATCH_UNMATCHED" });
+                        return;
+                    }
                 }
 
                 const typingState = Boolean(isTyping !== undefined ? isTyping : true);

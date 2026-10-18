@@ -117,3 +117,46 @@ export const swipeLimiter = rateLimit({
     ),
 });
 
+/**
+ * Report submission rate limiter:
+ * Prevents report harassment/spam. Max 10 reports per 10 minutes.
+ */
+export const reportLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: 10,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    handler: createRateLimitHandler(
+        "Too many reports submitted. Please wait before submitting another report."
+    ),
+});
+
+/**
+ * Block/unblock rate limiter:
+ * Max 30 block operations per 10 minutes.
+ */
+export const blockLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: 30,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    handler: createRateLimitHandler(
+        "Too many block requests. Please wait a moment."
+    ),
+});
+
+/**
+ * Unmatch rate limiter:
+ * Max 30 unmatch operations per 10 minutes.
+ */
+export const unmatchLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: 30,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    handler: createRateLimitHandler(
+        "Too many unmatch requests. Please wait a moment."
+    ),
+});
+
+

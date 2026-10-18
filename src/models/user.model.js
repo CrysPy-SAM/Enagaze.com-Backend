@@ -93,6 +93,11 @@ const userSchema = new Schema(
         isProfileComplete: {
             type: Boolean,
             default: false
+        },
+        role: {
+            type: String,
+            enum: ["user", "moderator", "admin"],
+            default: "user",
         }
     },
     {

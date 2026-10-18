@@ -1,7 +1,16 @@
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import httpStatus from "http-status";
 import { User } from "../models/user.model.js";
 import { getJwtSecret } from "../config/jwt.js";
+
+const safeCompare = (provided, expected) => {
+    if (typeof provided !== "string" || typeof expected !== "string") return false;
+    const bufProvided = Buffer.from(provided);
+    const bufExpected = Buffer.from(expected);
+    if (bufProvided.length !== bufExpected.length) return false;
+    return crypto.timingSafeEqual(bufProvided, bufExpected);
+};
 
 export const protect = async (req, res, next) => {
     let token = null;
@@ -50,4 +59,52 @@ export const protect = async (req, res, next) => {
         });
     }
 };
+
+export const requireModerator = async (req, res, next) => {
+    // 1. Dedicated operational secret header for automation/scripts: x-moderator-secret
+    const secret = req.headers["x-moderator-secret"];
+    if (secret !== undefined) {
+        const expectedSecret = process.env.MODERATOR_API_KEY;
+        // Fails closed if MODERATOR_API_KEY is not configured or empty
+        if (
+            expectedSecret &&
+            typeof expectedSecret === "string" &&
+            expectedSecret.trim().length > 0 &&
+            safeCompare(secret, expectedSecret)
+        ) {
+            if (!req.user) {
+                req.user = { _id: null, role: "admin", name: "System Admin" };
+            }
+            return next();
+        }
+
+        return res.status(httpStatus.FORBIDDEN).json({
+            success: false,
+            message: "Access forbidden. Invalid moderator credentials.",
+        });
+    }
+
+    // 2. Check if user is already authenticated via protect middleware
+    if (req.user) {
+        if (req.user.role === "moderator" || req.user.role === "admin") {
+            return next();
+        }
+        return res.status(httpStatus.FORBIDDEN).json({
+            success: false,
+            message: "Access forbidden. Moderator or admin privileges required.",
+        });
+    }
+
+    // 3. User is not yet authenticated and no secret header -> delegate to protect
+    return protect(req, res, () => {
+        if (req.user && (req.user.role === "moderator" || req.user.role === "admin")) {
+            return next();
+        }
+        return res.status(httpStatus.FORBIDDEN).json({
+            success: false,
+            message: "Access forbidden. Moderator or admin privileges required.",
+        });
+    });
+};
+
 

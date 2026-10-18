@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { User } from "../models/user.model.js";
+import { Block } from "../models/block.model.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
 import {
@@ -55,12 +56,12 @@ function endActiveCall(callId, initiatorSocketId, reason, io) {
         socketToCall.delete(peer.socketId);
         userToCall.delete(peer.userId);
 
-        const peerSocket = io.sockets.sockets.get(peer.socketId);
+        const peerSocket = io?.sockets?.sockets?.get?.(peer.socketId);
         if (peerSocket) {
             peerSocket.leave(roomName);
         }
 
-        if (peer.socketId !== initiatorSocketId) {
+        if (peer.socketId !== initiatorSocketId && io) {
             io.to(peer.socketId).emit("random:call-ended", {
                 callId,
                 reason: reason || "ended_by_partner",
@@ -88,7 +89,7 @@ async function getPublicProfile(userId) {
 /**
  * Atomically match a socket with a waiting peer or insert into the matchmaking queue
  */
-async function matchOrQueueUser(io, socket, ack) {
+export async function matchOrQueueUser(io, socket, ack) {
     const userIdStr = socket.userId.toString();
 
     // Prevent duplicate queue entries for the same user or socket
@@ -113,6 +114,8 @@ async function matchOrQueueUser(io, socket, ack) {
 
     // Atomic candidate search: Find eligible peer already waiting in queue
     let candidate = null;
+    const skippedCandidates = [];
+
     while (matchmakingQueue.length > 0) {
         const nextInLine = matchmakingQueue.shift();
 
@@ -130,10 +133,23 @@ async function matchOrQueueUser(io, socket, ack) {
             if (!candElig.isEligible) {
                 continue; // Discard ineligible candidate from queue
             }
+
+            // Check if either user has blocked the other
+            const isBlocked = await Block.isBlockedBidirectional(userIdStr, nextInLine.userId);
+            if (isBlocked) {
+                skippedCandidates.push(nextInLine);
+                continue; // Cannot pair with blocked user; retain candidate for other users
+            }
+
             candidate = nextInLine;
             break;
         }
         // Disconnected candidate automatically discarded
+    }
+
+    // Restore skipped candidates back to the front of queue in original relative order
+    if (skippedCandidates.length > 0) {
+        matchmakingQueue.unshift(...skippedCandidates);
     }
 
     if (candidate) {
@@ -279,7 +295,7 @@ export function registerRandomCallHandlers(io, socket) {
     // -------------------------------------------------------------
     // 3. WebRTC Signaling (Offer, Answer, ICE Candidates)
     // -------------------------------------------------------------
-    socket.on("random:signal", (data, ack) => {
+    socket.on("random:signal", async (data, ack) => {
         if (!socket.userId) {
             const err = { message: "Authentication required for signaling" };
             socket.emit("random:error", err);
@@ -369,6 +385,16 @@ export function registerRandomCallHandlers(io, socket) {
         if (!partnerSocket || !partnerSocket.connected) {
             endActiveCall(callId, socket.id, "partner_disconnected", io);
             const err = { message: "Partner disconnected" };
+            socket.emit("random:error", err);
+            if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        // Verify neither participant has blocked the other
+        const isBlocked = await Block.isBlockedBidirectional(socket.userId, partner.userId);
+        if (isBlocked) {
+            endActiveCall(callId, socket.id, "ended_by_partner", io);
+            const err = { message: "Call session ended" };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
             return;
@@ -487,12 +513,47 @@ export function registerRandomCallHandlers(io, socket) {
     });
 }
 
+/**
+ * Safely terminate any active call between two users (e.g. upon block/report)
+ */
+export function endActiveCallBetweenUsers(userIdA, userIdB, io) {
+    if (!userIdA || !userIdB) return null;
+    const userAStr = userIdA.toString();
+    const userBStr = userIdB.toString();
+    const callId = userToCall.get(userAStr) || userToCall.get(userBStr);
+    if (!callId) return null;
+
+    const call = activeCalls.get(callId);
+    if (!call) return null;
+
+    const hasA = call.peers.some((p) => p.userId === userAStr);
+    const hasB = call.peers.some((p) => p.userId === userBStr);
+    if (hasA && hasB) {
+        return endActiveCall(callId, null, "ended_by_partner", io);
+    }
+    return null;
+}
+
 // For unit testing inspection
 export const _testing = {
     getQueue: () => [...matchmakingQueue],
     getActiveCalls: () => new Map(activeCalls),
     getSocketToCall: () => new Map(socketToCall),
     getUserToCall: () => new Map(userToCall),
+    setActiveCall: (callId, callData) => {
+        activeCalls.set(callId, {
+            callId,
+            peers: [
+                { userId: callData.user1.userId, socketId: callData.user1.socketId },
+                { userId: callData.user2.userId, socketId: callData.user2.socketId },
+            ],
+            createdAt: callData.startedAt || new Date(),
+        });
+        userToCall.set(callData.user1.userId, callId);
+        userToCall.set(callData.user2.userId, callId);
+        socketToCall.set(callData.user1.socketId, callId);
+        socketToCall.set(callData.user2.socketId, callId);
+    },
     clearAll: () => {
         matchmakingQueue.length = 0;
         activeCalls.clear();

@@ -14,6 +14,21 @@ const matchSchema = new Schema(
             required: true,
             unique: true,
             index: true
+        },
+        status: {
+            type: String,
+            enum: ["active", "unmatched"],
+            default: "active",
+            index: true
+        },
+        unmatchedBy: {
+            type: Schema.Types.ObjectId,
+            ref: "User",
+            default: null
+        },
+        unmatchedAt: {
+            type: Date,
+            default: null
         }
     },
     {
