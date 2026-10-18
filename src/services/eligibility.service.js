@@ -60,17 +60,21 @@ export function calculateExactAge(dob, referenceDate = new Date()) {
 }
 
 /**
- * Authoritative check of a user's eligibility for adult dating surfaces
- * (Discovery, Swipe, Matches, Chat, Random Video).
+ * Authoritatively evaluate whether a user's profile fields and age satisfy
+ * dating profile completeness requirements (18+, valid gender, photos, bio).
+ * 
+ * IMPORTANT: This function evaluates purely the profile field values and age policy.
+ * It is deliberately decoupled from the persisted `isProfileComplete` flag to prevent
+ * circular dependency during profile onboarding updates.
  * 
  * @param {Object} user - User document or plain object
  * @param {Date|string|number} [referenceDate=new Date()] - Reference instant
- * @returns {{ isEligible: boolean, age: number|null, code: string|null, reason: string|null, missingFields: string[] }}
+ * @returns {{ isComplete: boolean, age: number|null, code: string|null, reason: string|null, missingFields: string[] }}
  */
-export function checkUserEligibility(user, referenceDate = new Date()) {
+export function evaluateProfileCompleteness(user, referenceDate = new Date()) {
     if (!user) {
         return {
-            isEligible: false,
+            isComplete: false,
             age: null,
             code: "USER_NOT_FOUND",
             reason: "User account was not found.",
@@ -95,7 +99,7 @@ export function checkUserEligibility(user, referenceDate = new Date()) {
     if (user.dob) {
         if (age === null) {
             return {
-                isEligible: false,
+                isComplete: false,
                 age: null,
                 code: "INVALID_DOB",
                 reason: "Please provide a valid date of birth.",
@@ -105,7 +109,7 @@ export function checkUserEligibility(user, referenceDate = new Date()) {
 
         if (age < MINIMUM_LEGAL_AGE) {
             return {
-                isEligible: false,
+                isComplete: false,
                 age,
                 code: "UNDERAGE",
                 reason: `You must be at least ${MINIMUM_LEGAL_AGE} years old to use Engaze.`,
@@ -115,7 +119,7 @@ export function checkUserEligibility(user, referenceDate = new Date()) {
 
         if (age > MAXIMUM_VALID_AGE) {
             return {
-                isEligible: false,
+                isComplete: false,
                 age,
                 code: "INVALID_DOB",
                 reason: "Please provide a valid date of birth.",
@@ -142,7 +146,7 @@ export function checkUserEligibility(user, referenceDate = new Date()) {
     // If DOB was missing
     if (!user.dob) {
         return {
-            isEligible: false,
+            isComplete: false,
             age: null,
             code: "DOB_REQUIRED",
             reason: "Date of birth is required to verify age eligibility (18+).",
@@ -150,20 +154,76 @@ export function checkUserEligibility(user, referenceDate = new Date()) {
         };
     }
 
-    // If profile is missing required fields or isProfileComplete flag is false
-    if (missingFields.length > 0 || !user.isProfileComplete) {
+    // If any required profile fields are missing
+    if (missingFields.length > 0) {
         return {
-            isEligible: false,
+            isComplete: false,
             age,
             code: "PROFILE_INCOMPLETE",
             reason: "Please complete your dating profile to access this feature.",
-            missingFields: missingFields.length > 0 ? missingFields : ["isProfileComplete"],
+            missingFields,
+        };
+    }
+
+    return {
+        isComplete: true,
+        age,
+        code: null,
+        reason: null,
+        missingFields: [],
+    };
+}
+
+/**
+ * Authoritative check of a user's eligibility for adult dating surfaces
+ * (Discovery, Swipe, Matches, Chat, Random Video).
+ * 
+ * An account is eligible if:
+ * 1. Its profile fields and age satisfy completeness policy (evaluateProfileCompleteness).
+ * 2. Its persisted `isProfileComplete` flag is true (or not explicitly false).
+ * 
+ * @param {Object} user - User document or plain object
+ * @param {Date|string|number} [referenceDate=new Date()] - Reference instant
+ * @param {Object} [options={}]
+ * @param {boolean} [options.requirePersistedFlag=true] - Whether to require user.isProfileComplete === true
+ * @returns {{ isEligible: boolean, age: number|null, code: string|null, reason: string|null, missingFields: string[] }}
+ */
+export function checkUserEligibility(user, referenceDate = new Date(), options = {}) {
+    if (!user) {
+        return {
+            isEligible: false,
+            age: null,
+            code: "USER_NOT_FOUND",
+            reason: "User account was not found.",
+            missingFields: [],
+        };
+    }
+
+    const evaluation = evaluateProfileCompleteness(user, referenceDate);
+    if (!evaluation.isComplete) {
+        return {
+            isEligible: false,
+            age: evaluation.age,
+            code: evaluation.code,
+            reason: evaluation.reason,
+            missingFields: evaluation.missingFields,
+        };
+    }
+
+    // Gating adult surfaces requires the account's persisted completion flag to be true
+    if (options.requirePersistedFlag !== false && user.isProfileComplete === false) {
+        return {
+            isEligible: false,
+            age: evaluation.age,
+            code: "PROFILE_INCOMPLETE",
+            reason: "Please complete your dating profile to access this feature.",
+            missingFields: ["isProfileComplete"],
         };
     }
 
     return {
         isEligible: true,
-        age,
+        age: evaluation.age,
         code: null,
         reason: null,
         missingFields: [],

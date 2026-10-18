@@ -5,7 +5,7 @@ import { OAuth2Client } from "google-auth-library";
 import { User } from "../models/user.model.js";
 import { Meeting } from "../models/meeting.model.js";
 import { getJwtSecret, JWT_EXPIRES_IN } from "../config/jwt.js";
-import { calculateExactAge, checkUserEligibility } from "../services/eligibility.service.js";
+import { calculateExactAge, evaluateProfileCompleteness, checkUserEligibility } from "../services/eligibility.service.js";
 
 // Helper: Generate JWT token
 const generateToken = (user) => {
@@ -156,8 +156,8 @@ const register = async (req, res) => {
             isProfileComplete: false
         });
 
-        // Evaluate eligibility based on available profile fields
-        newUser.isProfileComplete = checkUserEligibility(newUser).isEligible;
+        // Evaluate profile completion purely based on profile fields & age policy
+        newUser.isProfileComplete = evaluateProfileCompleteness(newUser).isComplete;
 
         const token = generateToken(newUser);
         newUser.token = token;
@@ -390,8 +390,9 @@ const updateMyProfile = async (req, res) => {
             }
         }
 
-        // Automatic profile completion check using central eligibility service
-        user.isProfileComplete = checkUserEligibility(user).isEligible;
+        // Automatic profile completion check evaluated purely from profile fields & age policy
+        const completion = evaluateProfileCompleteness(user);
+        user.isProfileComplete = completion.isComplete;
 
         await user.save();
 

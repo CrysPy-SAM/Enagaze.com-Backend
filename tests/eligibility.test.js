@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
 import request from "supertest";
@@ -6,6 +6,7 @@ import jwt from "jsonwebtoken";
 
 import {
     calculateExactAge,
+    evaluateProfileCompleteness,
     checkUserEligibility,
     requireEligibility,
     MINIMUM_LEGAL_AGE,
@@ -17,6 +18,7 @@ import matchesRouter from "../src/routes/matches.routes.js";
 import chatRouter from "../src/routes/chat.routes.js";
 import { _testing as randomCallTesting } from "../src/controllers/randomCallManager.js";
 import { User } from "../src/models/user.model.js";
+import { updateMyProfile } from "../src/controllers/user.controller.js";
 
 describe("Age & Profile Eligibility Test Suite", () => {
     // Deterministic reference date for birthday calculations: 2024-10-18T12:00:00.000Z
@@ -498,6 +500,295 @@ describe("Age & Profile Eligibility Test Suite", () => {
             assert.equal(discRes.status, 200);
             assert.equal(matchRes.status, 200);
             assert.equal(chatRes.status, 200);
+        });
+    });
+
+    // =========================================================================
+    // 7. evaluateProfileCompleteness Decoupled Field Validation
+    // =========================================================================
+    describe("evaluateProfileCompleteness Decoupled Field Validation", () => {
+        it("returns isComplete: true even if isProfileComplete is initially false on user object", () => {
+            const initiallyIncompleteUser = {
+                _id: "65cb44444444444444444444",
+                name: "Rohan Varma",
+                username: "rohan_v",
+                dob: new Date("1996-02-14T00:00:00.000Z"),
+                gender: "male",
+                bio: "Outdoor adventurer & coffee lover",
+                photos: ["https://example.com/rohan1.jpg"],
+                isProfileComplete: false, // Persisted flag is false initially
+            };
+
+            const evaluation = evaluateProfileCompleteness(initiallyIncompleteUser, REF_DATE);
+            assert.equal(evaluation.isComplete, true, "Field evaluation must be decoupled from the persisted flag");
+            assert.equal(evaluation.age, 28);
+            assert.equal(evaluation.code, null);
+            assert.deepEqual(evaluation.missingFields, []);
+        });
+
+        it("returns isComplete: false if DOB is missing", () => {
+            const noDobUser = {
+                name: "Rohan Varma",
+                dob: null,
+                gender: "male",
+                bio: "Coffee lover",
+                photos: ["https://example.com/p.jpg"],
+            };
+            const evaluation = evaluateProfileCompleteness(noDobUser, REF_DATE);
+            assert.equal(evaluation.isComplete, false);
+            assert.equal(evaluation.code, "DOB_REQUIRED");
+            assert.ok(evaluation.missingFields.includes("dob"));
+        });
+
+        it("returns isComplete: false if user is underage (< 18)", () => {
+            const underageUser = {
+                name: "Young Teen",
+                dob: new Date("2010-01-01T00:00:00.000Z"),
+                gender: "male",
+                bio: "Teenager",
+                photos: ["https://example.com/p.jpg"],
+            };
+            const evaluation = evaluateProfileCompleteness(underageUser, REF_DATE);
+            assert.equal(evaluation.isComplete, false);
+            assert.equal(evaluation.code, "UNDERAGE");
+            assert.equal(evaluation.age, 14);
+        });
+
+        it("returns isComplete: false if photos array is empty or missing", () => {
+            const noPhotosUser = {
+                name: "Adult User",
+                dob: new Date("1995-01-01T00:00:00.000Z"),
+                gender: "male",
+                bio: "Bio here",
+                photos: [],
+            };
+            const evaluation = evaluateProfileCompleteness(noPhotosUser, REF_DATE);
+            assert.equal(evaluation.isComplete, false);
+            assert.equal(evaluation.code, "PROFILE_INCOMPLETE");
+            assert.ok(evaluation.missingFields.includes("photos"));
+        });
+    });
+
+    // =========================================================================
+    // 8. Profile-Update Onboarding & Discovery Unlock Regression Tests
+    // =========================================================================
+    describe("Profile-Update Onboarding & Discovery Unlock Regression", () => {
+        let app;
+        let currentUserDoc;
+        const originalFindById = User.findById;
+
+        beforeEach(() => {
+            app = express();
+            app.use(express.json());
+
+            // Mock User.findById to return our active in-memory user document
+            User.findById = async (id) => {
+                if (currentUserDoc && currentUserDoc._id.toString() === id.toString()) {
+                    return currentUserDoc;
+                }
+                return null;
+            };
+
+            // Express app mounting profile update & discovery
+            app.put(
+                "/api/v1/users/profile/me",
+                (req, res, next) => {
+                    req.user = currentUserDoc;
+                    next();
+                },
+                updateMyProfile
+            );
+
+            app.get(
+                "/api/v1/discovery",
+                (req, res, next) => {
+                    req.user = currentUserDoc;
+                    next();
+                },
+                requireEligibility,
+                (req, res) => {
+                    res.json({
+                        success: true,
+                        message: "Discovery feed unlocked",
+                        profiles: [{ name: "Target Match", age: 24 }],
+                    });
+                }
+            );
+        });
+
+        afterEach(() => {
+            User.findById = originalFindById;
+        });
+
+        it("REGRESSION: Incomplete adult account updates profile with valid fields, isProfileComplete becomes true, and unlocks discovery", async () => {
+            // 1. Initial State: User created with isProfileComplete: false, no DOB, no photos, no bio
+            currentUserDoc = new User({
+                _id: "65cb55555555555555555555",
+                name: "Karan Johar",
+                username: "karan_j",
+                dob: undefined,
+                gender: undefined,
+                bio: "",
+                photos: [],
+                isProfileComplete: false,
+            });
+            currentUserDoc.save = async function() { return this; };
+
+            // 2. Initial discovery attempt MUST be rejected with HTTP 403
+            const initialDiscRes = await request(app).get("/api/v1/discovery");
+            assert.equal(initialDiscRes.status, 403);
+            assert.equal(initialDiscRes.body.code, "DOB_REQUIRED");
+
+            // 3. Submit valid required profile fields and adult DOB via profile-update endpoint
+            const updatePayload = {
+                dob: "2000-08-15",
+                gender: "male",
+                bio: "Coffee enthusiast, UI developer and music lover.",
+                photos: ["https://example.com/karan_photo1.jpg"],
+            };
+
+            const updateRes = await request(app)
+                .put("/api/v1/users/profile/me")
+                .send(updatePayload);
+
+            assert.equal(updateRes.status, 200);
+            assert.equal(updateRes.body.success, true);
+            assert.equal(updateRes.body.profile.isProfileComplete, true, "isProfileComplete MUST become true");
+            assert.equal(currentUserDoc.isProfileComplete, true);
+
+            // 4. Subsequent discovery attempt MUST now succeed with HTTP 200
+            const subsequentDiscRes = await request(app).get("/api/v1/discovery");
+            assert.equal(subsequentDiscRes.status, 200);
+            assert.equal(subsequentDiscRes.body.success, true);
+            assert.equal(subsequentDiscRes.body.message, "Discovery feed unlocked");
+        });
+
+        it("NEGATIVE TEST: Under-18 DOB submission is rejected with HTTP 400 and discovery remains blocked", async () => {
+            currentUserDoc = new User({
+                _id: "65cb66666666666666666666",
+                name: "Minor Student",
+                username: "minor_s",
+                dob: undefined,
+                isProfileComplete: false,
+            });
+            currentUserDoc.save = async function() { return this; };
+
+            // Submit underage DOB (14 years old)
+            const updateRes = await request(app)
+                .put("/api/v1/users/profile/me")
+                .send({
+                    dob: "2010-05-20",
+                    gender: "male",
+                    bio: "Still in high school",
+                    photos: ["https://example.com/minor.jpg"],
+                });
+
+            assert.equal(updateRes.status, 400);
+            assert.match(updateRes.body.message, /18 years old/);
+            assert.equal(currentUserDoc.isProfileComplete, false);
+
+            // Discovery remains strictly blocked
+            const discRes = await request(app).get("/api/v1/discovery");
+            assert.equal(discRes.status, 403);
+        });
+
+        it("NEGATIVE TEST: Incomplete profile update (omitted DOB) leaves account ineligible", async () => {
+            currentUserDoc = new User({
+                _id: "65cb77777777777777777777",
+                name: "Partial User",
+                username: "partial_u",
+                dob: undefined,
+                isProfileComplete: false,
+            });
+            currentUserDoc.save = async function() { return this; };
+
+            // Update bio and photos but leave DOB missing
+            const updateRes = await request(app)
+                .put("/api/v1/users/profile/me")
+                .send({
+                    gender: "female",
+                    bio: "Loving the sunsets",
+                    photos: ["https://example.com/p1.jpg"],
+                });
+
+            assert.equal(updateRes.status, 200);
+            assert.equal(updateRes.body.profile.isProfileComplete, false);
+            assert.equal(currentUserDoc.isProfileComplete, false);
+
+            // Discovery remains blocked with DOB_REQUIRED
+            const discRes = await request(app).get("/api/v1/discovery");
+            assert.equal(discRes.status, 403);
+            assert.equal(discRes.body.code, "DOB_REQUIRED");
+        });
+
+        it("NEGATIVE TEST: Adult DOB with missing photos leaves profile incomplete and ineligible", async () => {
+            currentUserDoc = new User({
+                _id: "65cb88888888888888888888",
+                name: "No Photo User",
+                username: "no_photo_u",
+                dob: undefined,
+                isProfileComplete: false,
+            });
+            currentUserDoc.save = async function() { return this; };
+
+            // Submit adult DOB but empty photos array
+            const updateRes = await request(app)
+                .put("/api/v1/users/profile/me")
+                .send({
+                    dob: "1999-11-25",
+                    gender: "male",
+                    bio: "Software developer",
+                    photos: [],
+                });
+
+            assert.equal(updateRes.status, 200);
+            assert.equal(updateRes.body.profile.isProfileComplete, false);
+            assert.equal(currentUserDoc.isProfileComplete, false);
+
+            // Discovery remains blocked with PROFILE_INCOMPLETE
+            const discRes = await request(app).get("/api/v1/discovery");
+            assert.equal(discRes.status, 403);
+            assert.equal(discRes.body.code, "PROFILE_INCOMPLETE");
+            assert.ok(discRes.body.missingFields.includes("photos"));
+        });
+
+        it("GOOGLE SIGNUP & EXISTING NULL-DOB: completes onboarding with real DOB and unlocks discovery without fabricated data", async () => {
+            // Simulated Google Sign-up account with null DOB
+            currentUserDoc = new User({
+                _id: "65cb99999999999999999999",
+                name: "Google Signup User",
+                username: "google_user_88",
+                email: "googleuser@gmail.com",
+                googleId: "google_sub_1029384756",
+                authProvider: "google",
+                dob: null, // Null DOB preserved non-destructively
+                photos: ["https://lh3.googleusercontent.com/photo.jpg"],
+                isProfileComplete: false,
+            });
+            currentUserDoc.save = async function() { return this; };
+
+            // 1. Blocked initially from adult discovery
+            const initialRes = await request(app).get("/api/v1/discovery");
+            assert.equal(initialRes.status, 403);
+            assert.equal(initialRes.body.code, "DOB_REQUIRED");
+
+            // 2. User completes onboarding with their genuine self-declared adult DOB, gender, and bio
+            const onboardRes = await request(app)
+                .put("/api/v1/users/profile/me")
+                .send({
+                    dob: "1997-04-10",
+                    gender: "non-binary",
+                    bio: "Creative writer and digital nomad.",
+                });
+
+            assert.equal(onboardRes.status, 200);
+            assert.equal(onboardRes.body.profile.isProfileComplete, true);
+            assert.equal(currentUserDoc.isProfileComplete, true);
+
+            // 3. Discovery unlocks cleanly
+            const finalRes = await request(app).get("/api/v1/discovery");
+            assert.equal(finalRes.status, 200);
+            assert.equal(finalRes.body.success, true);
         });
     });
 });
