@@ -5,6 +5,7 @@ import { Swipe } from "../models/swipe.model.js";
 import { Match } from "../models/match.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { getIO } from "./socketManager.js";
+import { toPublicProfile } from "../serializers/profile.serializer.js";
 
 // ==========================================
 // 1. GET DISCOVERY PROFILES
@@ -101,7 +102,7 @@ const getDiscoveryProfiles = async (req, res) => {
         // 5. Execute query with safe projection
         const total = await User.countDocuments(query);
         const profiles = await User.find(query)
-            .select("name username dob gender bio photos interests createdAt")
+            .select("name dob gender bio photos interests isProfileComplete")
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit);
@@ -112,7 +113,7 @@ const getDiscoveryProfiles = async (req, res) => {
             limit,
             total,
             totalPages: Math.ceil(total / limit) || 1,
-            profiles: profiles.map((p) => p.toJSON()), // Virtuals like 'age' automatically included; passwords stripped
+            profiles: profiles.map((p) => toPublicProfile(p)),
         });
     } catch (e) {
         console.error("Get discovery profiles error:", e);
@@ -156,7 +157,7 @@ const swipe = async (req, res) => {
     try {
         // 4. Verify target user exists
         const targetUser = await User.findById(targetUserId).select(
-            "name username dob gender bio photos interests isProfileComplete"
+            "name dob gender bio photos interests isProfileComplete"
         );
         if (!targetUser) {
             return res.status(httpStatus.NOT_FOUND).json({
@@ -226,13 +227,13 @@ const swipe = async (req, res) => {
                 // Real-time socket notification to both matched users
                 const io = req.app.get("io") || getIO();
                 if (io) {
-                    const currentUserJson = typeof req.user.toJSON === "function" ? req.user.toJSON() : req.user;
-                    const targetUserJson = typeof targetUser.toJSON === "function" ? targetUser.toJSON() : targetUser;
+                    const currentUserPublic = toPublicProfile(req.user);
+                    const targetUserPublic = toPublicProfile(targetUser);
 
                     io.to(`user:${targetUserId.toString()}`).emit("match:new", {
                         match: {
                             _id: match._id,
-                            matchedUser: currentUserJson,
+                            matchedUser: currentUserPublic,
                             conversationId: conversation?._id,
                             createdAt: match.createdAt,
                         },
@@ -241,7 +242,7 @@ const swipe = async (req, res) => {
                     io.to(`user:${req.user._id.toString()}`).emit("match:new", {
                         match: {
                             _id: match._id,
-                            matchedUser: targetUserJson,
+                            matchedUser: targetUserPublic,
                             conversationId: conversation?._id,
                             createdAt: match.createdAt,
                         },
@@ -254,7 +255,7 @@ const swipe = async (req, res) => {
                     isMatch: true,
                     match: {
                         _id: match._id,
-                        matchedUser: targetUser.toJSON(),
+                        matchedUser: toPublicProfile(targetUser),
                         conversationId: conversation?._id,
                         createdAt: match.createdAt,
                     },
@@ -303,7 +304,7 @@ const getMatches = async (req, res) => {
             .limit(limit)
             .populate({
                 path: "users",
-                select: "name username dob gender bio photos interests",
+                select: "name dob gender bio photos interests isProfileComplete",
             });
 
         // Fetch corresponding conversation IDs for these matches
@@ -322,7 +323,7 @@ const getMatches = async (req, res) => {
                 return {
                     _id: m._id,
                     conversationId: matchToConvMap.get(m._id.toString()) || null,
-                    matchedUser: otherUser.toJSON(),
+                    matchedUser: toPublicProfile(otherUser),
                     createdAt: m.createdAt,
                 };
             })

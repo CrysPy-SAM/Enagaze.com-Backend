@@ -1,0 +1,123 @@
+/**
+ * Central Allowlist Serializers for Public and Peer Profiles
+ * 
+ * Enforces strict allowlisting of fields returned to external clients.
+ * Never includes login identifiers (username), exact dates of birth, emails,
+ * Google IDs, hashed passwords, auth tokens, or private preferences.
+ */
+
+/**
+ * Calculates integer age from a Date of Birth string or Date object.
+ * Returns null if dob is missing, null, or invalid.
+ *
+ * @param {Date|string|null|undefined} dob 
+ * @returns {number|null}
+ */
+export const calculateAge = (dob) => {
+    if (!dob) return null;
+    const birthDate = new Date(dob);
+    if (isNaN(birthDate.getTime())) return null;
+
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const monthDiff = today.getMonth() - birthDate.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+        age--;
+    }
+    return age >= 0 && age <= 130 ? age : null;
+};
+
+/**
+ * Serializes a user record for public/peer viewing (discovery deck, matches,
+ * conversation headers, random video partners, and socket notifications).
+ * 
+ * ALLOWLIST ONLY:
+ * - _id: String
+ * - name: String
+ * - age: Number | null (calculated from DOB; exact DOB is never returned)
+ * - gender: String | null
+ * - bio: String
+ * - photos: Array<String>
+ * - interests: Array<String>
+ * - isProfileComplete: Boolean
+ * 
+ * FORBIDDEN (NEVER RETURNED):
+ * - username (login identifier)
+ * - dob (exact date of birth)
+ * - email
+ * - googleId
+ * - password
+ * - token
+ * - datingPreferences
+ * - authProvider
+ * 
+ * @param {Object|null|undefined} user - Mongoose document or plain object
+ * @returns {Object|null}
+ */
+export const toPublicProfile = (user) => {
+    if (!user) return null;
+
+    const doc = typeof user.toObject === "function"
+        ? user.toObject({ virtuals: true })
+        : (typeof user.toJSON === "function" ? user.toJSON() : user);
+
+    const age = typeof doc.age === "number" && !isNaN(doc.age)
+        ? doc.age
+        : calculateAge(doc.dob);
+
+    return {
+        _id: doc._id ? doc._id.toString() : undefined,
+        name: typeof doc.name === "string" && doc.name.trim() ? doc.name.trim() : "Engaze Member",
+        age,
+        gender: typeof doc.gender === "string" ? doc.gender : null,
+        bio: typeof doc.bio === "string" ? doc.bio : "",
+        photos: Array.isArray(doc.photos) ? doc.photos : [],
+        interests: Array.isArray(doc.interests) ? doc.interests : [],
+        isProfileComplete: Boolean(doc.isProfileComplete),
+    };
+};
+
+/**
+ * Serializes a user record for message sender preview in chat payloads.
+ * 
+ * @param {Object|null|undefined} sender - Mongoose document or plain object
+ * @returns {Object|null}
+ */
+export const toSenderProfile = (sender) => {
+    if (!sender) return null;
+
+    const doc = typeof sender.toObject === "function"
+        ? sender.toObject()
+        : (typeof sender.toJSON === "function" ? sender.toJSON() : sender);
+
+    return {
+        _id: doc._id ? doc._id.toString() : undefined,
+        name: typeof doc.name === "string" && doc.name.trim() ? doc.name.trim() : "Engaze Member",
+        photos: Array.isArray(doc.photos) ? doc.photos : [],
+    };
+};
+
+/**
+ * Serializes a message document ensuring sender profile is sanitized.
+ * 
+ * @param {Object|null|undefined} message - Mongoose document or plain object
+ * @returns {Object|null}
+ */
+export const toMessageDto = (message) => {
+    if (!message) return null;
+
+    const doc = typeof message.toObject === "function"
+        ? message.toObject()
+        : (typeof message.toJSON === "function" ? message.toJSON() : message);
+
+    return {
+        _id: doc._id ? doc._id.toString() : undefined,
+        conversation: doc.conversation ? doc.conversation.toString() : undefined,
+        sender: toSenderProfile(doc.sender),
+        content: doc.content || "",
+        clientTempId: doc.clientTempId || undefined,
+        readBy: Array.isArray(doc.readBy) ? doc.readBy.map((id) => id?.toString() || id) : [],
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
+    };
+};

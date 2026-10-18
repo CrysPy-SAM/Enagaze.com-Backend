@@ -4,6 +4,7 @@ import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
 import { Match } from "../models/match.model.js";
 import { getIO } from "./socketManager.js";
+import { toPublicProfile, toSenderProfile, toMessageDto } from "../serializers/profile.serializer.js";
 
 // ==========================================
 // 1. GET ALL CONVERSATIONS FOR CURRENT USER
@@ -38,11 +39,12 @@ const getConversations = async (req, res) => {
             .sort({ lastMessageAt: -1 })
             .populate({
                 path: "participants",
-                select: "name username photos dob gender isProfileComplete",
+                select: "name photos dob gender bio interests isProfileComplete",
             })
             .populate({
                 path: "lastMessage",
                 select: "content sender createdAt readBy",
+                populate: { path: "sender", select: "name photos" },
             });
 
         // Compute unread counts and format other participant
@@ -60,19 +62,13 @@ const getConversations = async (req, res) => {
                     readBy: { $ne: userId },
                 });
 
-                const otherJson = typeof otherParticipant.toJSON === "function"
-                    ? otherParticipant.toJSON()
-                    : otherParticipant;
-
-                const lastMsgJson = conv.lastMessage
-                    ? (typeof conv.lastMessage.toJSON === "function" ? conv.lastMessage.toJSON() : conv.lastMessage)
-                    : null;
+                const lastMsgDto = conv.lastMessage ? toMessageDto(conv.lastMessage) : null;
 
                 return {
                     _id: conv._id,
                     match: conv.match,
-                    otherParticipant: otherJson,
-                    lastMessage: lastMsgJson,
+                    otherParticipant: toPublicProfile(otherParticipant),
+                    lastMessage: lastMsgDto,
                     lastMessageAt: conv.lastMessageAt,
                     unreadCount,
                 };
@@ -108,7 +104,7 @@ const getOrCreateConversationByMatch = async (req, res) => {
     try {
         const match = await Match.findById(matchId).populate({
             path: "users",
-            select: "name username photos dob gender isProfileComplete",
+            select: "name photos dob gender bio interests isProfileComplete",
         });
 
         if (!match) {
@@ -149,7 +145,7 @@ const getOrCreateConversationByMatch = async (req, res) => {
             conversation: {
                 _id: conversation._id,
                 match: match._id,
-                otherParticipant: otherParticipant ? otherParticipant.toJSON() : null,
+                otherParticipant: otherParticipant ? toPublicProfile(otherParticipant) : null,
                 lastMessage: conversation.lastMessage,
                 lastMessageAt: conversation.lastMessageAt,
             },
@@ -209,7 +205,7 @@ const getMessages = async (req, res) => {
             .limit(limit)
             .populate({
                 path: "sender",
-                select: "name username photos",
+                select: "name photos",
             });
 
         const messagesChronological = messagesDesc.reverse();
@@ -221,7 +217,7 @@ const getMessages = async (req, res) => {
             page,
             limit,
             totalPages: Math.ceil(total / limit) || 1,
-            messages: messagesChronological,
+            messages: messagesChronological.map(toMessageDto),
         });
     } catch (e) {
         console.error("Get messages error:", e);
@@ -358,12 +354,12 @@ const sendMessageRest = async (req, res) => {
             const existing = await Message.findOne({
                 conversation: conversationId,
                 clientTempId,
-            }).populate({ path: "sender", select: "name username photos" });
+            }).populate({ path: "sender", select: "name photos" });
 
             if (existing) {
                 return res.status(httpStatus.OK).json({
                     success: true,
-                    message: existing,
+                    message: toMessageDto(existing),
                     duplicate: true,
                 });
             }
@@ -384,8 +380,8 @@ const sendMessageRest = async (req, res) => {
         conversation.lastMessageAt = newMessage.createdAt;
         await conversation.save();
 
-        await newMessage.populate({ path: "sender", select: "name username photos" });
-        const messageJson = newMessage.toJSON();
+        await newMessage.populate({ path: "sender", select: "name photos" });
+        const messageDto = toMessageDto(newMessage);
 
         // Broadcast to conversation room AND all participant user rooms
         const io = req.app?.get("io") || getIO();
@@ -397,12 +393,12 @@ const sendMessageRest = async (req, res) => {
                     broadcast = broadcast.to(`user:${p.toString()}`);
                 }
             }
-            broadcast.emit("chat:new-message", messageJson);
+            broadcast.emit("chat:new-message", messageDto);
         }
 
         return res.status(httpStatus.CREATED).json({
             success: true,
-            message: messageJson,
+            message: messageDto,
         });
     } catch (e) {
         // Catch duplicate key error if concurrent retry
@@ -410,12 +406,12 @@ const sendMessageRest = async (req, res) => {
             const existing = await Message.findOne({
                 conversation: conversationId,
                 clientTempId,
-            }).populate({ path: "sender", select: "name username photos" });
+            }).populate({ path: "sender", select: "name photos" });
 
             if (existing) {
                 return res.status(httpStatus.OK).json({
                     success: true,
-                    message: existing,
+                    message: toMessageDto(existing),
                     duplicate: true,
                 });
             }

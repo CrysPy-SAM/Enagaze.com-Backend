@@ -6,6 +6,7 @@ import { Message } from "../models/message.model.js";
 import { registerRandomCallHandlers } from "./randomCallManager.js";
 import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
+import { toMessageDto } from "../serializers/profile.serializer.js";
 
 let connections = {};
 let messages = {};
@@ -172,10 +173,10 @@ export const connectToSocket = (server) => {
                     const existing = await Message.findOne({
                         conversation: conversationId,
                         clientTempId,
-                    }).populate({ path: "sender", select: "name username photos" });
+                    }).populate({ path: "sender", select: "name photos" });
 
                     if (existing) {
-                        if (typeof ack === "function") ack({ success: true, message: existing.toJSON(), duplicate: true });
+                        if (typeof ack === "function") ack({ success: true, message: toMessageDto(existing), duplicate: true });
                         return;
                     }
                 }
@@ -196,8 +197,8 @@ export const connectToSocket = (server) => {
                 conversation.lastMessageAt = newMsg.createdAt;
                 await conversation.save();
 
-                await newMsg.populate({ path: "sender", select: "name username photos" });
-                const messageJson = newMsg.toJSON();
+                await newMsg.populate({ path: "sender", select: "name photos" });
+                const messageDto = toMessageDto(newMsg);
 
                 // Broadcast to conversation room AND all participant user rooms (deduplicated by socket.io)
                 const roomName = `conversation:${conversationId}`;
@@ -207,10 +208,10 @@ export const connectToSocket = (server) => {
                         broadcast = broadcast.to(`user:${p.toString()}`);
                     }
                 }
-                broadcast.emit("chat:new-message", messageJson);
+                broadcast.emit("chat:new-message", messageDto);
 
                 if (typeof ack === "function") {
-                    ack({ success: true, message: messageJson });
+                    ack({ success: true, message: messageDto });
                 }
             } catch (e) {
                 // Handle idempotency race condition gracefully
@@ -218,10 +219,10 @@ export const connectToSocket = (server) => {
                     const existing = await Message.findOne({
                         conversation: conversationId,
                         clientTempId,
-                    }).populate({ path: "sender", select: "name username photos" });
+                    }).populate({ path: "sender", select: "name photos" });
 
                     if (existing && typeof ack === "function") {
-                        return ack({ success: true, message: existing.toJSON(), duplicate: true });
+                        return ack({ success: true, message: toMessageDto(existing), duplicate: true });
                     }
                 }
 

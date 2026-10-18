@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { User } from "../models/user.model.js";
+import { toPublicProfile } from "../serializers/profile.serializer.js";
 
 // In-memory matchmaking state
 const matchmakingQueue = [];
@@ -69,18 +70,11 @@ function endActiveCall(callId, initiatorSocketId, reason, io) {
  */
 async function getPublicProfile(userId) {
     try {
-        const user = await User.findById(userId).select("name username photos gender bio");
-        if (!user) return { _id: userId, name: "Engaze Member", photos: [] };
-        return {
-            _id: user._id,
-            name: user.name,
-            username: user.username,
-            photos: user.photos || [],
-            gender: user.gender,
-            bio: user.bio,
-        };
+        const user = await User.findById(userId).select("name dob photos gender bio interests isProfileComplete");
+        if (!user) return { _id: userId ? userId.toString() : undefined, name: "Engaze Member", photos: [] };
+        return toPublicProfile(user);
     } catch {
-        return { _id: userId, name: "Engaze Member", photos: [] };
+        return { _id: userId ? userId.toString() : undefined, name: "Engaze Member", photos: [] };
     }
 }
 
