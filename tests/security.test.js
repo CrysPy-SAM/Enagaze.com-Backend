@@ -303,6 +303,31 @@ describe("Batch 1 Security Hardening Test Suite", () => {
             assert.equal(res.body.success, false);
             assert.match(res.body.message, /Invalid authentication token/i);
         });
+
+        it("POST /api/v1/users/login triggers 429 when threshold is exceeded from the same IP", async () => {
+            const uniqueTestIp = "192.0.2.77";
+
+            // Send 10 attempts (loginIpLimiter limit is 10)
+            for (let i = 0; i < 10; i++) {
+                const res = await request(app)
+                    .post("/api/v1/users/login")
+                    .set("X-Forwarded-For", uniqueTestIp)
+                    .send({});
+                // Missing credentials returns 400 immediately without querying database
+                assert.equal(res.status, 400);
+            }
+
+            // 11th attempt must be blocked by rate limiter with 429
+            const blockedRes = await request(app)
+                .post("/api/v1/users/login")
+                .set("X-Forwarded-For", uniqueTestIp)
+                .send({});
+
+            assert.equal(blockedRes.status, 429);
+            assert.equal(blockedRes.body.success, false);
+            assert.match(blockedRes.body.message, /Too many login attempts/i);
+            assert.ok(blockedRes.body.retryAfterSeconds > 0);
+        });
     });
 });
 

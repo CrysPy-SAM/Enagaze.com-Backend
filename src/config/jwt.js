@@ -42,10 +42,10 @@ export const validateJwtConfig = ({ exitOnError = true } = {}) => {
 
         if (!trimmed) {
             failureReason = "JWT_SECRET environment variable is required in production.";
-        } else if (trimmed.length < 32) {
-            failureReason = "JWT_SECRET must be at least 32 characters long in production for cryptographic safety.";
         } else if (DISALLOWED_PRODUCTION_SECRETS.has(trimmed.toLowerCase())) {
             failureReason = "JWT_SECRET cannot use an insecure development placeholder in production.";
+        } else if (trimmed.length < 32) {
+            failureReason = "JWT_SECRET must be at least 32 characters long in production for cryptographic safety.";
         }
 
         if (failureReason) {
