@@ -6,7 +6,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import jwt from "jsonwebtoken";
 
-import { validateJwtConfig, getJwtSecret, JWT_EXPIRES_IN } from "../src/config/jwt.js";
+import { validateJwtConfig, getJwtSecret, normalizeSecret, JWT_EXPIRES_IN } from "../src/config/jwt.js";
 import { isOriginAllowed, corsOptions, getAllowedOrigins } from "../src/config/cors.js";
 import { app } from "../src/app.js";
 
@@ -60,6 +60,8 @@ describe("Batch 1 Security Hardening Test Suite", () => {
             const placeholders = [
                 "engaze_super_secret_jwt_key_2026_dev_secure",
                 "your_jwt_secret_key_change_in_production",
+                "your_super_strong_random_jwt_secret_key_here",
+                "replace_with_a_secure_random_at_least_32_char_hex_secret_in_production",
                 "secret",
                 "dev_secret",
                 "change_me",
@@ -75,6 +77,21 @@ describe("Batch 1 Security Hardening Test Suite", () => {
             }
         });
 
+        it("fails startup in production when placeholder is enclosed in quotes", () => {
+            process.env.NODE_ENV = "production";
+            process.env.JWT_SECRET = '"engaze_super_secret_jwt_key_2026_dev_secure"';
+            assert.throws(
+                () => validateJwtConfig({ exitOnError: false }),
+                /cannot use an insecure development placeholder in production/
+            );
+
+            process.env.JWT_SECRET = "'your_jwt_secret_key_change_in_production'";
+            assert.throws(
+                () => validateJwtConfig({ exitOnError: false }),
+                /cannot use an insecure development placeholder in production/
+            );
+        });
+
         it("succeeds in production when JWT_SECRET is a cryptographically strong >=32 char string", () => {
             process.env.NODE_ENV = "production";
             process.env.JWT_SECRET = "c0a80101b4c9e8d7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3";
@@ -82,6 +99,38 @@ describe("Batch 1 Security Hardening Test Suite", () => {
             const result = validateJwtConfig({ exitOnError: false });
             assert.equal(result, true);
             assert.equal(getJwtSecret(), process.env.JWT_SECRET);
+        });
+
+        it("succeeds in production when valid JWT_SECRET has enclosing quotes", () => {
+            process.env.NODE_ENV = "production";
+            const rawSecret = "c0a80101b4c9e8d7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3";
+            process.env.JWT_SECRET = `"${rawSecret}"`;
+
+            const result = validateJwtConfig({ exitOnError: false });
+            assert.equal(result, true);
+            assert.equal(getJwtSecret(), rawSecret);
+        });
+
+        it("refuses to activate development fallback in production mode when JWT_SECRET is invalid", () => {
+            process.env.NODE_ENV = "production";
+            delete process.env.JWT_SECRET;
+            assert.throws(() => getJwtSecret(), /JWT_SECRET environment variable is missing in production/);
+
+            process.env.JWT_SECRET = "short";
+            assert.throws(() => getJwtSecret(), /Insecure JWT_SECRET used in production/);
+
+            process.env.JWT_SECRET = "engaze_super_secret_jwt_key_2026_dev_secure";
+            assert.throws(() => getJwtSecret(), /Insecure JWT_SECRET used in production/);
+        });
+
+        it("normalizeSecret correctly trims whitespace and strips enclosing quotes", () => {
+            assert.equal(normalizeSecret(""), "");
+            assert.equal(normalizeSecret(null), "");
+            assert.equal(normalizeSecret(undefined), "");
+            assert.equal(normalizeSecret("  hello  "), "hello");
+            assert.equal(normalizeSecret('"quoted_secret"'), "quoted_secret");
+            assert.equal(normalizeSecret("'single_quoted_secret'"), "single_quoted_secret");
+            assert.equal(normalizeSecret('  "spaced_quoted"  '), "spaced_quoted");
         });
 
         it("does NOT generate different random secrets across server restarts in development", () => {

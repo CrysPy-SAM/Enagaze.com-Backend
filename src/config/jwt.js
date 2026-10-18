@@ -10,6 +10,8 @@ const DISALLOWED_PRODUCTION_SECRETS = new Set([
     "your_jwt_secret",
     "your_jwt_secret_here",
     "your_super_secret_jwt_key",
+    "your_super_strong_random_jwt_secret_key_here",
+    "replace_with_a_secure_random_at_least_32_char_hex_secret_in_production",
     "secret",
     "dev_secret",
     "development_secret",
@@ -24,6 +26,21 @@ const DISALLOWED_PRODUCTION_SECRETS = new Set([
 const DEV_FALLBACK_SECRET = "engaze_local_dev_only_jwt_secret_never_use_in_production";
 
 /**
+ * Normalizes a raw secret string: trims whitespace and strips enclosing quotes if present.
+ *
+ * @param {any} val
+ * @returns {string}
+ */
+export const normalizeSecret = (val) => {
+    if (!val) return "";
+    let s = String(val).trim();
+    if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+        s = s.slice(1, -1).trim();
+    }
+    return s;
+};
+
+/**
  * Validates JWT configuration at server bootstrap or in test suites.
  * In production: terminates the process (or throws) if JWT_SECRET is missing, too short, or an insecure placeholder.
  * In development: logs a visible warning and permits local testing.
@@ -35,7 +52,7 @@ const DEV_FALLBACK_SECRET = "engaze_local_dev_only_jwt_secret_never_use_in_produ
 export const validateJwtConfig = ({ exitOnError = true } = {}) => {
     const isProduction = process.env.NODE_ENV === "production";
     const rawSecret = process.env.JWT_SECRET;
-    const trimmed = rawSecret ? String(rawSecret).trim() : "";
+    const trimmed = normalizeSecret(rawSecret);
 
     if (isProduction) {
         let failureReason = null;
@@ -74,7 +91,7 @@ export const validateJwtConfig = ({ exitOnError = true } = {}) => {
  * @returns {string} The active JWT secret
  */
 export const getJwtSecret = () => {
-    const trimmed = process.env.JWT_SECRET ? String(process.env.JWT_SECRET).trim() : "";
+    const trimmed = normalizeSecret(process.env.JWT_SECRET);
 
     if (trimmed) {
         if (process.env.NODE_ENV === "production") {

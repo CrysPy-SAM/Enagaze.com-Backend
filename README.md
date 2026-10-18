@@ -152,7 +152,7 @@ The backend relies on the following environment variables loaded via `dotenv`:
 | :--- | :---: | :--- | :--- |
 | `PORT` | No | `8000` | Port on which the HTTP and WebSocket server listens. |
 | `MONGO_URI` | **Yes** | *None* (warns if missing) | MongoDB connection string (Atlas or local). |
-| `JWT_SECRET` | **Yes** (Prod) | `engaze_super_secret_jwt_key_2026_dev_secure` | Secret key used to sign and verify JWT authentication tokens. |
+| `JWT_SECRET` | **Yes** (Prod) | *None* (Fails startup if missing in production) | Cryptographically secure secret (minimum 32 characters) used to sign and verify JWT authentication tokens. Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `JWT_EXPIRES_IN` | No | `7d` | Lifetime of issued JWT tokens (e.g., `7d`, `24h`). |
 | `NODE_ENV` | No | `development` | Runtime mode (`development` or `production`). In non-production, CORS allows all origins. |
 | `CLIENT_URL` | No | `https://engaze-com.vercel.app` | Explicit frontend origin allowed through CORS. |
@@ -161,7 +161,7 @@ The backend relies on the following environment variables loaded via `dotenv`:
 ```env
 PORT=8000
 MONGO_URI=mongodb+srv://<username>:<password>@cluster0.example.mongodb.net/engaze?retryWrites=true&w=majority
-JWT_SECRET=your_super_strong_random_jwt_secret_key_here
+JWT_SECRET=replace_with_a_secure_random_at_least_32_char_hex_secret_in_production
 JWT_EXPIRES_IN=7d
 NODE_ENV=development
 CLIENT_URL=https://engaze-com.vercel.app
