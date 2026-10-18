@@ -269,8 +269,49 @@ const getMessages = async (req, res) => {
             }
         }
 
-        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
+
+        // Cursor-based missed message recovery: fetch messages created after a given message ID
+        if (req.query.after) {
+            if (!mongoose.Types.ObjectId.isValid(req.query.after)) {
+                return res.status(httpStatus.BAD_REQUEST).json({
+                    success: false,
+                    message: "Invalid after message ID",
+                });
+            }
+
+            const afterMessage = await Message.findById(req.query.after).select("_id createdAt");
+            const afterFilter = {
+                conversation: conversationId,
+            };
+            if (afterMessage) {
+                // Compound cursor: strictly greater timestamp OR same timestamp with greater _id tie-breaker
+                afterFilter.$or = [
+                    { createdAt: { $gt: afterMessage.createdAt } },
+                    { createdAt: afterMessage.createdAt, _id: { $gt: afterMessage._id } },
+                ];
+            } else {
+                afterFilter._id = { $gt: new mongoose.Types.ObjectId(req.query.after) };
+            }
+
+            const missedMessages = await Message.find(afterFilter)
+                .sort({ createdAt: 1, _id: 1 })
+                .limit(limit)
+                .populate({
+                    path: "sender",
+                    select: "name photos",
+                });
+
+            return res.status(httpStatus.OK).json({
+                success: true,
+                conversationId,
+                messages: missedMessages.map(toMessageDto),
+                after: req.query.after,
+                count: missedMessages.length,
+            });
+        }
+
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const skip = (page - 1) * limit;
 
         const total = await Message.countDocuments({ conversation: conversationId });
