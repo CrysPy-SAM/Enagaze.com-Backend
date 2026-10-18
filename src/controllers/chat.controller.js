@@ -432,6 +432,17 @@ const sendMessageRest = async (req, res) => {
         });
     }
 
+    let sanitizedTempId = undefined;
+    if (clientTempId !== undefined && clientTempId !== null) {
+        if (typeof clientTempId !== "string" || clientTempId.length > 100) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "Invalid clientTempId format: string up to 100 characters expected",
+            });
+        }
+        sanitizedTempId = clientTempId.trim() || undefined;
+    }
+
     try {
         const conversation = await Conversation.findById(conversationId);
         if (!conversation) {
@@ -487,11 +498,12 @@ const sendMessageRest = async (req, res) => {
             }
         }
 
-        // Check for idempotency key to prevent duplicates
-        if (clientTempId) {
+        // Check for idempotency key to prevent duplicates scoped to conversation, sender, and clientTempId
+        if (sanitizedTempId) {
             const existing = await Message.findOne({
                 conversation: conversationId,
-                clientTempId,
+                sender: req.user._id,
+                clientTempId: sanitizedTempId,
             }).populate({ path: "sender", select: "name photos" });
 
             if (existing) {
@@ -507,7 +519,7 @@ const sendMessageRest = async (req, res) => {
             conversation: conversationId,
             sender: req.user._id,
             content: trimmed,
-            clientTempId: clientTempId || undefined,
+            clientTempId: sanitizedTempId,
             readBy: [req.user._id],
         });
 
@@ -540,10 +552,11 @@ const sendMessageRest = async (req, res) => {
         });
     } catch (e) {
         // Catch duplicate key error if concurrent retry
-        if (e.code === 11000) {
+        if (e.code === 11000 && sanitizedTempId) {
             const existing = await Message.findOne({
                 conversation: conversationId,
-                clientTempId,
+                sender: req.user._id,
+                clientTempId: sanitizedTempId,
             }).populate({ path: "sender", select: "name photos" });
 
             if (existing) {

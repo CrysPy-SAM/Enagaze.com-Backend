@@ -8,6 +8,7 @@ import { Conversation } from "../models/conversation.model.js";
 import { getIO } from "./socketManager.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
+import { findOrCreateCanonicalMatchAndConversation } from "../services/matching.service.js";
 
 // ==========================================
 // 1. GET DISCOVERY PROFILES
@@ -213,20 +214,97 @@ const swipe = async (req, res) => {
         });
 
         if (existingSwipe) {
+            // Idempotent duplicate retry if action matches
+            if (existingSwipe.action === action) {
+                if (action === "like") {
+                    const userPair = Match.getCanonicalPair(req.user._id, targetUserId);
+                    const activeMatch = await Match.findOne({ userPair, status: "active" });
+                    if (activeMatch) {
+                        const conversation = await Conversation.findOne({ match: activeMatch._id });
+                        return res.status(httpStatus.OK).json({
+                            success: true,
+                            action,
+                            isMatch: true,
+                            duplicate: true,
+                            match: {
+                                _id: activeMatch._id,
+                                matchedUser: toPublicProfile(targetUser),
+                                conversationId: conversation?._id,
+                                createdAt: activeMatch.createdAt,
+                            },
+                        });
+                    }
+                }
+                return res.status(httpStatus.OK).json({
+                    success: true,
+                    action,
+                    isMatch: false,
+                    duplicate: true,
+                });
+            }
+
+            // Conflicting action (e.g. was pass, now like)
             return res.status(httpStatus.CONFLICT).json({
                 success: false,
+                code: "SWIPE_EXISTS",
                 message: "You have already swiped on this profile",
                 action: existingSwipe.action,
             });
         }
 
-        // 6. Record swipe
-        const newSwipe = new Swipe({
-            fromUser: req.user._id,
-            toUser: targetUserId,
-            action,
-        });
-        await newSwipe.save();
+        // 6. Record swipe with duplicate-key recovery
+        let newSwipe;
+        try {
+            newSwipe = await Swipe.create({
+                fromUser: req.user._id,
+                toUser: targetUserId,
+                action,
+            });
+        } catch (e) {
+            if (e.code === 11000) {
+                // Concurrent duplicate swipe from same user
+                const concurrentSwipe = await Swipe.findOne({
+                    fromUser: req.user._id,
+                    toUser: targetUserId,
+                });
+                if (concurrentSwipe) {
+                    if (concurrentSwipe.action === action) {
+                        if (action === "like") {
+                            const userPair = Match.getCanonicalPair(req.user._id, targetUserId);
+                            const activeMatch = await Match.findOne({ userPair, status: "active" });
+                            if (activeMatch) {
+                                const conversation = await Conversation.findOne({ match: activeMatch._id });
+                                return res.status(httpStatus.OK).json({
+                                    success: true,
+                                    action,
+                                    isMatch: true,
+                                    duplicate: true,
+                                    match: {
+                                        _id: activeMatch._id,
+                                        matchedUser: toPublicProfile(targetUser),
+                                        conversationId: conversation?._id,
+                                        createdAt: activeMatch.createdAt,
+                                    },
+                                });
+                            }
+                        }
+                        return res.status(httpStatus.OK).json({
+                            success: true,
+                            action,
+                            isMatch: false,
+                            duplicate: true,
+                        });
+                    }
+                    return res.status(httpStatus.CONFLICT).json({
+                        success: false,
+                        code: "SWIPE_EXISTS",
+                        message: "A swipe record already exists for this profile",
+                        action: concurrentSwipe.action,
+                    });
+                }
+            }
+            throw e;
+        }
 
         // 7. Check for mutual match if action is "like"
         if (action === "like") {
@@ -237,56 +315,37 @@ const swipe = async (req, res) => {
             });
 
             if (reverseLike) {
-                // Mutual match found! Create or fetch canonical match
-                const userPair = Match.getCanonicalPair(req.user._id, targetUserId);
-
-                const match = await Match.findOneAndUpdate(
-                    { userPair },
-                    {
-                        $setOnInsert: {
-                            users: [req.user._id, targetUserId],
-                            userPair,
-                        },
-                    },
-                    { upsert: true, new: true, setDefaultsOnInsert: true }
+                // Mutual match found! Create or fetch canonical match and conversation
+                const { match, conversation, isNewMatch } = await findOrCreateCanonicalMatchAndConversation(
+                    req.user._id,
+                    targetUserId
                 );
 
-                // Atomically ensure conversation record exists for this mutual match
-                const conversation = await Conversation.findOneAndUpdate(
-                    { match: match._id },
-                    {
-                        $setOnInsert: {
-                            match: match._id,
-                            participants: [req.user._id, targetUserId],
-                            lastMessageAt: match.createdAt || new Date(),
-                        },
-                    },
-                    { upsert: true, new: true, setDefaultsOnInsert: true }
-                );
+                // Real-time socket notification strictly if this thread created the canonical match
+                if (isNewMatch) {
+                    const io = req.app?.get("io") || getIO();
+                    if (io) {
+                        const currentUserPublic = toPublicProfile(req.user);
+                        const targetUserPublic = toPublicProfile(targetUser);
 
-                // Real-time socket notification to both matched users
-                const io = req.app.get("io") || getIO();
-                if (io) {
-                    const currentUserPublic = toPublicProfile(req.user);
-                    const targetUserPublic = toPublicProfile(targetUser);
+                        io.to(`user:${targetUserId.toString()}`).emit("match:new", {
+                            match: {
+                                _id: match._id,
+                                matchedUser: currentUserPublic,
+                                conversationId: conversation?._id,
+                                createdAt: match.createdAt,
+                            },
+                        });
 
-                    io.to(`user:${targetUserId.toString()}`).emit("match:new", {
-                        match: {
-                            _id: match._id,
-                            matchedUser: currentUserPublic,
-                            conversationId: conversation?._id,
-                            createdAt: match.createdAt,
-                        },
-                    });
-
-                    io.to(`user:${req.user._id.toString()}`).emit("match:new", {
-                        match: {
-                            _id: match._id,
-                            matchedUser: targetUserPublic,
-                            conversationId: conversation?._id,
-                            createdAt: match.createdAt,
-                        },
-                    });
+                        io.to(`user:${req.user._id.toString()}`).emit("match:new", {
+                            match: {
+                                _id: match._id,
+                                matchedUser: targetUserPublic,
+                                conversationId: conversation?._id,
+                                createdAt: match.createdAt,
+                            },
+                        });
+                    }
                 }
 
                 return res.status(httpStatus.CREATED).json({
@@ -310,14 +369,6 @@ const swipe = async (req, res) => {
             isMatch: false,
         });
     } catch (e) {
-        // Handle race conditions where compound index catches concurrent duplicate swipes
-        if (e.code === 11000) {
-            return res.status(httpStatus.CONFLICT).json({
-                success: false,
-                message: "A swipe record already exists for this profile",
-            });
-        }
-
         console.error("Swipe processing error:", e);
         return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
             success: false,

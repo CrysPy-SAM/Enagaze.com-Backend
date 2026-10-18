@@ -290,10 +290,11 @@ export const connectToSocket = (server) => {
                     }
                 }
 
-                // Check for duplicate retry using sanitizedTempId
+                // Check for duplicate retry using sanitizedTempId scoped to sender
                 if (sanitizedTempId) {
                     const existing = await Message.findOne({
                         conversation: conversationId,
+                        sender: socket.userId,
                         clientTempId: sanitizedTempId,
                     }).populate({ path: "sender", select: "name photos" });
 
@@ -340,6 +341,7 @@ export const connectToSocket = (server) => {
                 if (e.code === 11000 && sanitizedTempId) {
                     const existing = await Message.findOne({
                         conversation: conversationId,
+                        sender: socket.userId,
                         clientTempId: sanitizedTempId,
                     }).populate({ path: "sender", select: "name photos" });
 

@@ -40,10 +40,17 @@ const messageSchema = new Schema(
 messageSchema.index({ conversation: 1, createdAt: 1 });
 messageSchema.index({ conversation: 1, _id: -1 });
 
-// Sparse unique index on clientTempId within a conversation to guarantee idempotent retries
+// Compound unique index with partialFilterExpression scoped to conversation, sender, and clientTempId.
+// Using partialFilterExpression avoids compound sparse index collisions on null/missing clientTempId,
+// and scoping by sender prevents cross-sender collisions when different clients generate the same temporary ID.
 messageSchema.index(
-    { conversation: 1, clientTempId: 1 },
-    { unique: true, sparse: true }
+    { conversation: 1, sender: 1, clientTempId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            clientTempId: { $type: "string" },
+        },
+    }
 );
 
 const Message = mongoose.model("Message", messageSchema);
