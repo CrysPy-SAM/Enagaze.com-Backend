@@ -409,10 +409,14 @@ describe("Prompt 9: Reliable Chat Reconnect, Acknowledgement Retry & Message Rec
         };
 
         Message.findOne = (filter) => {
+            const fSenderStr = filter.sender?._id ? filter.sender._id.toString() : filter.sender?.toString();
             const found = inMemoryMessages.find((m) => {
                 if (filter._id && m._id.toString() !== filter._id.toString()) return false;
                 if (filter.conversation && m.conversation.toString() !== filter.conversation.toString()) return false;
-                if (filter.sender && m.sender.toString() !== filter.sender.toString()) return false;
+                if (fSenderStr) {
+                    const mSenderStr = m.sender?._id ? m.sender._id.toString() : m.sender?.toString();
+                    if (mSenderStr !== fSenderStr) return false;
+                }
                 if (filter.clientTempId !== undefined && m.clientTempId !== filter.clientTempId) return false;
                 return true;
             }) || null;
@@ -943,6 +947,234 @@ describe("Prompt 9: Reliable Chat Reconnect, Acknowledgement Retry & Message Rec
 
             const validResult = handleResponse("conv_A", [{ _id: "valid_msg" }]);
             assert.ok(validResult, "Active conversation response must be processed");
+        });
+    });
+
+    // =========================================================================
+    // 5. Invariants: Missing IDs, Sender Collisions, Two Devices & Gap Recovery
+    // =========================================================================
+    describe("5. Invariants: Missing IDs, Sender Collisions, Two Devices & Gap Recovery", () => {
+        it("Scenario 1: Missing, empty, or null clientTempId is allowed and does not cause duplicate key collisions", async () => {
+            // Send multiple messages with no clientTempId via REST
+            const res1 = await request(app)
+                .post(`/api/v1/conversations/${testConversationId}/messages`)
+                .set("Authorization", `Bearer ${tokenA}`)
+                .send({ content: "Message without tempId 1" });
+            assert.equal(res1.status, 201);
+            assert.equal(res1.body.success, true);
+            assert.equal(res1.body.message.content, "Message without tempId 1");
+
+            const res2 = await request(app)
+                .post(`/api/v1/conversations/${testConversationId}/messages`)
+                .set("Authorization", `Bearer ${tokenA}`)
+                .send({ content: "Message without tempId 2" });
+            assert.equal(res2.status, 201);
+            assert.equal(res2.body.success, true);
+            assert.notEqual(res1.body.message._id, res2.body.message._id);
+
+            // Send with empty string and null clientTempId
+            const res3 = await request(app)
+                .post(`/api/v1/conversations/${testConversationId}/messages`)
+                .set("Authorization", `Bearer ${tokenA}`)
+                .send({ content: "Message with empty tempId", clientTempId: "" });
+            assert.equal(res3.status, 201);
+
+            const res4 = await request(app)
+                .post(`/api/v1/conversations/${testConversationId}/messages`)
+                .set("Authorization", `Bearer ${tokenA}`)
+                .send({ content: "Message with null tempId", clientTempId: null });
+            assert.equal(res4.status, 201);
+
+            // Send without clientTempId via Socket.IO
+            const { client: clientA } = await connectClient(port, { auth: { token: tokenA } });
+            await new Promise((res) => clientA.emit("chat:join", { conversationId: testConversationId }, res));
+
+            const sockAck1 = await new Promise((res) => {
+                clientA.emit("chat:send", { conversationId: testConversationId, content: "Socket msg without tempId 1" }, res);
+            });
+            assert.equal(sockAck1.success, true);
+
+            const sockAck2 = await new Promise((res) => {
+                clientA.emit("chat:send", { conversationId: testConversationId, content: "Socket msg without tempId 2" }, res);
+            });
+            assert.equal(sockAck2.success, true);
+            assert.notEqual(sockAck1.message._id, sockAck2.message._id);
+
+            clientA.disconnect();
+        });
+
+        it("Scenario 2: Sender collision - Different senders with the identical clientTempId in the same conversation do not collide", async () => {
+            const sharedTempId = "shared-client-temp-collision-test";
+
+            // User A sends with sharedTempId
+            const resA = await request(app)
+                .post(`/api/v1/conversations/${testConversationId}/messages`)
+                .set("Authorization", `Bearer ${tokenA}`)
+                .send({ content: "Message from Alice", clientTempId: sharedTempId });
+
+            assert.equal(resA.status, 201);
+            assert.equal(resA.body.success, true);
+            assert.equal(resA.body.message.clientTempId, sharedTempId);
+
+            // User B sends with the exact same sharedTempId in the same conversation
+            const resB = await request(app)
+                .post(`/api/v1/conversations/${testConversationId}/messages`)
+                .set("Authorization", `Bearer ${tokenB}`)
+                .send({ content: "Message from Bob", clientTempId: sharedTempId });
+
+            assert.equal(resB.status, 201);
+            assert.equal(resB.body.success, true);
+            assert.equal(resB.body.message.clientTempId, sharedTempId);
+
+            // Both messages must be persisted independently with distinct IDs
+            assert.notEqual(resA.body.message._id, resB.body.message._id);
+            const savedA = inMemoryMessages.find((m) => m._id.toString() === resA.body.message._id.toString());
+            const savedB = inMemoryMessages.find((m) => m._id.toString() === resB.body.message._id.toString());
+            assert.ok(savedA);
+            assert.ok(savedB);
+            assert.notEqual(savedA.sender._id.toString(), savedB.sender._id.toString());
+        });
+
+        it("Scenario 3: Two devices logged in as same user both receive real-time messages and sync read receipts", async () => {
+            // User A connects Device 1 and Device 2
+            const { client: clientA1 } = await connectClient(port, { auth: { token: tokenA } });
+            const { client: clientA2 } = await connectClient(port, { auth: { token: tokenA } });
+            // User B connects Device B
+            const { client: clientB } = await connectClient(port, { auth: { token: tokenB } });
+
+            await new Promise((res) => clientA1.emit("chat:join", { conversationId: testConversationId }, res));
+            await new Promise((res) => clientA2.emit("chat:join", { conversationId: testConversationId }, res));
+            await new Promise((res) => clientB.emit("chat:join", { conversationId: testConversationId }, res));
+
+            let a1Received = null;
+            let a2Received = null;
+            let a2ReadReceived = null;
+
+            clientA1.on("chat:new-message", (m) => { a1Received = m; });
+            clientA2.on("chat:new-message", (m) => { a2Received = m; });
+            clientA2.on("chat:read", (r) => { a2ReadReceived = r; });
+
+            // User B sends a message
+            const bAck = await new Promise((res) => {
+                clientB.emit("chat:send", {
+                    conversationId: testConversationId,
+                    content: "Message to both of Alice's devices",
+                    clientTempId: "temp-b-to-devices",
+                }, res);
+            });
+            assert.equal(bAck.success, true);
+
+            await new Promise((res) => setTimeout(res, 50));
+
+            // Both Device A1 and Device A2 must receive the message
+            assert.ok(a1Received, "Device A1 should receive the message");
+            assert.ok(a2Received, "Device A2 should receive the message");
+            assert.equal(a1Received._id, bAck.message._id);
+            assert.equal(a2Received._id, bAck.message._id);
+
+            // Device A1 marks conversation as read
+            const readAck = await new Promise((res) => {
+                clientA1.emit("chat:read", { conversationId: testConversationId }, res);
+            });
+            assert.equal(readAck.success, true);
+
+            await new Promise((res) => setTimeout(res, 50));
+
+            // Device A2 receives read receipt sync
+            assert.ok(a2ReadReceived, "Device A2 should receive read receipt sync");
+            assert.equal(a2ReadReceived.conversationId, testConversationId);
+            assert.equal(a2ReadReceived.readerId, mockUserA._id.toString());
+
+            clientA1.disconnect();
+            clientA2.disconnect();
+            clientB.disconnect();
+        });
+
+        it("Scenario 4: Dropped connection, REST fallback, reconnect, and cursor gap recovery produces zero lost or duplicate messages", async () => {
+            // User A and User B start connected
+            const { client: clientA } = await connectClient(port, { auth: { token: tokenA } });
+            const { client: clientB } = await connectClient(port, { auth: { token: tokenB } });
+
+            await new Promise((res) => clientA.emit("chat:join", { conversationId: testConversationId }, res));
+            await new Promise((res) => clientB.emit("chat:join", { conversationId: testConversationId }, res));
+
+            // Initial message M1 from A to B
+            const m1TempId = "temp-m1-initial";
+            const ack1 = await new Promise((res) => {
+                clientA.emit("chat:send", {
+                    conversationId: testConversationId,
+                    content: "M1: Initial message",
+                    clientTempId: m1TempId,
+                }, res);
+            });
+            assert.equal(ack1.success, true);
+            const m1Id = ack1.message._id;
+
+            // User A simulates network disconnect / dropped connection
+            clientA.disconnect();
+
+            // While A is offline:
+            // 1. User B sends M2 and M3
+            const ack2 = await new Promise((res) => {
+                clientB.emit("chat:send", {
+                    conversationId: testConversationId,
+                    content: "M2: Missed while A disconnected",
+                    clientTempId: "temp-b-m2",
+                }, res);
+            });
+            assert.equal(ack2.success, true);
+
+            const ack3 = await new Promise((res) => {
+                clientB.emit("chat:send", {
+                    conversationId: testConversationId,
+                    content: "M3: Another missed message",
+                    clientTempId: "temp-b-m3",
+                }, res);
+            });
+            assert.equal(ack3.success, true);
+
+            // 2. User A sends M4 via REST fallback because socket is offline
+            const m4TempId = "temp-m4-offline-rest";
+            const resM4 = await request(app)
+                .post(`/api/v1/conversations/${testConversationId}/messages`)
+                .set("Authorization", `Bearer ${tokenA}`)
+                .send({ content: "M4: Sent via REST fallback while offline", clientTempId: m4TempId });
+            assert.equal(resM4.status, 201);
+            const m4Id = resM4.body.message._id;
+
+            // 3. User A reconnects socket
+            const { client: clientAReconnected } = await connectClient(port, { auth: { token: tokenA } });
+            await new Promise((res) => clientAReconnected.emit("chat:join", { conversationId: testConversationId }, res));
+
+            // User A catches up missed messages using last known cursor (m1Id)
+            const catchUpRes = await request(app)
+                .get(`/api/v1/conversations/${testConversationId}/messages?after=${m1Id}`)
+                .set("Authorization", `Bearer ${tokenA}`);
+
+            assert.equal(catchUpRes.status, 200);
+            assert.equal(catchUpRes.body.count, 3); // M2, M3, M4
+
+            // Simulate frontend reconciliation on Client A
+            let clientAMessages = [
+                { _id: m1Id, clientTempId: m1TempId, content: "M1: Initial message", status: "sent" },
+                { _id: m4TempId, clientTempId: m4TempId, content: "M4: Sent via REST fallback while offline", status: "pending" },
+            ];
+
+            // Reconcile catch-up batch into client state
+            clientAMessages = reconcileBatchMessages(clientAMessages, catchUpRes.body.messages);
+
+            // Assert: Exactly 4 messages, no duplicates, M4 resolved from pending to sent
+            assert.equal(clientAMessages.length, 4);
+            const uniqueIds = new Set(clientAMessages.map((m) => m._id.toString()));
+            assert.equal(uniqueIds.size, 4, "Zero duplicate messages permitted");
+
+            const m4Entry = clientAMessages.find((m) => m.clientTempId === m4TempId);
+            assert.ok(m4Entry);
+            assert.equal(m4Entry._id.toString(), m4Id.toString());
+            assert.equal(m4Entry.status, "sent");
+
+            clientAReconnected.disconnect();
+            clientB.disconnect();
         });
     });
 });

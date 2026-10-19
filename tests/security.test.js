@@ -8,6 +8,7 @@ import jwt from "jsonwebtoken";
 
 import { validateJwtConfig, getJwtSecret, normalizeSecret, JWT_EXPIRES_IN } from "../src/config/jwt.js";
 import { isOriginAllowed, corsOptions, getAllowedOrigins } from "../src/config/cors.js";
+import mongoose from "mongoose";
 import { app } from "../src/app.js";
 
 describe("Batch 1 Security Hardening Test Suite", () => {
@@ -324,16 +325,39 @@ describe("Batch 1 Security Hardening Test Suite", () => {
     // 4. API Endpoints & Auth Middleware Verification
     // =========================================================================
     describe("API Health & Authentication Middleware", () => {
-        it("GET / returns 200 without rate-limit interference", async () => {
+        it("GET / returns 200 without rate-limit interference (liveness)", async () => {
             const res = await request(app).get("/");
             assert.equal(res.status, 200);
             assert.equal(res.body.status, "ok");
         });
 
-        it("GET /api/v1/health returns 200 healthy status", async () => {
-            const res = await request(app).get("/api/v1/health");
+        it("GET /api/v1/health/live returns 200 liveness status", async () => {
+            const res = await request(app).get("/api/v1/health/live");
             assert.equal(res.status, 200);
-            assert.equal(res.body.status, "healthy");
+            assert.equal(res.body.status, "alive");
+        });
+
+        it("GET /api/v1/health reflects readiness (503 when disconnected, 200 when connected)", async () => {
+            const origReadyState = mongoose.connection.readyState;
+            try {
+                // When database is disconnected, readiness reports 503
+                Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
+                const resDisc = await request(app).get("/api/v1/health");
+                assert.equal(resDisc.status, 503);
+                assert.equal(resDisc.body.status, "unhealthy");
+                assert.equal(resDisc.body.ready, false);
+                assert.equal(resDisc.body.database, "disconnected");
+
+                // When database is connected, readiness reports 200
+                Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
+                const resConn = await request(app).get("/api/v1/health");
+                assert.equal(resConn.status, 200);
+                assert.equal(resConn.body.status, "healthy");
+                assert.equal(resConn.body.ready, true);
+                assert.equal(resConn.body.database, "connected");
+            } finally {
+                Object.defineProperty(mongoose.connection, "readyState", { value: origReadyState, configurable: true, writable: true });
+            }
         });
 
         it("protected routes reject unauthenticated requests with HTTP 401", async () => {
