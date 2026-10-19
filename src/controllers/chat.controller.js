@@ -311,6 +311,53 @@ const getMessages = async (req, res) => {
             });
         }
 
+        // Cursor-based backward pagination: fetch messages created before a given message ID
+        if (req.query.before) {
+            if (!mongoose.Types.ObjectId.isValid(req.query.before)) {
+                return res.status(httpStatus.BAD_REQUEST).json({
+                    success: false,
+                    message: "Invalid before message ID",
+                });
+            }
+
+            const beforeMessage = await Message.findById(req.query.before).select("_id createdAt");
+            const beforeFilter = {
+                conversation: conversationId,
+            };
+            if (beforeMessage) {
+                // Compound cursor: strictly earlier timestamp OR same timestamp with smaller _id tie-breaker
+                beforeFilter.$or = [
+                    { createdAt: { $lt: beforeMessage.createdAt } },
+                    { createdAt: beforeMessage.createdAt, _id: { $lt: beforeMessage._id } },
+                ];
+            } else {
+                beforeFilter._id = { $lt: new mongoose.Types.ObjectId(req.query.before) };
+            }
+
+            const olderMessagesDesc = await Message.find(beforeFilter)
+                .sort({ createdAt: -1, _id: -1 })
+                .limit(limit)
+                .populate({
+                    path: "sender",
+                    select: "name photos",
+                });
+
+            const olderMessagesChronological = olderMessagesDesc.reverse();
+            const nextBeforeCursor = olderMessagesDesc.length === limit && olderMessagesChronological[0]
+                ? olderMessagesChronological[0]._id
+                : null;
+
+            return res.status(httpStatus.OK).json({
+                success: true,
+                conversationId,
+                messages: olderMessagesChronological.map(toMessageDto),
+                before: req.query.before,
+                nextBeforeCursor,
+                hasMore: Boolean(nextBeforeCursor),
+                count: olderMessagesChronological.length,
+            });
+        }
+
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const skip = (page - 1) * limit;
 
@@ -318,7 +365,7 @@ const getMessages = async (req, res) => {
 
         // Retrieve latest messages first for pagination, then sort chronologically
         const messagesDesc = await Message.find({ conversation: conversationId })
-            .sort({ createdAt: -1 })
+            .sort({ createdAt: -1, _id: -1 })
             .skip(skip)
             .limit(limit)
             .populate({
@@ -327,6 +374,7 @@ const getMessages = async (req, res) => {
             });
 
         const messagesChronological = messagesDesc.reverse();
+        const nextBeforeCursor = messagesChronological.length > 0 ? messagesChronological[0]._id : null;
 
         return res.status(httpStatus.OK).json({
             success: true,
@@ -335,6 +383,8 @@ const getMessages = async (req, res) => {
             page,
             limit,
             totalPages: Math.ceil(total / limit) || 1,
+            nextBeforeCursor,
+            hasMore: total > skip + messagesChronological.length,
             messages: messagesChronological.map(toMessageDto),
         });
     } catch (e) {

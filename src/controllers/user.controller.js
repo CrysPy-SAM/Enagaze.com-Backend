@@ -343,7 +343,7 @@ const updateMyProfile = async (req, res) => {
 
         // Validate Dating Preferences
         if (updates.datingPreferences !== undefined) {
-            if (typeof updates.datingPreferences !== "object" || updates.datingPreferences === null) {
+            if (typeof updates.datingPreferences !== "object" || updates.datingPreferences === null || Array.isArray(updates.datingPreferences)) {
                 return res.status(httpStatus.BAD_REQUEST).json({
                     success: false,
                     message: "Dating preferences must be an object"
@@ -358,34 +358,67 @@ const updateMyProfile = async (req, res) => {
                         message: "interestedIn must be an array"
                     });
                 }
-                const filtered = updates.datingPreferences.interestedIn.filter((val) =>
-                    validInterestedIn.includes(val)
-                );
-                user.datingPreferences.interestedIn = filtered.length > 0 ? filtered : ["everyone"];
+                if (updates.datingPreferences.interestedIn.length === 0) {
+                    user.datingPreferences.interestedIn = ["everyone"];
+                } else {
+                    for (const val of updates.datingPreferences.interestedIn) {
+                        if (typeof val !== "string" || !validInterestedIn.includes(val)) {
+                            return res.status(httpStatus.BAD_REQUEST).json({
+                                success: false,
+                                message: `Invalid interestedIn value: "${val}". Allowed values: ${validInterestedIn.join(", ")}`
+                            });
+                        }
+                    }
+                    user.datingPreferences.interestedIn = updates.datingPreferences.interestedIn;
+                }
             }
 
             if (updates.datingPreferences.ageRange !== undefined) {
+                if (typeof updates.datingPreferences.ageRange !== "object" || updates.datingPreferences.ageRange === null || Array.isArray(updates.datingPreferences.ageRange)) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: "ageRange must be an object with min and/or max properties"
+                    });
+                }
                 const { min, max } = updates.datingPreferences.ageRange;
+                const currentMin = user.datingPreferences?.ageRange?.min ?? 18;
+                const currentMax = user.datingPreferences?.ageRange?.max ?? 100;
+                let targetMin = currentMin;
+                let targetMax = currentMax;
+
                 if (min !== undefined) {
-                    const minAge = parseInt(min, 10);
-                    if (isNaN(minAge) || minAge < 18) {
+                    const minAge = typeof min === "number" ? min : parseInt(min, 10);
+                    if (isNaN(minAge) || !Number.isInteger(minAge) || minAge < 18 || minAge > 120) {
                         return res.status(httpStatus.BAD_REQUEST).json({
                             success: false,
-                            message: "Minimum age preference must be at least 18"
+                            message: "Minimum age preference must be an integer between 18 and 120"
                         });
                     }
-                    user.datingPreferences.ageRange.min = minAge;
+                    targetMin = minAge;
                 }
+
                 if (max !== undefined) {
-                    const maxAge = parseInt(max, 10);
-                    if (isNaN(maxAge) || maxAge > 120 || maxAge < user.datingPreferences.ageRange.min) {
+                    const maxAge = typeof max === "number" ? max : parseInt(max, 10);
+                    if (isNaN(maxAge) || !Number.isInteger(maxAge) || maxAge < 18 || maxAge > 120) {
                         return res.status(httpStatus.BAD_REQUEST).json({
                             success: false,
-                            message: "Maximum age preference must be greater than minimum age and valid"
+                            message: "Maximum age preference must be an integer between 18 and 120"
                         });
                     }
-                    user.datingPreferences.ageRange.max = maxAge;
+                    targetMax = maxAge;
                 }
+
+                if (targetMin > targetMax) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: "Minimum age preference cannot exceed maximum age preference"
+                    });
+                }
+
+                user.datingPreferences.ageRange = {
+                    min: targetMin,
+                    max: targetMax
+                };
             }
         }
 

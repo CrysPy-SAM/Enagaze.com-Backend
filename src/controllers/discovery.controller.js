@@ -28,9 +28,8 @@ const getDiscoveryProfiles = async (req, res) => {
             });
         }
 
-        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(30, Math.max(1, parseInt(req.query.limit, 10) || 10));
-        const skip = (page - 1) * limit;
+        const cursor = req.query.cursor;
 
         // 2. Fetch IDs of profiles the user has already swiped on, matched users, and blocked users
         const [swipedRecords, existingMatches, blockedIds] = await Promise.all([
@@ -54,8 +53,8 @@ const getDiscoveryProfiles = async (req, res) => {
         const prefMin = currentUser.datingPreferences?.ageRange?.min;
         const prefMax = currentUser.datingPreferences?.ageRange?.max;
 
-        const effectiveMinAge = prefMin && prefMin > 18 ? prefMin : 18;
-        const effectiveMaxAge = prefMax && prefMax < 100 ? prefMax : 120;
+        const effectiveMinAge = (typeof prefMin === "number" && prefMin >= 18) ? Math.min(prefMin, 120) : 18;
+        const effectiveMaxAge = (typeof prefMax === "number" && prefMax >= 18) ? Math.min(Math.max(prefMax, effectiveMinAge), 120) : 120;
 
         const latestEligibleDob = new Date(Date.UTC(
             now.getUTCFullYear() - effectiveMinAge,
@@ -74,10 +73,24 @@ const getDiscoveryProfiles = async (req, res) => {
         // Candidates MUST strictly have isProfileComplete: true and an adult DOB within bounds.
         // Profiles with null DOB or missing DOB are completely excluded from adult discovery.
         const query = {
-            _id: { $nin: excludedIds },
             isProfileComplete: true,
             dob: { $gte: earliestEligibleDob, $lte: latestEligibleDob },
         };
+
+        if (cursor) {
+            if (!mongoose.Types.ObjectId.isValid(cursor)) {
+                return res.status(httpStatus.BAD_REQUEST).json({
+                    success: false,
+                    message: "Invalid cursor format",
+                });
+            }
+            query._id = {
+                $nin: excludedIds,
+                $lt: new mongoose.Types.ObjectId(cursor),
+            };
+        } else {
+            query._id = { $nin: excludedIds };
+        }
 
         // 5. Gender preference matching
         const interestedIn = currentUser.datingPreferences?.interestedIn;
@@ -100,11 +113,21 @@ const getDiscoveryProfiles = async (req, res) => {
 
         // 6. Execute query with safe projection
         const total = await User.countDocuments(query);
-        const profiles = await User.find(query)
+        let findQuery = User.find(query)
             .select("name dob gender bio photos interests isProfileComplete")
-            .sort({ createdAt: -1 })
-            .skip(skip)
+            .sort({ _id: -1 })
             .limit(limit);
+
+        let page = 1;
+        if (!cursor) {
+            page = Math.max(1, parseInt(req.query.page, 10) || 1);
+            const skip = (page - 1) * limit;
+            findQuery = findQuery.skip(skip);
+        }
+
+        const profiles = await findQuery;
+        const nextCursor = profiles.length === limit ? profiles[profiles.length - 1]._id : null;
+        const hasMore = Boolean(nextCursor);
 
         return res.status(httpStatus.OK).json({
             success: true,
@@ -112,6 +135,9 @@ const getDiscoveryProfiles = async (req, res) => {
             limit,
             total,
             totalPages: Math.ceil(total / limit) || 1,
+            cursor: cursor || null,
+            nextCursor: nextCursor || null,
+            hasMore,
             profiles: profiles.map((p) => toPublicProfile(p)),
         });
     } catch (e) {
@@ -490,6 +516,175 @@ const resetDiscoverySwipes = async (req, res) => {
     }
 };
 
-export { getDiscoveryProfiles, swipe, getMatches, resetDiscoverySwipes };
+// ==========================================
+// 5. GET DISCOVERY PREFERENCES
+// ==========================================
+const getDiscoveryPreferences = async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id).select("datingPreferences");
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "User not found",
+            });
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            datingPreferences: user.datingPreferences || {
+                interestedIn: ["everyone"],
+                ageRange: { min: 18, max: 100 },
+            },
+        });
+    } catch (e) {
+        console.error("Get discovery preferences error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to retrieve discovery preferences",
+        });
+    }
+};
+
+// ==========================================
+// 6. UPDATE DISCOVERY PREFERENCES
+// ==========================================
+const updateDiscoveryPreferences = async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "User not found",
+            });
+        }
+
+        const updates = req.body;
+        if (!updates || typeof updates !== "object" || Array.isArray(updates)) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "Request body must be an object",
+            });
+        }
+
+        // Initialize user datingPreferences if not present
+        if (!user.datingPreferences) {
+            user.datingPreferences = {
+                interestedIn: ["everyone"],
+                ageRange: { min: 18, max: 100 },
+            };
+        }
+
+        const validInterestedIn = ["male", "female", "non-binary", "everyone"];
+
+        // 1. Validate and update interestedIn
+        if (updates.interestedIn !== undefined) {
+            if (!Array.isArray(updates.interestedIn)) {
+                return res.status(httpStatus.BAD_REQUEST).json({
+                    success: false,
+                    message: "interestedIn must be an array of valid preferences",
+                });
+            }
+            if (updates.interestedIn.length === 0) {
+                user.datingPreferences.interestedIn = ["everyone"];
+            } else {
+                for (const val of updates.interestedIn) {
+                    if (typeof val !== "string" || !validInterestedIn.includes(val)) {
+                        return res.status(httpStatus.BAD_REQUEST).json({
+                            success: false,
+                            message: `Invalid interestedIn value: "${val}". Allowed values: ${validInterestedIn.join(", ")}`,
+                        });
+                    }
+                }
+                user.datingPreferences.interestedIn = updates.interestedIn;
+            }
+        }
+
+        // 2. Validate and update ageRange
+        if (updates.ageRange !== undefined) {
+            if (typeof updates.ageRange !== "object" || updates.ageRange === null || Array.isArray(updates.ageRange)) {
+                return res.status(httpStatus.BAD_REQUEST).json({
+                    success: false,
+                    message: "ageRange must be an object with min and/or max properties",
+                });
+            }
+
+            const { min, max } = updates.ageRange;
+            const currentMin = user.datingPreferences?.ageRange?.min ?? 18;
+            const currentMax = user.datingPreferences?.ageRange?.max ?? 100;
+
+            let targetMin = currentMin;
+            let targetMax = currentMax;
+
+            if (min !== undefined) {
+                const minAge = typeof min === "number" ? min : parseInt(min, 10);
+                if (isNaN(minAge) || !Number.isInteger(minAge)) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: "Minimum age must be an integer",
+                    });
+                }
+                if (minAge < 18 || minAge > 120) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: "Minimum age preference must be between 18 and 120",
+                    });
+                }
+                targetMin = minAge;
+            }
+
+            if (max !== undefined) {
+                const maxAge = typeof max === "number" ? max : parseInt(max, 10);
+                if (isNaN(maxAge) || !Number.isInteger(maxAge)) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: "Maximum age must be an integer",
+                    });
+                }
+                if (maxAge < 18 || maxAge > 120) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: "Maximum age preference must be between 18 and 120",
+                    });
+                }
+                targetMax = maxAge;
+            }
+
+            if (targetMin > targetMax) {
+                return res.status(httpStatus.BAD_REQUEST).json({
+                    success: false,
+                    message: "Minimum age preference cannot exceed maximum age preference",
+                });
+            }
+
+            user.datingPreferences.ageRange = {
+                min: targetMin,
+                max: targetMax,
+            };
+        }
+
+        await user.save();
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            message: "Discovery preferences updated successfully",
+            datingPreferences: user.datingPreferences,
+        });
+    } catch (e) {
+        console.error("Update discovery preferences error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to update discovery preferences",
+        });
+    }
+};
+
+export {
+    getDiscoveryProfiles,
+    swipe,
+    getMatches,
+    resetDiscoverySwipes,
+    getDiscoveryPreferences,
+    updateDiscoveryPreferences,
+};
 
 
