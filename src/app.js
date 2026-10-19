@@ -98,11 +98,64 @@ app.use("/api/v1/safety", safetyRoutes);
 app.use("/api/v1/moderation", moderationRoutes);
 app.use("/api/v1/webrtc", webrtcRoutes);
 
+const KNOWN_SAFE_DB_ERRORS = new Set([
+  "MongoParseError",
+  "MongoServerSelectionError",
+  "MongoNetworkError",
+  "MongoServerError",
+  "MongoTimeoutError",
+  "MongoTopologyClosedError",
+  "MongooseServerSelectionError",
+  "MongooseError",
+  "CastError",
+  "ValidationError",
+  "DatabaseConnectionError",
+  "Error",
+]);
+
+const KNOWN_SAFE_SYSTEM_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+]);
+
+/**
+ * Safely format a database error for logs using an explicit safe allowlist.
+ * Ensures arbitrary or user-tainted error properties cannot leak credentials.
+ *
+ * @param {any} err
+ * @returns {string} Safe log description
+ */
+const formatSafeDatabaseError = (err) => {
+  const rawName = (err && typeof err.name === "string") ? err.name : "";
+  const errName = KNOWN_SAFE_DB_ERRORS.has(rawName) ? rawName : "DatabaseConnectionError";
+
+  let errCode = "";
+  if (err) {
+    if (typeof err.code === "number" && Number.isInteger(err.code)) {
+      errCode = ` [code: ${err.code}]`;
+    } else if (typeof err.code === "string" && KNOWN_SAFE_SYSTEM_CODES.has(err.code)) {
+      errCode = ` [code: ${err.code}]`;
+    }
+  }
+
+  return `Database connection failed (${errName}${errCode}). Please verify network reachability, database service status, and MONGO_URI configuration.`;
+};
+
 /**
  * Starts the HTTP and Socket.IO server after establishing required database connection.
  * On unrecoverable database connection failure:
- * - Logs a safe error message without credentials.
+ * - Logs a safe error message without credentials or raw connection strings.
  * - Does NOT start listening for traffic.
+ * - Terminates process with exit code 1 if exitOnError is true.
+ *
+ * On HTTP server listen failure (e.g. EADDRINUSE):
+ * - Correctly classifies as an HTTP listen error (not database failure).
+ * - Disconnects Mongoose cleanly.
  * - Terminates process with exit code 1 if exitOnError is true.
  *
  * @param {Object} [options]
@@ -119,10 +172,22 @@ const start = async ({ exitOnError = true } = {}) => {
     throw new Error(errorMsg);
   }
 
+  // 1. Establish required database connection before opening network listener
+  let connectionDb;
   try {
-    const connectionDb = await mongoose.connect(process.env.MONGO_URI);
+    connectionDb = await mongoose.connect(process.env.MONGO_URI);
     console.log(`✅ MONGO Connected DB Host: ${connectionDb.connection.host}`);
+  } catch (dbErr) {
+    const safeMsg = formatSafeDatabaseError(dbErr);
+    console.error(`❌ Fatal MongoDB Startup Connection Error: ${safeMsg}`);
+    if (exitOnError) {
+      process.exit(1);
+    }
+    throw dbErr;
+  }
 
+  // 2. Open HTTP and Socket.IO server listener
+  try {
     await new Promise((resolve, reject) => {
       server.listen(app.get("port"), () => {
         console.log(`🚀 Listening on PORT ${app.get("port")}`);
@@ -132,57 +197,108 @@ const start = async ({ exitOnError = true } = {}) => {
     });
 
     return { app, server, connectionDb };
-  } catch (err) {
-    console.error("❌ Fatal MongoDB Startup Connection Error:", err.message);
+  } catch (listenErr) {
+    const listenCode = (listenErr && listenErr.code) ? ` [${listenErr.code}]` : "";
+    console.error(`❌ Fatal HTTP Server Listen Error:${listenCode} Failed to bind port ${app.get("port")}.`);
+    if (mongoose.connection.readyState !== 0) {
+      try {
+        await mongoose.disconnect();
+      } catch (_) {}
+    }
     if (exitOnError) {
       process.exit(1);
     }
-    throw err;
+    throw listenErr;
   }
 };
 
 /**
- * Graceful process shutdown handler for SIGTERM and SIGINT signals.
+ * Bounded graceful process shutdown handler for SIGTERM and SIGINT signals.
+ * Drains HTTP connections, disconnects Socket.IO sockets, and disconnects Mongoose.
+ * Bounded by a timeout (default 10s or SHUTDOWN_TIMEOUT_MS) to prevent hanging indefinitely.
  */
 let isShuttingDown = false;
-const gracefulShutdown = async (signal = "SIGTERM", { exit = true } = {}) => {
-  if (isShuttingDown) return;
+const gracefulShutdown = async (
+  signal = "SIGTERM",
+  { exit = true, timeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 10000 } = {}
+) => {
+  if (isShuttingDown) {
+    console.log(`Shutdown already in progress. Ignoring duplicate ${signal} signal.`);
+    return;
+  }
   isShuttingDown = true;
   console.log(`Received ${signal}. Initiating graceful shutdown...`);
 
+  // Bounded force-termination fallback timer
+  let forceExitTimer = setTimeout(() => {
+    console.error(`⚠️ Graceful shutdown timed out after ${timeoutMs}ms. Forcing exit.`);
+    if (typeof server.closeAllConnections === "function") {
+      server.closeAllConnections();
+    }
+    if (exit) {
+      process.exit(1);
+    }
+    isShuttingDown = false;
+  }, timeoutMs);
+
+  if (typeof forceExitTimer.unref === "function") {
+    forceExitTimer.unref();
+  }
+
   try {
     // 1. Stop accepting new HTTP connections
-    await new Promise((resolve) => {
+    const serverClosePromise = new Promise((resolve) => {
       if (server.listening) {
         server.close((err) => {
           if (err) console.error("Error closing HTTP server:", err.message);
           resolve();
         });
+        // Immediately close idle HTTP keep-alive connections
+        if (typeof server.closeIdleConnections === "function") {
+          server.closeIdleConnections();
+        }
       } else {
         resolve();
       }
     });
 
-    // 2. Disconnect active Socket.IO connections
+    // 2. Disconnect active Socket.IO clients before waiting for server close callback.
+    // In Node.js, server.close() will not resolve if upgraded WebSocket connections
+    // remain open; disconnecting clients allows server.close() to complete without deadlocking.
     if (io) {
       io.disconnectSockets(true);
+      if (io.engine && typeof io.engine.close === "function") {
+        io.engine.close();
+      }
     }
 
-    // 3. Disconnect Mongoose
+    // 3. Await HTTP server drain completion
+    await serverClosePromise;
+
+    // 4. Disconnect Mongoose after network listeners and sockets are closed
     if (mongoose.connection.readyState !== 0) {
       await mongoose.disconnect();
       console.log("Mongoose connection closed cleanly.");
+    }
+
+    if (forceExitTimer) {
+      clearTimeout(forceExitTimer);
     }
 
     console.log("Graceful shutdown complete.");
     if (exit) {
       process.exit(0);
     }
+    isShuttingDown = false;
   } catch (shutdownErr) {
+    if (forceExitTimer) {
+      clearTimeout(forceExitTimer);
+    }
     console.error("Error during graceful shutdown:", shutdownErr.message);
     if (exit) {
       process.exit(1);
     }
+    isShuttingDown = false;
   }
 };
 
@@ -197,4 +313,6 @@ if (isMainModule) {
   start({ exitOnError: true }).catch(() => process.exit(1));
 }
 
-export { app, server, start, gracefulShutdown };
+const _resetShutdownForTesting = () => { isShuttingDown = false; };
+
+export { app, server, start, gracefulShutdown, formatSafeDatabaseError, _resetShutdownForTesting };

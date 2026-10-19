@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import request from "supertest";
 import mongoose from "mongoose";
 import http from "node:http";
+import jwt from "jsonwebtoken";
+import { io as ioc } from "socket.io-client";
 
-import { app, server, start, gracefulShutdown } from "../src/app.js";
+import { app, server, start, gracefulShutdown, formatSafeDatabaseError, _resetShutdownForTesting } from "../src/app.js";
+import { getJwtSecret } from "../src/config/jwt.js";
 
 describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () => {
     const originalEnv = { ...process.env };
@@ -13,10 +16,12 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
     beforeEach(() => {
         process.env = { ...originalEnv };
         originalReadyState = mongoose.connection.readyState;
+        _resetShutdownForTesting();
     });
 
     afterEach(() => {
         process.env = { ...originalEnv };
+        _resetShutdownForTesting();
         Object.defineProperty(mongoose.connection, "readyState", {
             value: originalReadyState,
             configurable: true,
@@ -187,6 +192,134 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
             }
         });
 
+        it("simulated parse error containing credentials logs sanitized category and does NOT leak credentials", async () => {
+            const fakeUser = "leaky_test_user_999";
+            const fakePass = "super_secret_raw_pass_888";
+            const simulatedError = new Error(`Protocol and host list are required in "mongodb://${fakeUser}:${fakePass}@"`);
+            simulatedError.name = "MongoParseError";
+
+            const origConnect = mongoose.connect;
+            const origConsoleError = console.error;
+            const capturedLogs = [];
+            console.error = (...args) => {
+                capturedLogs.push(args.join(" "));
+            };
+
+            const originalExit = process.exit;
+            let exitCalled = false;
+            let exitCode = null;
+            process.exit = (code) => {
+                exitCalled = true;
+                exitCode = code;
+            };
+
+            mongoose.connect = async () => {
+                throw simulatedError;
+            };
+
+            try {
+                await assert.rejects(async () => {
+                    await start({ exitOnError: true });
+                });
+
+                assert.equal(exitCalled, true);
+                assert.equal(exitCode, 1);
+
+                const allLogText = capturedLogs.join("\n");
+                assert.ok(!allLogText.includes(fakeUser), "Username must never appear in logs");
+                assert.ok(!allLogText.includes(fakePass), "Password must never appear in logs");
+                assert.ok(!allLogText.includes("mongodb://"), "Raw URI scheme must never appear in logs");
+                assert.ok(allLogText.includes("Fatal MongoDB Startup Connection Error"), "Safe category must be logged");
+                assert.ok(allLogText.includes("MongoParseError"), "Safe error name must be preserved");
+            } finally {
+                mongoose.connect = origConnect;
+                console.error = origConsoleError;
+                process.exit = originalExit;
+            }
+        });
+
+        it("formatSafeDatabaseError uses strict allowlist and suppresses arbitrary or tainted error properties", () => {
+            const maliciousErr = {
+                name: "mongodb://admin:secretPassword123@cluster.mongodb.net",
+                code: "raw_secret_leak_code",
+                message: "arbitrary message with secret",
+            };
+
+            const safeOutput = formatSafeDatabaseError(maliciousErr);
+            assert.ok(!safeOutput.includes("secretPassword123"), "Malicious name must not leak");
+            assert.ok(!safeOutput.includes("raw_secret_leak_code"), "Malicious code must not leak");
+            assert.ok(!safeOutput.includes("cluster.mongodb.net"), "Host must not leak");
+            assert.ok(safeOutput.includes("(DatabaseConnectionError)"), "Falls back to safe static name");
+
+            // Legitimate error objects
+            const parseErr = formatSafeDatabaseError({ name: "MongoParseError" });
+            assert.ok(parseErr.includes("(MongoParseError)"), "Preserves safe name");
+
+            const codeErr = formatSafeDatabaseError({ name: "MongoServerError", code: 18 });
+            assert.ok(codeErr.includes("(MongoServerError [code: 18])"), "Preserves integer code");
+
+            const sysErr = formatSafeDatabaseError({ name: "MongoNetworkError", code: "ECONNREFUSED" });
+            assert.ok(sysErr.includes("(MongoNetworkError [code: ECONNREFUSED])"), "Preserves safe system code");
+        });
+
+        it("correctly classifies HTTP server listen/bind failure (EADDRINUSE) and does not label as MongoDB error", async () => {
+            process.env.MONGO_URI = "mongodb://127.0.0.1:27017/test_db";
+
+            const origConnect = mongoose.connect;
+            const origDisconnect = mongoose.disconnect;
+            const origListen = server.listen;
+            const origConsoleError = console.error;
+            const capturedLogs = [];
+            console.error = (...args) => {
+                capturedLogs.push(args.join(" "));
+            };
+
+            const originalExit = process.exit;
+            let exitCalled = false;
+            let exitCode = null;
+            process.exit = (code) => {
+                exitCalled = true;
+                exitCode = code;
+            };
+
+            let disconnectCalled = false;
+            mongoose.connect = async () => {
+                Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
+                return { connection: { host: "127.0.0.1" } };
+            };
+            mongoose.disconnect = async () => {
+                disconnectCalled = true;
+                Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
+            };
+
+            // Simulate EADDRINUSE on server.listen
+            server.listen = (port, cb) => {
+                const err = new Error("listen EADDRINUSE: address already in use :::8000");
+                err.code = "EADDRINUSE";
+                server.emit("error", err);
+            };
+
+            try {
+                await assert.rejects(async () => {
+                    await start({ exitOnError: true });
+                }, /EADDRINUSE/);
+
+                assert.equal(exitCalled, true);
+                assert.equal(exitCode, 1);
+                assert.equal(disconnectCalled, true, "Mongoose must be disconnected if server listen fails");
+
+                const allLogText = capturedLogs.join("\n");
+                assert.ok(allLogText.includes("Fatal HTTP Server Listen Error: [EADDRINUSE]"), "Must log as HTTP Listen Error");
+                assert.ok(!allLogText.includes("Fatal MongoDB Startup Connection Error: listen EADDRINUSE"), "Must NOT label as MongoDB error");
+            } finally {
+                mongoose.connect = origConnect;
+                mongoose.disconnect = origDisconnect;
+                server.listen = origListen;
+                console.error = origConsoleError;
+                process.exit = originalExit;
+            }
+        });
+
         it("successful startup waits for database connection before listening and returns server and connection", async () => {
             process.env.MONGO_URI = "mongodb://127.0.0.1:27017/test_db";
             app.set("port", 0); // Dynamic available port for testing
@@ -234,6 +367,133 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
             } finally {
                 process.exit = originalExit;
             }
+        });
+
+        it("gracefulShutdown ignores duplicate signals while shutdown is in progress", async () => {
+            const origConsoleLog = console.log;
+            const logs = [];
+            console.log = (...args) => logs.push(args.join(" "));
+
+            try {
+                const firstPromise = gracefulShutdown("SIGTERM", { exit: false });
+                await gracefulShutdown("SIGINT", { exit: false });
+                await firstPromise;
+
+                const allLogText = logs.join("\n");
+                assert.ok(allLogText.includes("Shutdown already in progress. Ignoring duplicate SIGINT signal."));
+            } finally {
+                console.log = origConsoleLog;
+            }
+        });
+
+        it("gracefulShutdown forces exit with 1 when shutdown timeout is exceeded", async () => {
+            const origConsoleError = console.error;
+            const errLogs = [];
+            console.error = (...args) => errLogs.push(args.join(" "));
+
+            const originalExit = process.exit;
+            let exitCalled = false;
+            let exitCode = null;
+            process.exit = (code) => {
+                exitCalled = true;
+                exitCode = code;
+            };
+
+            const origClose = server.close;
+            const origListening = server.listening;
+            Object.defineProperty(server, "listening", { value: true, configurable: true });
+            server.close = (cb) => {
+                // Intentionally delay invoking callback longer than timeoutMs (50ms) to simulate stall
+                if (typeof cb === "function") setTimeout(cb, 150);
+            };
+
+            try {
+                // Launch shutdown without awaiting so test execution can advance while server.close hangs
+                gracefulShutdown("SIGTERM", { exit: true, timeoutMs: 50 });
+                await new Promise((res) => setTimeout(res, 90));
+
+                assert.equal(exitCalled, true, "Force exit must be called on timeout");
+                assert.equal(exitCode, 1, "Exit code must be 1 on timeout");
+                const allErrText = errLogs.join("\n");
+                assert.ok(allErrText.includes("Graceful shutdown timed out after 50ms. Forcing exit."));
+            } finally {
+                server.close = origClose;
+                Object.defineProperty(server, "listening", { value: origListening, configurable: true });
+                console.error = origConsoleError;
+                process.exit = originalExit;
+            }
+        });
+
+        it("gracefulShutdown drains active Socket.IO WebSocket connection without waiting for fallback timeout", async () => {
+            app.set("port", 0);
+            process.env.MONGO_URI = "mongodb://127.0.0.1:27017/test_db";
+
+            const origConnect = mongoose.connect;
+            const origDisconnect = mongoose.disconnect;
+            let mongooseDisconnected = false;
+
+            mongoose.connect = async () => {
+                Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
+                return { connection: { host: "127.0.0.1" } };
+            };
+            mongoose.disconnect = async () => {
+                mongooseDisconnected = true;
+                Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
+            };
+
+            const started = await start({ exitOnError: false });
+            const port = started.server.address().port;
+
+            const testToken = jwt.sign(
+                { id: new mongoose.Types.ObjectId().toString(), username: "test_ws_user" },
+                getJwtSecret(),
+                { expiresIn: "1h" }
+            );
+
+            // Connect real Socket.IO client using WebSocket transport
+            const client = ioc(`http://127.0.0.1:${port}`, {
+                transports: ["websocket"],
+                reconnection: false,
+                auth: { token: testToken },
+            });
+
+            await new Promise((resolve, reject) => {
+                client.on("connect", resolve);
+                client.on("connect_error", reject);
+            });
+
+            assert.equal(client.connected, true, "Socket.IO client must be connected");
+
+            let clientDisconnected = false;
+            const disconnectPromise = new Promise((resolve) => {
+                client.on("disconnect", () => {
+                    clientDisconnected = true;
+                    resolve(true);
+                });
+            });
+
+            // Initiate gracefulShutdown with a large timeout (4000ms)
+            const startTime = Date.now();
+            await gracefulShutdown("SIGTERM", { exit: false, timeoutMs: 4000 });
+            const elapsedMs = Date.now() - startTime;
+            await Promise.race([
+                disconnectPromise,
+                new Promise((res) => setTimeout(res, 200)),
+            ]);
+
+            // Assert:
+            // 1. Shutdown completed promptly (< 500ms) without blocking on 4000ms fallback timeout
+            assert.ok(elapsedMs < 500, `Shutdown took ${elapsedMs}ms; must complete without waiting for fallback timeout`);
+            // 2. Client received disconnect event
+            assert.equal(clientDisconnected, true, "Socket client must receive disconnect during shutdown");
+            // 3. HTTP server is no longer listening
+            assert.equal(started.server.listening, false, "HTTP server must be closed");
+            // 4. Mongoose was disconnected after network shutdown
+            assert.equal(mongooseDisconnected, true, "Mongoose must be disconnected after network drain");
+
+            client.close();
+            mongoose.connect = origConnect;
+            mongoose.disconnect = origDisconnect;
         });
     });
 });
