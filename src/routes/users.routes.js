@@ -7,6 +7,10 @@ import {
     googleLogin
 } from "../controllers/user.controller.js";
 import {
+    searchUsers,
+    getPublicUserProfile,
+} from "../controllers/userSearch.controller.js";
+import {
     requestUploadUrl,
     confirmUpload,
     removePhoto,
@@ -20,6 +24,7 @@ import {
     registerLimiter,
     googleLoginLimiter,
     photoUploadLimiter,
+    userSearchLimiter,
 } from "../middlewares/rateLimiter.middleware.js";
 
 const router = Router();
@@ -28,6 +33,13 @@ const router = Router();
 router.route("/login").post(loginIpLimiter, loginAccountLimiter, login);
 router.route("/register").post(registerLimiter, register);
 router.route("/google-login").post(googleLoginLimiter, googleLogin);
+
+// People Discovery & Instagram-style Search endpoints
+router.route("/search")
+    .get(protect, userSearchLimiter, searchUsers);
+
+router.route("/profile/public/:userId")
+    .get(protect, getPublicUserProfile);
 
 // Protected profile endpoints
 router.route("/profile/me")

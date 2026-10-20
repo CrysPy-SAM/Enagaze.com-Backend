@@ -172,3 +172,19 @@ export const photoUploadLimiter = rateLimit({
         "Too many photo upload requests. Please wait a few minutes before trying again."
     ),
 });
+
+/**
+ * User search rate limiter:
+ * Allows up to 60 search requests per minute per IP to accommodate debounced typing
+ * while preventing scraping and abusive query volumes.
+ */
+export const userSearchLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 60,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    skip: () => process.env.NODE_ENV === "test",
+    handler: createRateLimitHandler(
+        "Too many search requests. Please slow down."
+    ),
+});

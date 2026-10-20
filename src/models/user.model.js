@@ -128,6 +128,11 @@ userSchema.virtual("age").get(function() {
     return calculated !== null ? calculated : undefined;
 });
 
+// Indexes for People Discovery and Instagram-style search performance
+userSchema.index({ name: 1 });
+userSchema.index({ isProfileComplete: 1, username: 1 });
+userSchema.index({ isProfileComplete: 1, name: 1 });
+
 const User = mongoose.model("User", userSchema);
 
 export { User };

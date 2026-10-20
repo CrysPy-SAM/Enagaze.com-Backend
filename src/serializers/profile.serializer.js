@@ -113,3 +113,42 @@ export const toMessageDto = (message) => {
         updatedAt: doc.updatedAt,
     };
 };
+
+/**
+ * Serializes a user record for Instagram-inspired search and people discovery.
+ * Includes public username, display name, public bio, photos, age, interests,
+ * and current relationship context with the requesting user.
+ *
+ * Strict allowlist guarantees that sensitive internal fields (passwords, emails,
+ * phone numbers, exact DOBs, tokens, Google IDs, or dating preferences) are NEVER leaked.
+ *
+ * @param {Object|null|undefined} user - Mongoose document or plain object
+ * @param {Object} [relationship={}] - Relationship context { status, requestId, conversationId }
+ * @returns {Object|null}
+ */
+export const toSearchUserProfile = (user, relationship = {}) => {
+    if (!user) return null;
+
+    const doc = typeof user.toObject === "function"
+        ? user.toObject({ virtuals: true })
+        : (typeof user.toJSON === "function" ? user.toJSON() : user);
+
+    const age = typeof doc.age === "number" && !isNaN(doc.age)
+        ? doc.age
+        : calculateAge(doc.dob);
+
+    return {
+        _id: doc._id ? doc._id.toString() : undefined,
+        name: typeof doc.name === "string" && doc.name.trim() ? doc.name.trim() : "Engaze Member",
+        username: typeof doc.username === "string" ? doc.username.trim() : "",
+        age,
+        gender: typeof doc.gender === "string" ? doc.gender : null,
+        bio: typeof doc.bio === "string" ? doc.bio : "",
+        photos: Array.isArray(doc.photos) ? doc.photos : [],
+        interests: Array.isArray(doc.interests) ? doc.interests : [],
+        isProfileComplete: Boolean(doc.isProfileComplete),
+        relationship: relationship.status || "none",
+        requestId: relationship.requestId ? relationship.requestId.toString() : null,
+        conversationId: relationship.conversationId ? relationship.conversationId.toString() : null,
+    };
+};
