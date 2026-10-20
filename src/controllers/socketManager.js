@@ -1,6 +1,7 @@
 import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
+import crypto from "crypto";
 import { User } from "../models/user.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
@@ -9,7 +10,7 @@ import { Block } from "../models/block.model.js";
 import { registerRandomCallHandlers } from "./randomCallManager.js";
 import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
-import { toMessageDto } from "../serializers/profile.serializer.js";
+import { toMessageDto, toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
 import {
     isPlainObject,
@@ -164,6 +165,12 @@ export const connectToSocket = (server) => {
                         if (typeof ack === "function") ack({ success: false, ...err });
                         return;
                     }
+                    if (match && match.status !== "active") {
+                        const err = { code: "MATCH_NOT_ACTIVE", message: "An active accepted connection is required for private chat" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
                 }
 
                 // Authorize socket to join the isolated conversation room
@@ -284,6 +291,12 @@ export const connectToSocket = (server) => {
                     const match = await Match.findById(conversation.match).select("status");
                     if (match && match.status === "unmatched") {
                         const err = { code: "MATCH_UNMATCHED", message: "This match has been unmatched" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                    if (match && match.status !== "active") {
+                        const err = { code: "MATCH_NOT_ACTIVE", message: "An active accepted connection is required for private chat" };
                         socket.emit("chat:error", err);
                         if (typeof ack === "function") ack({ success: false, ...err });
                         return;
@@ -565,6 +578,219 @@ export const connectToSocket = (server) => {
                 socket.emit("chat:error", err);
                 if (typeof ack === "function") ack({ success: false, ...err });
             }
+        });
+
+        // ==========================================
+        // 3. 1-ON-1 DIRECT VIDEO CALLING (MUTUAL ACTIVE MATCHES ONLY)
+        // ==========================================
+        socket.on("call:initiate", async (data, ack) => {
+            if (!socket.userId) {
+                const err = { code: "AUTH_REQUIRED", message: "Authentication required to initiate calls" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (!isPlainObject(data)) {
+                const err = { code: "INVALID_PAYLOAD", message: "Invalid payload format" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const { targetUserId, conversationId } = data;
+            let calleeId = targetUserId;
+
+            if (!calleeId && conversationId && isValidObjectId(conversationId)) {
+                const conv = await Conversation.findById(conversationId);
+                if (conv && Array.isArray(conv.participants)) {
+                    calleeId = conv.participants.find((p) => p.toString() !== socket.userId.toString())?.toString();
+                }
+            }
+
+            if (!calleeId || !isValidObjectId(calleeId)) {
+                const err = { code: "INVALID_TARGET", message: "Valid target user ID required" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (calleeId === socket.userId) {
+                const err = { code: "SELF_CALL_PROHIBITED", message: "Cannot call yourself" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            try {
+                // Authoritative caller eligibility check
+                const callerUser = await User.findById(socket.userId).select("name dob gender bio photos interests isProfileComplete");
+                const callerElig = checkUserEligibility(callerUser);
+                if (!callerElig.isEligible) {
+                    const err = { code: callerElig.code, message: callerElig.reason };
+                    socket.emit("call:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                // Verify bidirectional block
+                const isBlocked = await Block.isBlockedBidirectional(socket.userId, calleeId);
+                if (isBlocked) {
+                    const err = { code: "BLOCKED_USER", message: "Call not permitted." };
+                    socket.emit("call:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                // Strict Connection Gate: Verify active accepted connection exists
+                const userPair = Match.getCanonicalPair(socket.userId, calleeId);
+                const activeMatch = await Match.findOne({ userPair, status: "active" });
+
+                if (!activeMatch) {
+                    const err = {
+                        code: "CALL_UNAUTHORIZED",
+                        message: "Video calling is only allowed between users with an active connection.",
+                    };
+                    socket.emit("call:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                const callId = `call_${crypto.randomUUID()}`;
+                const roomName = `direct-call:${callId}`;
+                socket.join(roomName);
+
+                // Notify target recipient of incoming call
+                io.to(`user:${calleeId}`).emit("call:incoming", {
+                    callId,
+                    caller: toPublicProfile(callerUser),
+                    conversationId: conversationId || null,
+                });
+
+                if (typeof ack === "function") {
+                    ack({ success: true, callId });
+                }
+            } catch (e) {
+                console.error("Socket call:initiate error:", e);
+                const err = { message: "Failed to initiate call" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+            }
+        });
+
+        socket.on("call:join", async (data, ack) => {
+            if (!socket.userId) {
+                const err = { code: "AUTH_REQUIRED", message: "Authentication required to join call" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const { callId, targetUserId } = data || {};
+            if (!callId || typeof callId !== "string") {
+                const err = { code: "INVALID_CALL_ID", message: "Call ID required" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            try {
+                if (targetUserId && isValidObjectId(targetUserId)) {
+                    const userPair = Match.getCanonicalPair(socket.userId, targetUserId);
+                    const activeMatch = await Match.findOne({ userPair, status: "active" });
+                    if (!activeMatch) {
+                        const err = {
+                            code: "CALL_UNAUTHORIZED",
+                            message: "Video calling is only allowed between users with an active connection.",
+                        };
+                        socket.emit("call:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
+                const roomName = `direct-call:${callId}`;
+                socket.join(roomName);
+                socket.to(roomName).emit("call:user-joined", { userId: socket.userId, callId });
+
+                if (typeof ack === "function") {
+                    ack({ success: true, callId });
+                }
+            } catch (e) {
+                console.error("Socket call:join error:", e);
+                const err = { message: "Failed to join call" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+            }
+        });
+
+        socket.on("call:signal", async (data, ack) => {
+            if (!socket.userId) {
+                const err = { code: "AUTH_REQUIRED", message: "Authentication required" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const { callId, targetUserId, signal } = data || {};
+            if (!targetUserId || !signal) {
+                const err = { code: "INVALID_SIGNAL", message: "Target user ID and signal payload required" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            try {
+                // Strict Connection Gate: Verify active connection before routing WebRTC signal
+                const userPair = Match.getCanonicalPair(socket.userId, targetUserId);
+                const activeMatch = await Match.findOne({ userPair, status: "active" });
+                if (!activeMatch) {
+                    const err = {
+                        code: "CALL_UNAUTHORIZED",
+                        message: "Signaling is only allowed between users with an active connection.",
+                    };
+                    socket.emit("call:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                io.to(`user:${targetUserId.toString()}`).emit("call:signal", {
+                    callId,
+                    senderId: socket.userId,
+                    signal,
+                });
+
+                if (typeof ack === "function") {
+                    ack({ success: true });
+                }
+            } catch (e) {
+                console.error("Socket call:signal error:", e);
+                const err = { message: "Failed to forward signal" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+            }
+        });
+
+        socket.on("call:end", (data, ack) => {
+            const { callId, targetUserId } = data || {};
+            if (targetUserId) {
+                io.to(`user:${targetUserId.toString()}`).emit("call:ended", { callId, reason: "ended_by_partner" });
+            }
+            if (callId) {
+                socket.leave(`direct-call:${callId}`);
+            }
+            if (typeof ack === "function") ack({ success: true });
+        });
+
+        socket.on("call:decline", (data, ack) => {
+            const { callId, targetUserId } = data || {};
+            if (targetUserId) {
+                io.to(`user:${targetUserId.toString()}`).emit("call:declined", { callId, reason: "declined_by_partner" });
+            }
+            if (callId) {
+                socket.leave(`direct-call:${callId}`);
+            }
+            if (typeof ack === "function") ack({ success: true });
         });
 
         socket.on("disconnect", () => {

@@ -1,5 +1,8 @@
 import httpStatus from "http-status";
+import mongoose from "mongoose";
 import { getIceServersConfig } from "../config/webrtc.js";
+import { Match } from "../models/match.model.js";
+import { Block } from "../models/block.model.js";
 
 // Bounded in-memory ring buffer for recent call diagnostics (max 100 entries)
 const MAX_DIAGNOSTICS_RECORDS = 100;
@@ -171,6 +174,53 @@ export const submitDiagnostics = async (req, res) => {
         return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
             success: false,
             message: "Failed to process diagnostics report.",
+        });
+    }
+};
+
+/**
+ * Validates that authenticated user has an active connection with target user before calling.
+ */
+export const verifyCallAccess = async (req, res) => {
+    const targetUserId = req.params.targetUserId || req.body.targetUserId;
+    if (!targetUserId || !mongoose.Types.ObjectId.isValid(targetUserId)) {
+        return res.status(httpStatus.BAD_REQUEST).json({
+            success: false,
+            message: "Invalid target user ID",
+        });
+    }
+
+    try {
+        const isBlocked = await Block.isBlockedBidirectional(req.user._id, targetUserId);
+        if (isBlocked) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "BLOCKED_USER",
+                message: "Call not permitted.",
+            });
+        }
+
+        const userPair = Match.getCanonicalPair(req.user._id, targetUserId);
+        const activeMatch = await Match.findOne({ userPair, status: "active" });
+
+        if (!activeMatch) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "CALL_UNAUTHORIZED",
+                message: "Video calling is only allowed between users with an active connection.",
+            });
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            allowed: true,
+            matchId: activeMatch._id,
+        });
+    } catch (e) {
+        console.error("verifyCallAccess error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to verify call access",
         });
     }
 };

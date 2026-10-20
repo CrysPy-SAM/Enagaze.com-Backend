@@ -59,8 +59,8 @@ const getConversations = async (req, res) => {
         // Compute unread counts and format other participant
         const formatted = await Promise.all(
             conversations.map(async (conv) => {
-                // If match is unmatched, exclude from active conversation list
-                if (conv.match && conv.match.status === "unmatched") {
+                // Exclude conversations where match is not active
+                if (!conv.match || conv.match.status !== "active") {
                     return null;
                 }
 
@@ -149,6 +149,14 @@ const getOrCreateConversationByMatch = async (req, res) => {
                 success: false,
                 code: "MATCH_UNMATCHED",
                 message: "This match has been unmatched.",
+            });
+        }
+
+        if (match.status !== "active") {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "MATCH_NOT_ACTIVE",
+                message: "Conversation requires an active accepted match.",
             });
         }
 
@@ -265,6 +273,13 @@ const getMessages = async (req, res) => {
                     success: false,
                     code: "MATCH_UNMATCHED",
                     message: "This match has been unmatched.",
+                });
+            }
+            if (match && match.status !== "active") {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "MATCH_NOT_ACTIVE",
+                    message: "An active accepted connection is required to access messages.",
                 });
             }
         }
@@ -451,6 +466,13 @@ const markConversationAsRead = async (req, res) => {
                     message: "This match has been unmatched.",
                 });
             }
+            if (match && match.status !== "active") {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "MATCH_NOT_ACTIVE",
+                    message: "An active accepted connection is required to access messages.",
+                });
+            }
         }
 
         const updateResult = await Message.updateMany(
@@ -585,6 +607,13 @@ const sendMessageRest = async (req, res) => {
                     success: false,
                     code: "MATCH_UNMATCHED",
                     message: "This match has been unmatched.",
+                });
+            }
+            if (match && match.status !== "active") {
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    code: "MATCH_NOT_ACTIVE",
+                    message: "An active accepted connection is required to access messages.",
                 });
             }
         }

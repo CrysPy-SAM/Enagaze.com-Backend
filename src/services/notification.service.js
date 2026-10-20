@@ -64,6 +64,7 @@ export const createNotification = async ({ recipient, sender, type, data = {}, i
                     data: {
                         matchId: data.matchId || null,
                         conversationId: data.conversationId || null,
+                        requestId: data.requestId || null,
                     },
                     read: false,
                 });
@@ -98,6 +99,7 @@ export const createNotification = async ({ recipient, sender, type, data = {}, i
                     data: {
                         matchId: data.matchId || null,
                         conversationId: data.conversationId || null,
+                        requestId: data.requestId || null,
                     },
                     read: false,
                     createdAt: new Date(),
@@ -473,6 +475,46 @@ export const supersedeLikeNotifications = async (user1, user2) => {
         }
     } catch (e) {
         console.warn("Failed to supersede like notifications:", e.message);
+    }
+};
+
+/**
+ * When a match request is accepted or declined, supersede prior "match_request"
+ * notifications between the two users by marking them as read.
+ *
+ * @param {string|mongoose.Types.ObjectId} user1
+ * @param {string|mongoose.Types.ObjectId} user2
+ */
+export const supersedeMatchRequestNotifications = async (user1, user2) => {
+    try {
+        const isDbConnected = mongoose.connection.readyState === 1;
+        if (isDbConnected) {
+            await Notification.updateMany(
+                {
+                    type: "match_request",
+                    $or: [
+                        { recipient: user1, sender: user2 },
+                        { recipient: user2, sender: user1 },
+                    ],
+                },
+                { $set: { read: true } }
+            );
+        } else {
+            const u1Str = user1.toString();
+            const u2Str = user2.toString();
+            for (const n of inMemoryFallbackNotifications) {
+                if (
+                    n.type === "match_request" &&
+                    ((n.recipient.toString() === u1Str && n.sender.toString() === u2Str) ||
+                        (n.recipient.toString() === u2Str && n.sender.toString() === u1Str))
+                ) {
+                    n.read = true;
+                    n.updatedAt = new Date();
+                }
+            }
+        }
+    } catch (e) {
+        console.warn("Failed to supersede match request notifications:", e.message);
     }
 };
 

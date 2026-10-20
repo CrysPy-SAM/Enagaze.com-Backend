@@ -15,7 +15,7 @@ const notificationSchema = new mongoose.Schema(
         },
         type: {
             type: String,
-            enum: ["like", "match", "message"],
+            enum: ["like", "match", "message", "match_request", "match_accepted"],
             required: true,
         },
         data: {
@@ -27,6 +27,11 @@ const notificationSchema = new mongoose.Schema(
             conversationId: {
                 type: mongoose.Schema.Types.ObjectId,
                 ref: "Conversation",
+                default: null,
+            },
+            requestId: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "MatchRequest",
                 default: null,
             },
         },
@@ -48,12 +53,12 @@ notificationSchema.index({ recipient: 1, createdAt: -1 });
 // Compound index for unread count
 notificationSchema.index({ recipient: 1, read: 1 });
 
-// Partial unique compound index to deduplicate like and match notifications
+// Partial unique compound index to deduplicate like, match, and request notifications
 notificationSchema.index(
     { recipient: 1, sender: 1, type: 1 },
     {
         unique: true,
-        partialFilterExpression: { type: { $in: ["like", "match"] } },
+        partialFilterExpression: { type: { $in: ["like", "match", "match_request", "match_accepted"] } },
     }
 );
 
