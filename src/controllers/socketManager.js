@@ -22,6 +22,18 @@ import {
 
 let ioInstance = null;
 
+// In-memory active direct 1-on-1 call sessions
+const activeDirectCalls = new Map(); // callId -> { callId, callerId, calleeId, status, callerSocketId, calleeSocketId, conversationId, createdAt, timeoutHandle }
+const userToDirectCall = new Map();  // userId -> callId
+
+export const _resetInMemoryDirectCalls = () => {
+    for (const call of activeDirectCalls.values()) {
+        if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
+    }
+    activeDirectCalls.clear();
+    userToDirectCall.clear();
+};
+
 export const getIO = () => ioInstance;
 
 export const connectToSocket = (server) => {
@@ -656,11 +668,64 @@ export const connectToSocket = (server) => {
                     return;
                 }
 
+                // Busy Check: Is the recipient already in another direct call session?
+                if (userToDirectCall.has(calleeId)) {
+                    const existingCallId = userToDirectCall.get(calleeId);
+                    const existingCall = activeDirectCalls.get(existingCallId);
+                    if (existingCall && (existingCall.status === "ringing" || existingCall.status === "connected")) {
+                        const err = { code: "USER_BUSY", message: "User is currently busy on another call." };
+                        socket.emit("call:busy", { targetUserId: calleeId, reason: "busy" });
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
+                // Clean up previous caller session if any was left hanging
+                if (userToDirectCall.has(socket.userId)) {
+                    const prevCallId = userToDirectCall.get(socket.userId);
+                    const prevCall = activeDirectCalls.get(prevCallId);
+                    if (prevCall) {
+                        if (prevCall.timeoutHandle) clearTimeout(prevCall.timeoutHandle);
+                        activeDirectCalls.delete(prevCallId);
+                        userToDirectCall.delete(prevCall.callerId);
+                        userToDirectCall.delete(prevCall.calleeId);
+                    }
+                }
+
                 const callId = `call_${crypto.randomUUID()}`;
                 const roomName = `direct-call:${callId}`;
                 socket.join(roomName);
 
-                // Notify target recipient of incoming call
+                // Set 35s ringing timeout
+                const timeoutHandle = setTimeout(() => {
+                    const call = activeDirectCalls.get(callId);
+                    if (call && call.status === "ringing") {
+                        call.status = "ended";
+                        activeDirectCalls.delete(callId);
+                        userToDirectCall.delete(call.callerId);
+                        userToDirectCall.delete(call.calleeId);
+                        io.to(`user:${call.callerId}`).emit("call:no-answer", { callId, reason: "timeout" });
+                        io.to(`user:${call.calleeId}`).emit("call:ended", { callId, reason: "timeout" });
+                    }
+                }, 35000);
+
+                const callSession = {
+                    callId,
+                    callerId: socket.userId,
+                    calleeId: calleeId,
+                    status: "ringing",
+                    callerSocketId: socket.id,
+                    calleeSocketId: null,
+                    conversationId: conversationId || null,
+                    createdAt: Date.now(),
+                    timeoutHandle,
+                };
+
+                activeDirectCalls.set(callId, callSession);
+                userToDirectCall.set(socket.userId, callId);
+                userToDirectCall.set(calleeId, callId);
+
+                // Notify target recipient of incoming direct call
                 io.to(`user:${calleeId}`).emit("call:incoming", {
                     callId,
                     caller: toPublicProfile(callerUser),
@@ -675,6 +740,50 @@ export const connectToSocket = (server) => {
                 const err = { message: "Failed to initiate call" };
                 socket.emit("call:error", err);
                 if (typeof ack === "function") ack({ success: false, ...err });
+            }
+        });
+
+        socket.on("call:accept", async (data, ack) => {
+            if (!socket.userId) {
+                const err = { code: "AUTH_REQUIRED", message: "Authentication required" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const { callId } = data || {};
+            const call = activeDirectCalls.get(callId);
+
+            if (!call || call.status !== "ringing") {
+                const err = { code: "CALL_NOT_FOUND", message: "Call session not found or already ended" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            // Strict check: Only intended callee can accept
+            if (socket.userId.toString() !== call.calleeId.toString()) {
+                const err = { code: "CALL_UNAUTHORIZED", message: "Not authorized to accept this call" };
+                socket.emit("call:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
+            call.status = "connected";
+            call.calleeSocketId = socket.id;
+
+            const roomName = `direct-call:${callId}`;
+            socket.join(roomName);
+
+            // Notify caller that callee accepted
+            io.to(`user:${call.callerId}`).emit("call:accepted", {
+                callId,
+                calleeId: socket.userId,
+            });
+
+            if (typeof ack === "function") {
+                ack({ success: true, callId });
             }
         });
 
@@ -695,6 +804,19 @@ export const connectToSocket = (server) => {
             }
 
             try {
+                // If call exists in active session map, verify participant membership
+                const call = activeDirectCalls.get(callId);
+                if (call) {
+                    const isCaller = socket.userId.toString() === call.callerId.toString();
+                    const isCallee = socket.userId.toString() === call.calleeId.toString();
+                    if (!isCaller && !isCallee) {
+                        const err = { code: "CALL_UNAUTHORIZED", message: "Unauthorized to join this call" };
+                        socket.emit("call:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+                }
+
                 if (targetUserId && isValidObjectId(targetUserId)) {
                     const userPair = Match.getCanonicalPair(socket.userId, targetUserId);
                     const activeMatch = await Match.findOne({ userPair, status: "active" });
@@ -754,6 +876,21 @@ export const connectToSocket = (server) => {
                     return;
                 }
 
+                // If call session exists in memory, verify sender and receiver belong to this call
+                if (callId) {
+                    const call = activeDirectCalls.get(callId);
+                    if (call) {
+                        const isCaller = socket.userId.toString() === call.callerId.toString() && targetUserId.toString() === call.calleeId.toString();
+                        const isCallee = socket.userId.toString() === call.calleeId.toString() && targetUserId.toString() === call.callerId.toString();
+                        if (!isCaller && !isCallee) {
+                            const err = { code: "CALL_UNAUTHORIZED", message: "Not authorized for this call session" };
+                            socket.emit("call:error", err);
+                            if (typeof ack === "function") ack({ success: false, ...err });
+                            return;
+                        }
+                    }
+                }
+
                 io.to(`user:${targetUserId.toString()}`).emit("call:signal", {
                     callId,
                     senderId: socket.userId,
@@ -773,22 +910,40 @@ export const connectToSocket = (server) => {
 
         socket.on("call:end", (data, ack) => {
             const { callId, targetUserId } = data || {};
-            if (targetUserId) {
+            const activeId = callId || (socket.userId ? userToDirectCall.get(socket.userId) : null);
+            if (activeId) {
+                const call = activeDirectCalls.get(activeId);
+                if (call) {
+                    if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
+                    activeDirectCalls.delete(activeId);
+                    userToDirectCall.delete(call.callerId);
+                    userToDirectCall.delete(call.calleeId);
+                    const partnerId = targetUserId || (socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId);
+                    io.to(`user:${partnerId.toString()}`).emit("call:ended", { callId: activeId, reason: "ended_by_partner" });
+                }
+                socket.leave(`direct-call:${activeId}`);
+            } else if (targetUserId) {
                 io.to(`user:${targetUserId.toString()}`).emit("call:ended", { callId, reason: "ended_by_partner" });
-            }
-            if (callId) {
-                socket.leave(`direct-call:${callId}`);
             }
             if (typeof ack === "function") ack({ success: true });
         });
 
         socket.on("call:decline", (data, ack) => {
             const { callId, targetUserId } = data || {};
-            if (targetUserId) {
+            const activeId = callId || (socket.userId ? userToDirectCall.get(socket.userId) : null);
+            if (activeId) {
+                const call = activeDirectCalls.get(activeId);
+                if (call) {
+                    if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
+                    activeDirectCalls.delete(activeId);
+                    userToDirectCall.delete(call.callerId);
+                    userToDirectCall.delete(call.calleeId);
+                    const partnerId = targetUserId || (socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId);
+                    io.to(`user:${partnerId.toString()}`).emit("call:declined", { callId: activeId, reason: "declined_by_partner" });
+                }
+                socket.leave(`direct-call:${activeId}`);
+            } else if (targetUserId) {
                 io.to(`user:${targetUserId.toString()}`).emit("call:declined", { callId, reason: "declined_by_partner" });
-            }
-            if (callId) {
-                socket.leave(`direct-call:${callId}`);
             }
             if (typeof ack === "function") ack({ success: true });
         });
@@ -796,6 +951,21 @@ export const connectToSocket = (server) => {
         socket.on("disconnect", () => {
             // Clean up rate limits on socket disconnect
             clearSocketRateLimits(socket.id);
+
+            // Clean up any direct call session in which this user was participating
+            if (socket.userId && userToDirectCall.has(socket.userId)) {
+                const directCallId = userToDirectCall.get(socket.userId);
+                const call = activeDirectCalls.get(directCallId);
+                if (call) {
+                    if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
+                    activeDirectCalls.delete(directCallId);
+                    userToDirectCall.delete(call.callerId);
+                    userToDirectCall.delete(call.calleeId);
+
+                    const otherUserId = socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId;
+                    io.to(`user:${otherUserId}`).emit("call:ended", { callId: directCallId, reason: "partner_disconnected" });
+                }
+            }
         });
     });
 
