@@ -159,4 +159,16 @@ export const unmatchLimiter = rateLimit({
     ),
 });
 
-
+/**
+ * Photo upload intent and confirmation rate limiter:
+ * Limits photo upload requests to 30 requests per 15 minutes per IP.
+ */
+export const photoUploadLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 30,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    handler: createRateLimitHandler(
+        "Too many photo upload requests. Please wait a few minutes before trying again."
+    ),
+});

@@ -5,6 +5,7 @@ import { OAuth2Client } from "google-auth-library";
 import { User } from "../models/user.model.js";
 import { getJwtSecret, JWT_EXPIRES_IN } from "../config/jwt.js";
 import { calculateExactAge, evaluateProfileCompleteness, checkUserEligibility } from "../services/eligibility.service.js";
+import { validatePublicPhotoUrl } from "../services/imageValidation.service.js";
 
 // Helper: Generate JWT token
 const generateToken = (user) => {
@@ -315,9 +316,19 @@ const updateMyProfile = async (req, res) => {
                 });
             }
             // Sanitize and validate photo URLs
-            const validPhotos = updates.photos
-                .map((url) => String(url).trim())
-                .filter((url) => url.length > 0);
+            const validPhotos = [];
+            for (const item of updates.photos) {
+                const url = String(item).trim();
+                if (!url) continue;
+                const check = validatePublicPhotoUrl(url);
+                if (!check.valid) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: `Invalid photo URL: ${check.error}`
+                    });
+                }
+                validPhotos.push(url);
+            }
 
             user.photos = validPhotos;
         }
