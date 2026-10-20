@@ -22,7 +22,7 @@ import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
 // ✅ Ensure .env loads properly even in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-dotenv.config({ path: path.join(__dirname, "../.env") });
+dotenv.config({ path: path.join(__dirname, "../.env"), quiet: true });
 
 // Ensure database URI is configured
 if (!process.env.MONGO_URI) {
@@ -34,6 +34,11 @@ validateJwtConfig({ exitOnError: true });
 
 const app = express();
 const server = createServer(app);
+server.on("clientError", (err, socket) => {
+  if (socket && !socket.destroyed) {
+    socket.destroy();
+  }
+});
 const io = connectToSocket(server);
 app.set("io", io);
 
@@ -189,11 +194,11 @@ const start = async ({ exitOnError = true } = {}) => {
   // 2. Open HTTP and Socket.IO server listener
   try {
     await new Promise((resolve, reject) => {
+      server.once("error", reject);
       server.listen(app.get("port"), () => {
         console.log(`🚀 Listening on PORT ${app.get("port")}`);
         resolve();
       });
-      server.once("error", reject);
     });
 
     return { app, server, connectionDb };
@@ -229,8 +234,10 @@ const gracefulShutdown = async (
   isShuttingDown = true;
   console.log(`Received ${signal}. Initiating graceful shutdown...`);
 
+  let timedOut = false;
   // Bounded force-termination fallback timer
   let forceExitTimer = setTimeout(() => {
+    timedOut = true;
     console.error(`⚠️ Graceful shutdown timed out after ${timeoutMs}ms. Forcing exit.`);
     if (typeof server.closeAllConnections === "function") {
       server.closeAllConnections();
@@ -285,9 +292,11 @@ const gracefulShutdown = async (
       clearTimeout(forceExitTimer);
     }
 
-    console.log("Graceful shutdown complete.");
-    if (exit) {
-      process.exit(0);
+    if (!timedOut) {
+      console.log("Graceful shutdown complete.");
+      if (exit) {
+        process.exit(0);
+      }
     }
     isShuttingDown = false;
   } catch (shutdownErr) {
@@ -295,7 +304,7 @@ const gracefulShutdown = async (
       clearTimeout(forceExitTimer);
     }
     console.error("Error during graceful shutdown:", shutdownErr.message);
-    if (exit) {
+    if (!timedOut && exit) {
       process.exit(1);
     }
     isShuttingDown = false;

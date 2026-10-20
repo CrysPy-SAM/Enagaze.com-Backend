@@ -11,16 +11,27 @@ import { getJwtSecret } from "../src/config/jwt.js";
 
 describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () => {
     const originalEnv = { ...process.env };
+    const originalConsoleLog = console.log;
+    const originalConsoleError = console.error;
     let originalReadyState;
+    let testLogs = [];
+    let testErrLogs = [];
 
     beforeEach(() => {
+        testLogs = [];
+        testErrLogs = [];
+        console.log = (...args) => testLogs.push(args.join(" "));
+        console.error = (...args) => testErrLogs.push(args.join(" "));
         process.env = { ...originalEnv };
         originalReadyState = mongoose.connection.readyState;
         _resetShutdownForTesting();
     });
 
     afterEach(() => {
+        console.log = originalConsoleLog;
+        console.error = originalConsoleError;
         process.env = { ...originalEnv };
+        delete server.listening;
         _resetShutdownForTesting();
         Object.defineProperty(mongoose.connection, "readyState", {
             value: originalReadyState,
@@ -420,7 +431,7 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
                 await shutdownPromise;
             } finally {
                 server.close = origClose;
-                Object.defineProperty(server, "listening", { value: origListening, configurable: true });
+                delete server.listening;
                 console.error = origConsoleError;
                 process.exit = originalExit;
                 _resetShutdownForTesting();
@@ -444,59 +455,76 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
                 Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
             };
 
-            const started = await start({ exitOnError: false });
-            const port = started.server.address().port;
+            let started;
+            let client;
+            try {
+                started = await start({ exitOnError: false });
+                const port = started.server.address().port;
 
-            const testToken = jwt.sign(
-                { id: new mongoose.Types.ObjectId().toString(), username: "test_ws_user" },
-                getJwtSecret(),
-                { expiresIn: "1h" }
-            );
+                const testToken = jwt.sign(
+                    { id: new mongoose.Types.ObjectId().toString(), username: "test_ws_user" },
+                    getJwtSecret(),
+                    { expiresIn: "1h" }
+                );
 
-            // Connect real Socket.IO client using WebSocket transport
-            const client = ioc(`http://127.0.0.1:${port}`, {
-                transports: ["websocket"],
-                reconnection: false,
-                auth: { token: testToken },
-            });
-
-            await new Promise((resolve, reject) => {
-                client.on("connect", resolve);
-                client.on("connect_error", reject);
-            });
-
-            assert.equal(client.connected, true, "Socket.IO client must be connected");
-
-            let clientDisconnected = false;
-            const disconnectPromise = new Promise((resolve) => {
-                client.on("disconnect", () => {
-                    clientDisconnected = true;
-                    resolve(true);
+                // Connect real Socket.IO client using WebSocket transport
+                client = ioc(`http://127.0.0.1:${port}`, {
+                    transports: ["websocket"],
+                    reconnection: false,
+                    auth: { token: testToken },
                 });
-            });
 
-            // Initiate gracefulShutdown with a large timeout (4000ms)
-            const startTime = Date.now();
-            await gracefulShutdown("SIGTERM", { exit: false, timeoutMs: 4000 });
-            const elapsedMs = Date.now() - startTime;
-            await Promise.race([
-                disconnectPromise,
-                new Promise((res) => setTimeout(res, 200)),
-            ]);
+                await new Promise((resolve, reject) => {
+                    client.on("connect", resolve);
+                    client.on("connect_error", reject);
+                });
 
-            // Assert:
-            // 1. Shutdown completed promptly (< 500ms) without blocking on 4000ms fallback timeout
-            assert.ok(elapsedMs < 500, `Shutdown took ${elapsedMs}ms; must complete without waiting for fallback timeout`);
-            // 2. Client received disconnect event
-            assert.equal(clientDisconnected, true, "Socket client must receive disconnect during shutdown");
-            // 3. HTTP server is no longer listening
-            assert.equal(started.server.listening, false, "HTTP server must be closed");
-            // 4. Mongoose was disconnected after network shutdown
-            assert.equal(mongooseDisconnected, true, "Mongoose must be disconnected after network drain");
+                assert.equal(client.connected, true, "Socket.IO client must be connected");
 
-            client.close();
-            mongoose.connect = origConnect;
-            mongoose.disconnect = origDisconnect;
+                // Mute post-shutdown transport errors on the client to avoid unhandled rejections
+                client.on("connect_error", () => {});
+                client.on("error", () => {});
+                if (client.io) {
+                    client.io.on("error", () => {});
+                }
+
+                let clientDisconnected = false;
+                const disconnectPromise = new Promise((resolve) => {
+                    client.on("disconnect", () => {
+                        clientDisconnected = true;
+                        resolve(true);
+                    });
+                });
+
+                // Initiate gracefulShutdown with a large timeout (4000ms)
+                const startTime = Date.now();
+                await gracefulShutdown("SIGTERM", { exit: false, timeoutMs: 4000 });
+                const elapsedMs = Date.now() - startTime;
+                await Promise.race([
+                    disconnectPromise,
+                    new Promise((res) => setTimeout(res, 200)),
+                ]);
+
+                // Assert:
+                // 1. Shutdown completed promptly (< 500ms) without blocking on 4000ms fallback timeout
+                assert.ok(elapsedMs < 500, `Shutdown took ${elapsedMs}ms; must complete without waiting for fallback timeout`);
+                // 2. Client received disconnect event
+                assert.equal(clientDisconnected, true, "Socket client must receive disconnect during shutdown");
+                // 3. HTTP server is no longer listening
+                assert.equal(started.server.listening, false, "HTTP server must be closed");
+                // 4. Mongoose was disconnected after network shutdown
+                assert.equal(mongooseDisconnected, true, "Mongoose must be disconnected after network drain");
+            } finally {
+                if (client) {
+                    client.disconnect();
+                    client.close();
+                }
+                mongoose.connect = origConnect;
+                mongoose.disconnect = origDisconnect;
+                if (started?.server?.listening) {
+                    await new Promise((res) => started.server.close(res));
+                }
+            }
         });
     });
 });
