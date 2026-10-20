@@ -22,6 +22,7 @@ jobs:
       JWT_SECRET: ci-test-jwt-secret-minimum-32-characters-long!
       PORT: 5000
       DOTENV_CONFIG_QUIET: "true"
+      MONGO_URI: mongodb://127.0.0.1:27017/ci_test_db
 
     steps:
       - name: Check out repository

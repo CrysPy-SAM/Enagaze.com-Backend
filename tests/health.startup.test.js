@@ -206,6 +206,7 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
         it("simulated parse error containing credentials logs sanitized category and does NOT leak credentials", async () => {
             const fakeUser = "leaky_test_user_999";
             const fakePass = "super_secret_raw_pass_888";
+            process.env.MONGO_URI = `mongodb://${fakeUser}:${fakePass}@cluster0.example.com/test_db`;
             const simulatedError = new Error(`Protocol and host list are required in "mongodb://${fakeUser}:${fakePass}@"`);
             simulatedError.name = "MongoParseError";
 
