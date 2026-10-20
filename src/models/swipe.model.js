@@ -30,6 +30,9 @@ const swipeSchema = new Schema(
 
 // Compound unique index ensures a user cannot swipe twice on the same target
 swipeSchema.index({ fromUser: 1, toUser: 1 }, { unique: true });
+// Performance indexes for reset pass queries and incoming likes lookup
+swipeSchema.index({ fromUser: 1, action: 1 });
+swipeSchema.index({ toUser: 1, action: 1 });
 
 const Swipe = mongoose.model("Swipe", swipeSchema);
 

@@ -36,9 +36,15 @@ const getDiscoveryProfiles = async (req, res) => {
         const cursor = req.query.cursor;
 
         // 2. Fetch IDs of profiles the user has already swiped on, matched users, and blocked users
+        let swipeQuery = Swipe.find({ fromUser: currentUser._id }).select("toUser");
+        if (typeof swipeQuery.lean === "function") swipeQuery = swipeQuery.lean();
+
+        let matchQuery = Match.find({ users: currentUser._id }).select("users");
+        if (typeof matchQuery.lean === "function") matchQuery = matchQuery.lean();
+
         const [swipedRecords, existingMatches, blockedIds] = await Promise.all([
-            Swipe.find({ fromUser: currentUser._id }).select("toUser"),
-            Match.find({ users: currentUser._id }).select("users"),
+            swipeQuery,
+            matchQuery,
             Block.getBlockedUserIds(currentUser._id),
         ]);
         const matchedUserIds = existingMatches.flatMap((m) =>
@@ -116,20 +122,26 @@ const getDiscoveryProfiles = async (req, res) => {
         }
 
         // 6. Execute query with safe projection
-        const total = await User.countDocuments(query);
+        let page = 1;
         let findQuery = User.find(query)
             .select("name dob gender bio photos interests isProfileComplete")
             .sort({ _id: -1 })
             .limit(limit);
 
-        let page = 1;
         if (!cursor) {
             page = Math.max(1, parseInt(req.query.page, 10) || 1);
             const skip = (page - 1) * limit;
             findQuery = findQuery.skip(skip);
         }
 
-        const profiles = await findQuery;
+        if (typeof findQuery.lean === "function") {
+            findQuery = findQuery.lean();
+        }
+
+        const [total, profiles] = await Promise.all([
+            User.countDocuments(query),
+            findQuery,
+        ]);
         const nextCursor = profiles.length === limit ? profiles[profiles.length - 1]._id : null;
         const hasMore = Boolean(nextCursor);
 

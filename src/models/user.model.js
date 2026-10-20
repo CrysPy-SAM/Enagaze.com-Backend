@@ -133,6 +133,10 @@ userSchema.index({ name: 1 });
 userSchema.index({ isProfileComplete: 1, username: 1 });
 userSchema.index({ isProfileComplete: 1, name: 1 });
 
+// High-performance compound indexes for adult discovery feed filtering and cursor pagination
+userSchema.index({ isProfileComplete: 1, dob: 1, _id: -1 });
+userSchema.index({ isProfileComplete: 1, gender: 1, dob: 1, _id: -1 });
+
 const User = mongoose.model("User", userSchema);
 
 export { User };
