@@ -8,6 +8,10 @@ import {
     MAX_PHOTO_BYTES,
     ALLOWED_MIME_TYPES,
 } from "./imageValidation.service.js";
+import {
+    generatePresignedPutUrl,
+    signS3Request,
+} from "./s3Signer.service.js";
 
 const UPLOAD_TOKEN_TTL_SECONDS = 300; // 5 minutes
 
@@ -114,6 +118,77 @@ export function generatePhotoKey(userId, mimeType) {
     const ext = extMap[mimeType] || "jpg";
     const uuid = crypto.randomUUID();
     return `profile-photos/${userId}/${uuid}.${ext}`;
+}
+
+/**
+ * Validates S3/R2 storage provider environment configuration.
+ * Never prints or leaks secret credential values in output messages.
+ *
+ * @param {object} [env=process.env]
+ * @returns {{ valid: boolean, reason?: string, config?: object }}
+ */
+export function validateStorageConfig(env = process.env) {
+    const provider = (env.STORAGE_PROVIDER || "").toLowerCase().trim();
+    if (provider !== "s3" && provider !== "r2") {
+        return { valid: false, reason: "STORAGE_PROVIDER is not set to 's3' or 'r2'." };
+    }
+
+    const bucket = (env.STORAGE_BUCKET || env.AWS_S3_BUCKET || env.R2_BUCKET || "").trim();
+    if (!bucket) {
+        return { valid: false, reason: "Missing required storage bucket configuration (STORAGE_BUCKET or AWS_S3_BUCKET)." };
+    }
+
+    const accessKeyId = (env.STORAGE_ACCESS_KEY_ID || env.AWS_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "").trim();
+    if (!accessKeyId || accessKeyId.length < 4) {
+        return { valid: false, reason: "Missing or invalid storage access key ID (STORAGE_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID)." };
+    }
+
+    const secretAccessKey = (env.STORAGE_SECRET_ACCESS_KEY || env.AWS_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "").trim();
+    if (!secretAccessKey || secretAccessKey.length < 8) {
+        return { valid: false, reason: "Missing or invalid storage secret access key (STORAGE_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY)." };
+    }
+
+    const region = (env.STORAGE_REGION || env.AWS_REGION || env.AWS_DEFAULT_REGION || (provider === "r2" ? "auto" : "us-east-1")).trim();
+    if (!region) {
+        return { valid: false, reason: "Missing storage region configuration (STORAGE_REGION or AWS_REGION)." };
+    }
+
+    const publicBaseUrl = (
+        env.STORAGE_PUBLIC_BASE_URL ||
+        env.CLOUDFLARE_R2_PUBLIC_URL ||
+        env.AWS_S3_PUBLIC_URL ||
+        ""
+    ).trim().replace(/\/+$/, "");
+
+    if (!publicBaseUrl || !publicBaseUrl.startsWith("http")) {
+        return { valid: false, reason: "Missing or invalid public delivery base URL (STORAGE_PUBLIC_BASE_URL or AWS_S3_PUBLIC_URL). Must start with http:// or https://." };
+    }
+
+    const rawEndpoint = (env.STORAGE_ENDPOINT || env.AWS_S3_ENDPOINT || env.CLOUDFLARE_R2_ENDPOINT || "").trim().replace(/\/+$/, "");
+    let endpoint = rawEndpoint || null;
+
+    if (!endpoint && provider === "r2" && env.CLOUDFLARE_R2_ACCOUNT_ID) {
+        endpoint = `https://${env.CLOUDFLARE_R2_ACCOUNT_ID.trim()}.r2.cloudflarestorage.com`;
+    }
+
+    const forcePathStyle =
+        env.STORAGE_FORCE_PATH_STYLE !== undefined
+            ? env.STORAGE_FORCE_PATH_STYLE === "true"
+            : Boolean(endpoint);
+
+    return {
+        valid: true,
+        config: {
+            provider,
+            bucket,
+            accessKeyId,
+            secretAccessKey,
+            region,
+            endpoint,
+            forcePathStyle,
+            publicBaseUrl,
+        },
+    };
 }
 
 /**
@@ -234,14 +309,24 @@ export class StorageUnavailableAdapter {
 }
 
 /**
- * S3 Storage Provider Adapter.
- * Activates when STORAGE_PROVIDER === 's3' and AWS credentials are set.
+ * Production S3-Compatible Storage Provider Adapter.
+ * Supports AWS S3 and S3-compatible object storage providers (Cloudflare R2, MinIO, Wasabi).
+ * Generates AWS SigV4 presigned upload PUT URLs and executes server-to-S3 HEAD/DELETE operations.
  */
 export class S3StorageAdapter {
-    constructor() {
-        this.name = "s3";
-        this.bucket = process.env.AWS_S3_BUCKET;
-        this.region = process.env.AWS_REGION || "us-east-1";
+    constructor(config = null, options = {}) {
+        this.config = config || validateStorageConfig().config;
+        if (!this.config) {
+            const err = new Error("S3StorageAdapter requires valid storage configuration");
+            err.statusCode = 503;
+            err.code = "STORAGE_UNAVAILABLE";
+            throw err;
+        }
+        this.name = this.config.provider || "s3";
+        this.bucket = this.config.bucket;
+        this.region = this.config.region;
+        this.publicBaseUrl = this.config.publicBaseUrl;
+        this.fetchFn = options.fetchFn || globalThis.fetch;
     }
 
     async createPresignedUpload(user, key, mimeType, maxBytes, targetIndex) {
@@ -255,17 +340,18 @@ export class S3StorageAdapter {
             expiresAt,
         });
 
-        // Use custom CDN or fallback to S3 bucket domain
-        const publicBase =
-            process.env.STORAGE_PUBLIC_BASE_URL ||
-            process.env.AWS_S3_PUBLIC_URL ||
-            `https://${this.bucket}.s3.${this.region}.amazonaws.com`;
+        const uploadUrl = generatePresignedPutUrl({
+            config: this.config,
+            key,
+            contentType: mimeType,
+            expiresInSeconds: UPLOAD_TOKEN_TTL_SECONDS,
+        });
 
-        const publicUrl = `${publicBase}/${key}`;
-        const uploadUrl = `${publicBase}/${key}?signed=true`; // Placeholder when SDK credentials exist
+        // Resulting public URL uses configured CDN / public delivery base URL (permanent, non-expiring)
+        const publicUrl = `${this.publicBaseUrl}/${key}`;
 
         return {
-            provider: "s3",
+            provider: this.name,
             uploadUrl,
             publicUrl,
             key,
@@ -277,29 +363,108 @@ export class S3StorageAdapter {
     }
 
     async objectExists(key) {
-        if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
-            const err = new Error("S3 storage credentials not configured for object verification");
-            err.statusCode = 503;
-            err.code = "STORAGE_UNAVAILABLE";
-            throw err;
+        try {
+            const signed = signS3Request({
+                config: this.config,
+                method: "HEAD",
+                key,
+            });
+            const res = await this.fetchFn(signed.url, {
+                method: "HEAD",
+                headers: signed.headers,
+            });
+
+            if (res.status === 200) {
+                return true;
+            }
+            if (res.status === 404) {
+                return false;
+            }
+            if (res.status === 403) {
+                const err = new Error("Storage provider access denied. S3/R2 bucket credentials or permissions invalid.");
+                err.statusCode = 503;
+                err.code = "STORAGE_UNAVAILABLE";
+                throw err;
+            }
+            return false;
+        } catch (err) {
+            if (err.statusCode) throw err;
+            const error = new Error(`Storage provider connection error: ${err.message}`);
+            error.statusCode = 503;
+            error.code = "STORAGE_UNAVAILABLE";
+            throw error;
         }
-        // Placeholder for HeadObjectCommand when AWS SDK is present
-        return true;
     }
 
     async getObjectMetadata(key) {
-        if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
-            const err = new Error("S3 storage credentials not configured for object verification");
-            err.statusCode = 503;
-            err.code = "STORAGE_UNAVAILABLE";
-            throw err;
+        try {
+            const signed = signS3Request({
+                config: this.config,
+                method: "HEAD",
+                key,
+            });
+            const res = await this.fetchFn(signed.url, {
+                method: "HEAD",
+                headers: signed.headers,
+            });
+
+            if (res.status === 200) {
+                const contentLength = res.headers?.get
+                    ? res.headers.get("content-length")
+                    : res.headers?.["content-length"];
+                const contentType = res.headers?.get
+                    ? res.headers.get("content-type")
+                    : res.headers?.["content-type"];
+                const lastModified = res.headers?.get
+                    ? res.headers.get("last-modified")
+                    : res.headers?.["last-modified"];
+                const etag = res.headers?.get
+                    ? res.headers.get("etag")
+                    : res.headers?.["etag"];
+
+                return {
+                    size: contentLength ? parseInt(contentLength, 10) : 0,
+                    contentType: contentType ? contentType.split(";")[0].trim().toLowerCase() : "",
+                    lastModified: lastModified || null,
+                    etag: etag || null,
+                };
+            }
+            if (res.status === 404) {
+                return null;
+            }
+            if (res.status === 403) {
+                const err = new Error("Storage provider access denied. S3/R2 bucket credentials or permissions invalid.");
+                err.statusCode = 503;
+                err.code = "STORAGE_UNAVAILABLE";
+                throw err;
+            }
+            return null;
+        } catch (err) {
+            if (err.statusCode) throw err;
+            const error = new Error(`Storage provider connection error: ${err.message}`);
+            error.statusCode = 503;
+            error.code = "STORAGE_UNAVAILABLE";
+            throw error;
         }
-        return null;
     }
 
-    async deleteObject() {
-        // Will be deleted via DeleteObjectCommand when credentials exist
-        return true;
+    async deleteObject(key) {
+        try {
+            const signed = signS3Request({
+                config: this.config,
+                method: "DELETE",
+                key,
+            });
+            const res = await this.fetchFn(signed.url, {
+                method: "DELETE",
+                headers: signed.headers,
+            });
+
+            return res.status === 204 || res.status === 200 || res.status === 404;
+        } catch (err) {
+            console.warn("Non-fatal storage object delete error:", err?.message);
+            return false;
+        }
     }
 }
 
@@ -309,10 +474,15 @@ let currentAdapter = null;
 export function getStorageAdapter() {
     if (!currentAdapter) {
         const isProduction = process.env.NODE_ENV === "production";
-        if (process.env.STORAGE_PROVIDER === "s3" && process.env.AWS_S3_BUCKET) {
-            currentAdapter = new S3StorageAdapter();
+        const validation = validateStorageConfig();
+
+        if (validation.valid) {
+            currentAdapter = new S3StorageAdapter(validation.config);
         } else if (isProduction) {
-            currentAdapter = new StorageUnavailableAdapter();
+            currentAdapter = new StorageUnavailableAdapter(validation.reason);
+        } else if (process.env.STORAGE_PROVIDER === "s3" || process.env.STORAGE_PROVIDER === "r2") {
+            // In dev/test, if S3/R2 was specifically requested but configuration is invalid, fail closed
+            currentAdapter = new StorageUnavailableAdapter(validation.reason);
         } else {
             currentAdapter = new DevMockStorageAdapter();
         }
@@ -410,11 +580,23 @@ export async function confirmPhotoUpload(userId, payload) {
         const meta = await adapter.getObjectMetadata(key);
         if (meta) {
             if (meta.size && meta.size > (tokenClaims.maxSizeBytes || MAX_PHOTO_BYTES)) {
+                // Delete oversized object from storage to free up space and prevent unverified files
+                try {
+                    await adapter.deleteObject(key);
+                } catch (cleanupErr) {
+                    console.warn("Non-fatal cleanup error for oversized object:", cleanupErr?.message);
+                }
                 const error = new Error(`Uploaded file size (${meta.size} bytes) exceeds maximum allowed limit of ${Math.round((tokenClaims.maxSizeBytes || MAX_PHOTO_BYTES) / (1024 * 1024))}MB`);
                 error.statusCode = 400;
                 throw error;
             }
             if (meta.contentType && tokenClaims.expectedMime && meta.contentType !== tokenClaims.expectedMime) {
+                // Delete mismatched content-type object from storage
+                try {
+                    await adapter.deleteObject(key);
+                } catch (cleanupErr) {
+                    console.warn("Non-fatal cleanup error for mismatched content-type object:", cleanupErr?.message);
+                }
                 const error = new Error(`Uploaded object content type (${meta.contentType}) does not match authorized content type (${tokenClaims.expectedMime})`);
                 error.statusCode = 400;
                 throw error;
@@ -428,21 +610,32 @@ export async function confirmPhotoUpload(userId, payload) {
     }
 
     // Construct resulting public URL
-    const baseUrl =
-        process.env.STORAGE_PUBLIC_BASE_URL ||
-        process.env.CLOUDFLARE_R2_PUBLIC_URL ||
-        process.env.AWS_S3_PUBLIC_URL ||
-        `http://localhost:${process.env.PORT || 5000}`;
-
     let publicUrl;
     if (adapter.name === "mock") {
+        const baseUrl = process.env.STORAGE_PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 5000}`;
         publicUrl = `${baseUrl}/api/v1/users/profile/photo/media/${encodeURIComponent(key)}`;
     } else {
+        const baseUrl =
+            adapter.publicBaseUrl ||
+            process.env.STORAGE_PUBLIC_BASE_URL ||
+            process.env.CLOUDFLARE_R2_PUBLIC_URL ||
+            process.env.AWS_S3_PUBLIC_URL ||
+            `http://localhost:${process.env.PORT || 5000}`;
         publicUrl = `${baseUrl}/${key}`;
     }
 
     // Validate the resulting URL through host allowlist and SSRF checks
-    const urlValidation = validatePublicPhotoUrl(publicUrl);
+    let adapterHost = null;
+    try {
+        if (adapter.publicBaseUrl) {
+            adapterHost = new URL(adapter.publicBaseUrl).hostname;
+        }
+    } catch { /* ignore */ }
+
+    const urlValidation = validatePublicPhotoUrl(
+        publicUrl,
+        adapterHost ? { additionalApprovedHosts: [adapterHost] } : {}
+    );
     if (!urlValidation.valid) {
         throw new Error(`Validated URL rejected: ${urlValidation.error}`);
     }
@@ -450,6 +643,10 @@ export async function confirmPhotoUpload(userId, payload) {
     // Capture existing photos array for safe rollback on persistence error
     const previousPhotos = Array.isArray(user.photos) ? [...user.photos] : [];
     const effectiveTargetIndex = targetIndex !== undefined ? Number(targetIndex) : tokenClaims.targetIndex;
+    const previousPhotoUrl =
+        typeof effectiveTargetIndex === "number" && effectiveTargetIndex >= 0 && effectiveTargetIndex < previousPhotos.length
+            ? previousPhotos[effectiveTargetIndex]
+            : null;
 
     if (typeof effectiveTargetIndex === "number" && effectiveTargetIndex >= 0 && effectiveTargetIndex < 6) {
         // Replace existing photo at targetIndex, or pad if within bounds
@@ -468,8 +665,33 @@ export async function confirmPhotoUpload(userId, payload) {
         user.photos = [...previousPhotos, publicUrl];
     }
 
-    // Save user profile
-    await user.save();
+    // Save user profile with rollback protection
+    try {
+        await user.save();
+    } catch (saveError) {
+        // Safe rollback: delete the newly uploaded object from storage if database persistence fails
+        try {
+            await adapter.deleteObject(key);
+        } catch (cleanupErr) {
+            console.warn("Non-fatal cleanup error on persistence failure:", cleanupErr?.message);
+        }
+        throw saveError;
+    }
+
+    // On successful replacement, clean up old photo from storage if it belonged to our platform
+    if (previousPhotoUrl && previousPhotoUrl !== publicUrl && previousPhotoUrl.includes("/profile-photos/")) {
+        const keyMatch = previousPhotoUrl.match(/(profile-photos\/[^?]+)/);
+        if (keyMatch) {
+            const oldKey = decodeURIComponent(keyMatch[1]);
+            if (oldKey.startsWith(`profile-photos/${userId}/`)) {
+                try {
+                    await adapter.deleteObject(oldKey);
+                } catch (cleanupErr) {
+                    console.warn("Non-fatal cleanup error for replaced photo:", cleanupErr?.message);
+                }
+            }
+        }
+    }
 
     return {
         success: true,
@@ -501,12 +723,15 @@ export async function deleteProfilePhoto(userId, photoIndex) {
 
     // Trigger cleanup on adapter if the photo was stored on our platform
     try {
-        if (removedUrl.includes("/profile-photos/")) {
+        if (removedUrl && removedUrl.includes("/profile-photos/")) {
             const keyMatch = removedUrl.match(/(profile-photos\/[^?]+)/);
             if (keyMatch) {
                 const key = decodeURIComponent(keyMatch[1]);
-                const adapter = getStorageAdapter();
-                await adapter.deleteObject(key);
+                // Ensure key belongs to current user to prevent deleting another user's photos
+                if (key.startsWith(`profile-photos/${userId}/`)) {
+                    const adapter = getStorageAdapter();
+                    await adapter.deleteObject(key);
+                }
             }
         }
     } catch (e) {

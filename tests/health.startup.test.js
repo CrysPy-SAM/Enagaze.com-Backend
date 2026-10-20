@@ -409,18 +409,21 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
 
             try {
                 // Launch shutdown without awaiting so test execution can advance while server.close hangs
-                gracefulShutdown("SIGTERM", { exit: true, timeoutMs: 50 });
+                const shutdownPromise = gracefulShutdown("SIGTERM", { exit: true, timeoutMs: 50 });
                 await new Promise((res) => setTimeout(res, 90));
 
                 assert.equal(exitCalled, true, "Force exit must be called on timeout");
                 assert.equal(exitCode, 1, "Exit code must be 1 on timeout");
                 const allErrText = errLogs.join("\n");
                 assert.ok(allErrText.includes("Graceful shutdown timed out after 50ms. Forcing exit."));
+                // Allow simulated server.close to settle while process.exit remains mocked
+                await shutdownPromise;
             } finally {
                 server.close = origClose;
                 Object.defineProperty(server, "listening", { value: origListening, configurable: true });
                 console.error = origConsoleError;
                 process.exit = originalExit;
+                _resetShutdownForTesting();
             }
         });
 
