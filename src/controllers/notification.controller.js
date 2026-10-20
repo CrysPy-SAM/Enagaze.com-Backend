@@ -103,3 +103,4 @@ export const markAllAsReadHandler = async (req, res) => {
         });
     }
 };
+

@@ -22,3 +22,4 @@ router.patch("/read-all", protect, markAllAsReadHandler);
 router.patch("/:id/read", protect, markAsReadHandler);
 
 export default router;
+
