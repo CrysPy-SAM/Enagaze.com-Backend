@@ -2,6 +2,7 @@ import { Router } from "express";
 import {
     getDiscoveryProfiles,
     swipe,
+    getLikesYou,
     resetDiscoverySwipes,
     getDiscoveryPreferences,
     updateDiscoveryPreferences,
@@ -28,6 +29,9 @@ router.route("/").get(discoveryLimiter, getDiscoveryProfiles);
 
 // POST /api/v1/discovery/swipe - Like or pass a profile (anti-automation rate limited)
 router.route("/swipe").post(swipeLimiter, swipe);
+
+// GET /api/v1/discovery/likes-you - Profiles who liked current user
+router.route("/likes-you").get(getLikesYou);
 
 // POST /api/v1/discovery/reset - Reset passed swipes so profiles reappear in feed
 router.route("/reset").post(swipeLimiter, resetDiscoverySwipes);

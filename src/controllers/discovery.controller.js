@@ -9,6 +9,10 @@ import { getIO } from "./socketManager.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
 import { findOrCreateCanonicalMatchAndConversation } from "../services/matching.service.js";
+import {
+    createNotification,
+    supersedeLikeNotifications,
+} from "../services/notification.service.js";
 
 // ==========================================
 // 1. GET DISCOVERY PROFILES
@@ -347,9 +351,9 @@ const swipe = async (req, res) => {
                     targetUserId
                 );
 
-                // Real-time socket notification strictly if this thread created the canonical match
+                // Real-time socket notification and persistent match notifications
+                const io = req.app?.get("io") || getIO();
                 if (isNewMatch) {
-                    const io = req.app?.get("io") || getIO();
                     if (io) {
                         const currentUserPublic = toPublicProfile(req.user);
                         const targetUserPublic = toPublicProfile(targetUser);
@@ -372,6 +376,25 @@ const swipe = async (req, res) => {
                             },
                         });
                     }
+
+                    // Persist match notifications for both users and supersede any prior likes
+                    await Promise.allSettled([
+                        createNotification({
+                            recipient: targetUserId,
+                            sender: req.user._id,
+                            type: "match",
+                            data: { matchId: match._id, conversationId: conversation?._id },
+                            io,
+                        }),
+                        createNotification({
+                            recipient: req.user._id,
+                            sender: targetUserId,
+                            type: "match",
+                            data: { matchId: match._id, conversationId: conversation?._id },
+                            io,
+                        }),
+                        supersedeLikeNotifications(req.user._id, targetUserId),
+                    ]);
                 }
 
                 return res.status(httpStatus.CREATED).json({
@@ -386,6 +409,17 @@ const swipe = async (req, res) => {
                     },
                 });
             }
+        }
+
+        // Unilateral like notification (when action is 'like' without mutual match yet)
+        if (action === "like") {
+            const io = req.app?.get("io") || getIO();
+            await createNotification({
+                recipient: targetUserId,
+                sender: req.user._id,
+                type: "like",
+                io,
+            });
         }
 
         // Either action was 'pass' or one-sided 'like' without a mutual like yet
@@ -479,6 +513,135 @@ const getMatches = async (req, res) => {
         return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
             success: false,
             message: "Failed to load matches",
+        });
+    }
+};
+
+// ==========================================
+// 3b. GET LIKES YOU PROFILES
+// ==========================================
+const getLikesYou = async (req, res) => {
+    try {
+        const currentUser = req.user;
+
+        // 1. Authoritative check: Viewing user must be 18+ and have a complete profile
+        const viewerEligibility = checkUserEligibility(currentUser);
+        if (!viewerEligibility.isEligible) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: viewerEligibility.code,
+                message: viewerEligibility.reason,
+                missingFields: viewerEligibility.missingFields,
+            });
+        }
+
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+
+        // 2. Fetch incoming likes
+        const incomingLikes = await Swipe.find({
+            toUser: currentUser._id,
+            action: "like",
+        }).sort({ createdAt: -1 });
+
+        if (incomingLikes.length === 0) {
+            return res.status(httpStatus.OK).json({
+                success: true,
+                profiles: [],
+                pagination: {
+                    page,
+                    limit,
+                    total: 0,
+                    totalPages: 1,
+                },
+            });
+        }
+
+        // 3. Exclude users already swiped by currentUser, existing matches, and blocked users
+        const [mySwipes, existingMatches, blockedIds] = await Promise.all([
+            Swipe.find({ fromUser: currentUser._id }).select("toUser"),
+            Match.find({ users: currentUser._id }).select("users"),
+            Block.getBlockedUserIds(currentUser._id),
+        ]);
+
+        const swipedUserIds = new Set(mySwipes.map((s) => s.toUser.toString()));
+        const matchedUserIds = new Set(
+            existingMatches.flatMap((m) =>
+                m.users.filter((u) => u && u.toString() !== currentUser._id.toString()).map((u) => u.toString())
+            )
+        );
+        const blockedSet = new Set(blockedIds.map((id) => id.toString()));
+
+        // Filter and collect candidate user IDs and their like timestamps
+        const candidateMap = new Map(); // userId -> likedAt
+        for (const swipeRecord of incomingLikes) {
+            const senderIdStr = swipeRecord.fromUser.toString();
+            if (
+                senderIdStr !== currentUser._id.toString() &&
+                !swipedUserIds.has(senderIdStr) &&
+                !matchedUserIds.has(senderIdStr) &&
+                !blockedSet.has(senderIdStr) &&
+                !candidateMap.has(senderIdStr)
+            ) {
+                candidateMap.set(senderIdStr, swipeRecord.createdAt);
+            }
+        }
+
+        const allCandidateIds = Array.from(candidateMap.keys());
+        const total = allCandidateIds.length;
+        const pageCandidateIds = allCandidateIds.slice(skip, skip + limit);
+
+        if (pageCandidateIds.length === 0) {
+            return res.status(httpStatus.OK).json({
+                success: true,
+                profiles: [],
+                pagination: {
+                    page,
+                    limit,
+                    total,
+                    totalPages: Math.ceil(total / limit) || 1,
+                },
+            });
+        }
+
+        // 4. Fetch user records ensuring isProfileComplete: true
+        const candidateUsers = await User.find({
+            _id: { $in: pageCandidateIds },
+            isProfileComplete: true,
+        }).select("name dob gender bio photos interests isProfileComplete");
+
+        // Preserve sort order from candidateMap
+        const userMap = new Map(candidateUsers.map((u) => [u._id.toString(), u]));
+
+        const profiles = pageCandidateIds
+            .map((id) => {
+                const user = userMap.get(id);
+                if (!user) return null;
+                const publicProfile = toPublicProfile(user);
+                if (!publicProfile) return null;
+                return {
+                    ...publicProfile,
+                    likedAt: candidateMap.get(id) || null,
+                };
+            })
+            .filter(Boolean);
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            profiles,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit) || 1,
+            },
+        });
+    } catch (e) {
+        console.error("Get likes you error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to retrieve likes",
         });
     }
 };
@@ -682,6 +845,7 @@ export {
     getDiscoveryProfiles,
     swipe,
     getMatches,
+    getLikesYou,
     resetDiscoverySwipes,
     getDiscoveryPreferences,
     updateDiscoveryPreferences,

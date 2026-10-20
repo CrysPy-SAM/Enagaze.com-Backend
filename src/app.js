@@ -15,6 +15,7 @@ import chatRoutes from "./routes/chat.routes.js";
 import safetyRoutes from "./routes/safety.routes.js";
 import moderationRoutes from "./routes/moderation.routes.js";
 import webrtcRoutes from "./routes/webrtc.routes.js";
+import notificationRoutes from "./routes/notification.routes.js";
 import { validateJwtConfig } from "./config/jwt.js";
 import { corsOptions } from "./config/cors.js";
 import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
@@ -102,6 +103,7 @@ app.use("/api/v1/conversations", chatRoutes);
 app.use("/api/v1/safety", safetyRoutes);
 app.use("/api/v1/moderation", moderationRoutes);
 app.use("/api/v1/webrtc", webrtcRoutes);
+app.use("/api/v1/notifications", notificationRoutes);
 
 const KNOWN_SAFE_DB_ERRORS = new Set([
   "MongoParseError",
