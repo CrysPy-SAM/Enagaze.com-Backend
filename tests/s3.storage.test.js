@@ -91,6 +91,7 @@ describe("Prompt 16: Production-Ready S3/R2 Profile Photo Storage Integration Su
 
     afterEach(() => {
         setStorageAdapter(null);
+        process.env = { ...originalEnv };
     });
 
     describe("1. Environment Configuration & Validation", () => {
@@ -773,6 +774,114 @@ describe("Prompt 16: Production-Ready S3/R2 Profile Photo Storage Integration Su
                     return true;
                 }
             );
+        });
+    });
+
+    describe("8. Private S3 Bucket Support & Media URL Resolution", () => {
+        const privateS3Env = {
+            STORAGE_PROVIDER: "s3",
+            STORAGE_BUCKET: "engaze-profile-photos-unique",
+            STORAGE_REGION: "ap-southeast-2",
+            STORAGE_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+            STORAGE_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            // Notice: STORAGE_PUBLIC_BASE_URL is intentionally omitted
+        };
+
+        it("validates private S3 configuration without STORAGE_PUBLIC_BASE_URL", () => {
+            const result = validateStorageConfig(privateS3Env);
+            assert.equal(result.valid, true);
+            assert.equal(result.config.isPrivate, true);
+            assert.equal(result.config.publicBaseUrl, null);
+            assert.equal(result.config.region, "ap-southeast-2");
+            assert.equal(result.config.bucket, "engaze-profile-photos-unique");
+        });
+
+        it("generates presigned download GET URL with SigV4 authentication parameters", async () => {
+            const config = validateStorageConfig(privateS3Env).config;
+            const adapter = new S3StorageAdapter(config);
+            const downloadUrl = await adapter.getPresignedDownloadUrl("profile-photos/alice/pic.jpg", 600);
+
+            assert.ok(downloadUrl.startsWith("https://engaze-profile-photos-unique.s3.ap-southeast-2.amazonaws.com/profile-photos/alice/pic.jpg?"));
+            const parsed = new URL(downloadUrl);
+            assert.equal(parsed.searchParams.get("X-Amz-Algorithm"), "AWS4-HMAC-SHA256");
+            assert.ok(parsed.searchParams.get("X-Amz-Credential").includes("ap-southeast-2/s3/aws4_request"));
+            assert.equal(parsed.searchParams.get("X-Amz-Expires"), "600");
+            assert.ok(parsed.searchParams.get("X-Amz-Signature"));
+        });
+
+        it("confirms photo upload in private mode and stores backend media path in user profile", async () => {
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+            const uploadToken = createUploadToken({
+                userId: userAliceId,
+                key,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+            });
+
+            const headersMap = new Map();
+            headersMap.set("content-type", "image/jpeg");
+            headersMap.set("content-length", "2048");
+
+            const mockFetch = async (url, opts) => {
+                if (opts?.method === "HEAD") {
+                    return {
+                        status: 200,
+                        headers: {
+                            get: (h) => headersMap.get(h.toLowerCase()),
+                        },
+                    };
+                }
+                return { status: 200, headers: { get: () => null } };
+            };
+
+            const config = validateStorageConfig(privateS3Env).config;
+            const adapter = new S3StorageAdapter(config, { fetchFn: mockFetch });
+            setStorageAdapter(adapter);
+
+            const result = await confirmPhotoUpload(userAliceId, { key, uploadToken });
+            assert.equal(result.success, true);
+            const expectedUrl = `/api/v1/users/profile/photo/media/${encodeURIComponent(key)}`;
+            assert.equal(result.publicUrl, expectedUrl);
+            assert.ok(mockAlice.photos.includes(expectedUrl));
+        });
+
+        it("cleans up previous private-mode photo key from S3 when photo is replaced", async () => {
+            const oldKey = `profile-photos/${userAliceId}/old_private.jpg`;
+            mockAlice.photos = [`/api/v1/users/profile/photo/media/${oldKey}`];
+
+            const newKey = `profile-photos/${userAliceId}/new_private.jpg`;
+            const uploadToken = createUploadToken({
+                userId: userAliceId,
+                key: newKey,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+            });
+
+            const deletedKeys = [];
+            const mockFetch = async (url, opts) => {
+                if (opts?.method === "HEAD") {
+                    return {
+                        status: 200,
+                        headers: {
+                            get: (h) => (h.toLowerCase() === "content-type" ? "image/jpeg" : "2048"),
+                        },
+                    };
+                }
+                if (opts?.method === "DELETE") {
+                    deletedKeys.push(url);
+                    return { status: 204, headers: { get: () => null } };
+                }
+                return { status: 200, headers: { get: () => null } };
+            };
+
+            const config = validateStorageConfig(privateS3Env).config;
+            const adapter = new S3StorageAdapter(config, { fetchFn: mockFetch });
+            setStorageAdapter(adapter);
+
+            const result = await confirmPhotoUpload(userAliceId, { key: newKey, uploadToken, targetIndex: 0 });
+            assert.equal(result.success, true);
+            assert.equal(deletedKeys.length, 1);
+            assert.ok(deletedKeys[0].includes("old_private.jpg"));
         });
     });
 });

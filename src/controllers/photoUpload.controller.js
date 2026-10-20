@@ -184,32 +184,73 @@ export const uploadPayload = async (req, res) => {
 };
 
 /**
- * 5. Dev/Mock media server
- * GET /api/v1/users/profile/photo/media/:key
+ * 5. Profile Photo Media Delivery Endpoint
+ * GET /api/v1/users/profile/photo/media/*
+ * Serves in-memory buffer in dev-mock mode;
+ * Generates secure time-limited presigned GET URL and redirects (HTTP 307) in S3/R2 private bucket mode.
  */
 export const serveMedia = async (req, res) => {
     try {
-        if (process.env.NODE_ENV === "production") {
-            return res.status(httpStatus.NOT_FOUND).json({
+        const rawKey = req.params[0] || req.params.key;
+        if (!rawKey) {
+            return res.status(httpStatus.BAD_REQUEST).json({
                 success: false,
-                message: "Dev/mock media endpoint is disabled in production",
+                message: "Missing object key parameter",
             });
         }
+        const key = decodeURIComponent(rawKey);
 
-        const key = req.params.key || req.params[0];
         const adapter = getStorageAdapter();
-        const obj = await adapter.getObject(key);
+        if (adapter.name === "mock") {
+            if (process.env.NODE_ENV === "production") {
+                return res.status(httpStatus.NOT_FOUND).json({
+                    success: false,
+                    message: "Dev/mock media endpoint is disabled in production",
+                });
+            }
 
-        if (!obj || !obj.buffer) {
-            return res.status(httpStatus.NOT_FOUND).json({
-                success: false,
-                message: "Image not found",
-            });
+            const obj = await adapter.getObject(key);
+            if (!obj || !obj.buffer) {
+                return res.status(httpStatus.NOT_FOUND).json({
+                    success: false,
+                    message: "Image not found",
+                });
+            }
+
+            res.setHeader("Content-Type", obj.mimeType || "image/jpeg");
+            res.setHeader("Cache-Control", "public, max-age=86400");
+            return res.status(httpStatus.OK).send(obj.buffer);
         }
 
-        res.setHeader("Content-Type", obj.mimeType || "image/jpeg");
-        res.setHeader("Cache-Control", "public, max-age=86400");
-        return res.status(httpStatus.OK).send(obj.buffer);
+        if (adapter.name === "s3" || adapter.name === "r2") {
+            // Verify object exists in storage
+            const exists = await adapter.objectExists(key);
+            if (!exists) {
+                return res.status(httpStatus.NOT_FOUND).json({
+                    success: false,
+                    message: "Image not found in storage",
+                });
+            }
+
+            // Generate time-limited secure presigned GET download URL (1 hour)
+            const presignedDownloadUrl = adapter.getPresignedDownloadUrl(key, 3600);
+
+            if (req.query.json === "true") {
+                return res.status(httpStatus.OK).json({
+                    success: true,
+                    url: presignedDownloadUrl,
+                    key,
+                });
+            }
+
+            res.setHeader("Cache-Control", "private, max-age=300");
+            return res.redirect(httpStatus.TEMPORARY_REDIRECT, presignedDownloadUrl);
+        }
+
+        return res.status(httpStatus.NOT_FOUND).json({
+            success: false,
+            message: "Image not found",
+        });
     } catch (err) {
         return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
             success: false,

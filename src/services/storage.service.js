@@ -10,7 +10,9 @@ import {
 } from "./imageValidation.service.js";
 import {
     generatePresignedPutUrl,
+    generatePresignedGetUrl,
     signS3Request,
+    sha256Hex,
 } from "./s3Signer.service.js";
 
 const UPLOAD_TOKEN_TTL_SECONDS = 300; // 5 minutes
@@ -153,16 +155,19 @@ export function validateStorageConfig(env = process.env) {
         return { valid: false, reason: "Missing storage region configuration (STORAGE_REGION or AWS_REGION)." };
     }
 
-    const publicBaseUrl = (
+    const rawPublicUrl = (
         env.STORAGE_PUBLIC_BASE_URL ||
         env.CLOUDFLARE_R2_PUBLIC_URL ||
         env.AWS_S3_PUBLIC_URL ||
         ""
     ).trim().replace(/\/+$/, "");
 
-    if (!publicBaseUrl || !publicBaseUrl.startsWith("http")) {
-        return { valid: false, reason: "Missing or invalid public delivery base URL (STORAGE_PUBLIC_BASE_URL or AWS_S3_PUBLIC_URL). Must start with http:// or https://." };
+    if (rawPublicUrl && !rawPublicUrl.startsWith("http")) {
+        return { valid: false, reason: "Invalid public delivery base URL (STORAGE_PUBLIC_BASE_URL or AWS_S3_PUBLIC_URL). Must start with http:// or https://." };
     }
+
+    const isPrivate = !rawPublicUrl;
+    const publicBaseUrl = rawPublicUrl || null;
 
     const rawEndpoint = (env.STORAGE_ENDPOINT || env.AWS_S3_ENDPOINT || env.CLOUDFLARE_R2_ENDPOINT || "").trim().replace(/\/+$/, "");
     let endpoint = rawEndpoint || null;
@@ -187,6 +192,7 @@ export function validateStorageConfig(env = process.env) {
             endpoint,
             forcePathStyle,
             publicBaseUrl,
+            isPrivate,
         },
     };
 }
@@ -347,8 +353,16 @@ export class S3StorageAdapter {
             expiresInSeconds: UPLOAD_TOKEN_TTL_SECONDS,
         });
 
-        // Resulting public URL uses configured CDN / public delivery base URL (permanent, non-expiring)
-        const publicUrl = `${this.publicBaseUrl}/${key}`;
+        // Resulting public URL uses configured CDN, or private backend media delivery URL
+        let publicUrl;
+        if (this.publicBaseUrl && !this.config.isPrivate) {
+            publicUrl = `${this.publicBaseUrl}/${key}`;
+        } else {
+            const apiBase = process.env.APP_BASE_URL || process.env.RENDER_EXTERNAL_URL;
+            publicUrl = apiBase
+                ? `${apiBase.replace(/\/+$/, "")}/api/v1/users/profile/photo/media/${encodeURIComponent(key)}`
+                : `/api/v1/users/profile/photo/media/${encodeURIComponent(key)}`;
+        }
 
         return {
             provider: this.name,
@@ -360,6 +374,51 @@ export class S3StorageAdapter {
             maxSizeBytes: maxBytes,
             targetIndex,
         };
+    }
+
+    /**
+     * Generate secure presigned GET download URL for viewing private S3 objects.
+     *
+     * @param {string} key
+     * @param {number} [expiresInSeconds=3600]
+     * @returns {string}
+     */
+    getPresignedDownloadUrl(key, expiresInSeconds = 3600) {
+        return generatePresignedGetUrl({
+            config: this.config,
+            key,
+            expiresInSeconds,
+        });
+    }
+
+    /**
+     * Upload an object directly to S3 from backend buffer.
+     *
+     * @param {string} key
+     * @param {Buffer} buffer
+     * @param {string} [mimeType="image/jpeg"]
+     * @returns {Promise<boolean>}
+     */
+    async putObject(key, buffer, mimeType = "image/jpeg") {
+        try {
+            const payloadHash = sha256Hex(buffer);
+            const signed = signS3Request({
+                config: this.config,
+                method: "PUT",
+                key,
+                headers: { "content-type": mimeType },
+                payloadHash,
+            });
+            const res = await this.fetchFn(signed.url, {
+                method: "PUT",
+                headers: signed.headers,
+                body: buffer,
+            });
+            return res.status === 200 || res.status === 204;
+        } catch (err) {
+            console.warn("Storage object put error:", err?.message);
+            return false;
+        }
     }
 
     async objectExists(key) {
@@ -609,26 +668,25 @@ export async function confirmPhotoUpload(userId, payload) {
         throw new Error("User not found");
     }
 
-    // Construct resulting public URL
+    // Construct resulting public URL or private media delivery URL
     let publicUrl;
     if (adapter.name === "mock") {
-        const baseUrl = process.env.STORAGE_PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 5000}`;
+        const baseUrl = process.env.STORAGE_PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 8000}`;
         publicUrl = `${baseUrl}/api/v1/users/profile/photo/media/${encodeURIComponent(key)}`;
+    } else if (adapter.publicBaseUrl && !adapter.config?.isPrivate) {
+        publicUrl = `${adapter.publicBaseUrl}/${key}`;
     } else {
-        const baseUrl =
-            adapter.publicBaseUrl ||
-            process.env.STORAGE_PUBLIC_BASE_URL ||
-            process.env.CLOUDFLARE_R2_PUBLIC_URL ||
-            process.env.AWS_S3_PUBLIC_URL ||
-            `http://localhost:${process.env.PORT || 5000}`;
-        publicUrl = `${baseUrl}/${key}`;
+        const apiBase = process.env.APP_BASE_URL || process.env.RENDER_EXTERNAL_URL;
+        publicUrl = apiBase
+            ? `${apiBase.replace(/\/+$/, "")}/api/v1/users/profile/photo/media/${encodeURIComponent(key)}`
+            : `/api/v1/users/profile/photo/media/${encodeURIComponent(key)}`;
     }
 
     // Validate the resulting URL through host allowlist and SSRF checks
     let adapterHost = null;
     try {
-        if (adapter.publicBaseUrl) {
-            adapterHost = new URL(adapter.publicBaseUrl).hostname;
+        if (publicUrl) {
+            adapterHost = new URL(publicUrl).hostname;
         }
     } catch { /* ignore */ }
 

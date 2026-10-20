@@ -193,6 +193,82 @@ export function generatePresignedPutUrl({
 }
 
 /**
+ * Generate an AWS SigV4 presigned GET URL for secure downloading/viewing from a private S3 bucket.
+ *
+ * @param {object} params
+ * @param {object} params.config Validated storage config
+ * @param {string} params.key Object key
+ * @param {number} [params.expiresInSeconds=3600] URL TTL (default 1 hour)
+ * @param {Date} [params.date=new Date()]
+ * @returns {string} Presigned download URL
+ */
+export function generatePresignedGetUrl({
+    config,
+    key,
+    expiresInSeconds = 3600,
+    date = new Date(),
+}) {
+    if (!config || !config.bucket || !config.accessKeyId || !config.secretAccessKey) {
+        throw new Error("Cannot generate presigned download URL: invalid or missing storage configuration");
+    }
+    if (!key) {
+        throw new Error("Cannot generate presigned download URL: missing object key");
+    }
+
+    const amzDate = date.toISOString().replace(/[:-]|\.\d{3}/g, "");
+    const dateStamp = amzDate.substring(0, 8);
+    const region = config.region || "us-east-1";
+    const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
+
+    const { protocol, host, path } = resolveEndpoint(config, key);
+    const canonicalUri = uriEncode(path, false);
+
+    const queryParams = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": `${config.accessKeyId}/${credentialScope}`,
+        "X-Amz-Date": amzDate,
+        "X-Amz-Expires": String(expiresInSeconds),
+        "X-Amz-SignedHeaders": "host",
+    };
+
+    const sortedKeys = Object.keys(queryParams).sort();
+    const canonicalQueryString = sortedKeys
+        .map((k) => `${uriEncode(k, true)}=${uriEncode(queryParams[k], true)}`)
+        .join("&");
+
+    const normalizedHost = host.trim().toLowerCase();
+    const canonicalHeaders = `host:${normalizedHost}\n`;
+    const signedHeaders = "host";
+    const payloadHash = "UNSIGNED-PAYLOAD";
+
+    const canonicalRequest = [
+        "GET",
+        canonicalUri,
+        canonicalQueryString,
+        canonicalHeaders,
+        signedHeaders,
+        payloadHash,
+    ].join("\n");
+
+    const canonicalRequestHash = sha256Hex(canonicalRequest);
+
+    const stringToSign = [
+        "AWS4-HMAC-SHA256",
+        amzDate,
+        credentialScope,
+        canonicalRequestHash,
+    ].join("\n");
+
+    const signingKey = getSignatureKey(config.secretAccessKey, dateStamp, region, "s3");
+    const signature = crypto
+        .createHmac("sha256", signingKey)
+        .update(stringToSign)
+        .digest("hex");
+
+    return `${protocol}//${host}${path}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
+}
+
+/**
  * Sign HTTP request headers for server-to-S3 REST API calls (HEAD, DELETE, GET).
  * Uses AWS SigV4 Authorization header scheme.
  *

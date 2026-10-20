@@ -359,6 +359,11 @@ export function validatePublicPhotoUrl(urlString, options = {}) {
 
     const trimmed = urlString.trim();
 
+    // Support internal platform media delivery paths directly
+    if (trimmed.startsWith("/api/v1/users/profile/photo/media/")) {
+        return { valid: true };
+    }
+
     let parsed;
     try {
         parsed = new URL(trimmed);
@@ -421,9 +426,24 @@ export function validatePublicPhotoUrl(urlString, options = {}) {
             approvedHosts.add(new URL(process.env.AWS_S3_PUBLIC_URL).hostname.toLowerCase());
         } catch { /* ignore */ }
     }
+    if (process.env.APP_BASE_URL) {
+        try {
+            approvedHosts.add(new URL(process.env.APP_BASE_URL).hostname.toLowerCase());
+        } catch { /* ignore */ }
+    }
+    if (process.env.RENDER_EXTERNAL_URL) {
+        try {
+            approvedHosts.add(new URL(process.env.RENDER_EXTERNAL_URL).hostname.toLowerCase());
+        } catch { /* ignore */ }
+    }
+    approvedHosts.add("enagaze-com-backend.onrender.com");
+    approvedHosts.add("engaze-com-backend.onrender.com");
+
     if (options.additionalApprovedHosts && Array.isArray(options.additionalApprovedHosts)) {
         for (const h of options.additionalApprovedHosts) {
-            approvedHosts.add(h.toLowerCase());
+            if (h && typeof h === "string") {
+                approvedHosts.add(h.toLowerCase());
+            }
         }
     }
 
