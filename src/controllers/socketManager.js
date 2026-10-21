@@ -298,30 +298,40 @@ export const connectToSocket = (server) => {
                     return;
                 }
 
-                // Verify neither participant has blocked the other
                 const otherParticipantId = conversation.participants.find(
                     (p) => p.toString() !== socket.userId.toString()
                 );
-                if (otherParticipantId) {
-                    const isBlocked = await Block.isBlockedBidirectional(socket.userId, otherParticipantId);
-                    if (isBlocked) {
-                        const err = { code: "BLOCKED_USER", message: "You cannot message this user" };
-                        socket.emit("chat:error", err);
-                        if (typeof ack === "function") ack({ success: false, ...err });
-                        return;
-                    }
+
+                // Stage 2: Parallelize block check, match status, and duplicate lookup to collapse 3 round-trips into 1
+                const [isBlocked, match, existing] = await Promise.all([
+                    otherParticipantId ? Block.isBlockedBidirectional(socket.userId, otherParticipantId) : Promise.resolve(false),
+                    conversation.match && mongoose.connection.readyState !== 0
+                        ? safeLean(Match.findById(conversation.match).select("status"))
+                        : Promise.resolve(null),
+                    sanitizedTempId
+                        ? Message.findOne({
+                              conversation: conversationId,
+                              sender: socket.userId,
+                              clientTempId: sanitizedTempId,
+                          }).populate({ path: "sender", select: "name photos" })
+                        : Promise.resolve(null),
+                ]);
+
+                if (isBlocked) {
+                    const err = { code: "BLOCKED_USER", message: "You cannot message this user" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
                 }
 
-                // Verify match status if conversation is linked to a match
-                if (conversation.match && mongoose.connection.readyState !== 0) {
-                    const match = await safeLean(Match.findById(conversation.match).select("status"));
-                    if (match && match.status === "unmatched") {
+                if (match) {
+                    if (match.status === "unmatched") {
                         const err = { code: "MATCH_UNMATCHED", message: "This match has been unmatched" };
                         socket.emit("chat:error", err);
                         if (typeof ack === "function") ack({ success: false, ...err });
                         return;
                     }
-                    if (match && match.status !== "active") {
+                    if (match.status !== "active") {
                         const err = { code: "MATCH_NOT_ACTIVE", message: "An active accepted connection is required for private chat" };
                         socket.emit("chat:error", err);
                         if (typeof ack === "function") ack({ success: false, ...err });
@@ -329,18 +339,9 @@ export const connectToSocket = (server) => {
                     }
                 }
 
-                // Check for duplicate retry using sanitizedTempId scoped to sender
-                if (sanitizedTempId) {
-                    const existing = await Message.findOne({
-                        conversation: conversationId,
-                        sender: socket.userId,
-                        clientTempId: sanitizedTempId,
-                    }).populate({ path: "sender", select: "name photos" });
-
-                    if (existing) {
-                        if (typeof ack === "function") ack({ success: true, message: toMessageDto(existing), duplicate: true });
-                        return;
-                    }
+                if (existing) {
+                    if (typeof ack === "function") ack({ success: true, message: toMessageDto(existing), duplicate: true });
+                    return;
                 }
 
                 // Persist new message: sender identity is derived STRICTLY from verified socket.userId
@@ -360,7 +361,12 @@ export const connectToSocket = (server) => {
                 conversation.lastMessageAt = newMsg.createdAt;
                 await conversation.save();
 
-                await newMsg.populate({ path: "sender", select: "name photos" });
+                // Attach caller profile without an extra round-trip to database
+                newMsg.sender = {
+                    _id: callerUser._id,
+                    name: callerUser.name,
+                    photos: callerUser.photos,
+                };
                 const messageDto = toMessageDto(newMsg);
                 const persistMs = Date.now() - persistStart;
 

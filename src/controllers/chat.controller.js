@@ -643,27 +643,37 @@ const sendMessageRest = async (req, res) => {
         const otherParticipantId = conversation.participants.find(
             (p) => p.toString() !== req.user._id.toString()
         );
-        if (otherParticipantId) {
-            const isBlocked = await Block.isBlockedBidirectional(req.user._id, otherParticipantId);
-            if (isBlocked) {
-                return res.status(httpStatus.FORBIDDEN).json({
-                    success: false,
-                    code: "BLOCKED_USER",
-                    message: "You cannot message this user.",
-                });
-            }
+
+        // Run block check, match status, and idempotency lookup concurrently to collapse 3 round-trips into 1
+        const [isBlocked, match, existing] = await Promise.all([
+            otherParticipantId ? Block.isBlockedBidirectional(req.user._id, otherParticipantId) : Promise.resolve(false),
+            conversation.match ? safeLean(Match.findById(conversation.match).select("status")) : Promise.resolve(null),
+            sanitizedTempId
+                ? Message.findOne({
+                      conversation: conversationId,
+                      sender: req.user._id,
+                      clientTempId: sanitizedTempId,
+                  }).populate({ path: "sender", select: "name photos" })
+                : Promise.resolve(null),
+        ]);
+
+        if (isBlocked) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                code: "BLOCKED_USER",
+                message: "You cannot message this user.",
+            });
         }
 
-        if (conversation.match) {
-            const match = await safeLean(Match.findById(conversation.match).select("status"));
-            if (match && match.status === "unmatched") {
+        if (match) {
+            if (match.status === "unmatched") {
                 return res.status(httpStatus.FORBIDDEN).json({
                     success: false,
                     code: "MATCH_UNMATCHED",
                     message: "This match has been unmatched.",
                 });
             }
-            if (match && match.status !== "active") {
+            if (match.status !== "active") {
                 return res.status(httpStatus.FORBIDDEN).json({
                     success: false,
                     code: "MATCH_NOT_ACTIVE",
@@ -672,21 +682,12 @@ const sendMessageRest = async (req, res) => {
             }
         }
 
-        // Check for idempotency key to prevent duplicates scoped to conversation, sender, and clientTempId
-        if (sanitizedTempId) {
-            const existing = await Message.findOne({
-                conversation: conversationId,
-                sender: req.user._id,
-                clientTempId: sanitizedTempId,
-            }).populate({ path: "sender", select: "name photos" });
-
-            if (existing) {
-                return res.status(httpStatus.OK).json({
-                    success: true,
-                    message: toMessageDto(existing),
-                    duplicate: true,
-                });
-            }
+        if (existing) {
+            return res.status(httpStatus.OK).json({
+                success: true,
+                message: toMessageDto(existing),
+                duplicate: true,
+            });
         }
 
         const newMessage = new Message({
@@ -704,7 +705,12 @@ const sendMessageRest = async (req, res) => {
         conversation.lastMessageAt = newMessage.createdAt;
         await conversation.save();
 
-        await newMessage.populate({ path: "sender", select: "name photos" });
+        // Attach sender profile without an extra round-trip to database
+        newMessage.sender = {
+            _id: req.user._id,
+            name: req.user.name,
+            photos: req.user.photos,
+        };
         const messageDto = toMessageDto(newMessage);
 
         // Broadcast to conversation room AND all participant user rooms

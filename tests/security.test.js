@@ -162,7 +162,9 @@ describe("Batch 1 Security Hardening Test Suite", () => {
     // 2. Strict CORS & Origin Policy Consistency
     // =========================================================================
     describe("CORS Allowlist & Origin Policy", () => {
-        it("allows legitimate production frontend origin", () => {
+        it("allows legitimate production frontend origins", () => {
+            assert.equal(isOriginAllowed("https://engaze.date"), true);
+            assert.equal(isOriginAllowed("https://www.engaze.date"), true);
             assert.equal(isOriginAllowed("https://engaze-com.vercel.app"), true);
         });
 

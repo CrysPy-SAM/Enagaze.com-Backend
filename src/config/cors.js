@@ -6,6 +6,8 @@
 
 // Default trusted origins required for production and local development
 const DEFAULT_ALLOWED_ORIGINS = [
+    "https://engaze.date",
+    "https://www.engaze.date",
     "https://engaze-com.vercel.app",
     "http://localhost:3000",
     "http://localhost:5173",
