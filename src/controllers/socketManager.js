@@ -368,6 +368,13 @@ export const connectToSocket = (server) => {
                     photos: callerUser.photos,
                 };
                 const messageDto = toMessageDto(newMsg);
+                if (!messageDto.sender || !messageDto.sender._id || messageDto.sender.name === "Engaze Member") {
+                    messageDto.sender = {
+                        _id: callerUser._id ? callerUser._id.toString() : socket.userId.toString(),
+                        name: callerUser.name || "Engaze Member",
+                        photos: Array.isArray(callerUser.photos) ? callerUser.photos : [],
+                    };
+                }
                 const persistMs = Date.now() - persistStart;
 
                 // Stage 4: Non-sensitive diagnostic timing metric

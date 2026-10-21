@@ -712,6 +712,13 @@ const sendMessageRest = async (req, res) => {
             photos: req.user.photos,
         };
         const messageDto = toMessageDto(newMessage);
+        if (!messageDto.sender || !messageDto.sender._id || messageDto.sender.name === "Engaze Member") {
+            messageDto.sender = {
+                _id: req.user._id ? req.user._id.toString() : String(req.user),
+                name: req.user.name || "Engaze Member",
+                photos: Array.isArray(req.user.photos) ? req.user.photos : [],
+            };
+        }
 
         // Broadcast to conversation room AND all participant user rooms
         const io = req.app?.get("io") || getIO();

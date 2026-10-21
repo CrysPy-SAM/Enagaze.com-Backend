@@ -78,12 +78,40 @@ export const toPublicProfile = (user) => {
 export const toSenderProfile = (sender) => {
     if (!sender) return null;
 
+    // Handle plain string ID
+    if (typeof sender === "string") {
+        return {
+            _id: sender.trim(),
+            name: "Engaze Member",
+            photos: [],
+        };
+    }
+
+    // Handle MongoDB ObjectId directly
+    if (sender._bsontype === "ObjectID" || (typeof sender.toHexString === "function")) {
+        return {
+            _id: sender.toString(),
+            name: "Engaze Member",
+            photos: [],
+        };
+    }
+
     const doc = typeof sender.toObject === "function"
         ? sender.toObject()
         : (typeof sender.toJSON === "function" ? sender.toJSON() : sender);
 
+    // Extract ID safely from _id, id, or doc itself if doc is an ID string/object
+    let senderId;
+    if (doc._id) {
+        senderId = doc._id.toString();
+    } else if (doc.id) {
+        senderId = doc.id.toString();
+    } else if (typeof doc.toString === "function" && doc.toString() !== "[object Object]") {
+        senderId = doc.toString().trim();
+    }
+
     return {
-        _id: doc._id ? doc._id.toString() : undefined,
+        _id: senderId,
         name: typeof doc.name === "string" && doc.name.trim() ? doc.name.trim() : "Engaze Member",
         photos: Array.isArray(doc.photos) ? doc.photos : [],
     };

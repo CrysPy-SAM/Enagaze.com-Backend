@@ -198,6 +198,27 @@ describe("Public & Peer Profile Serializer Privacy Test Suite", () => {
             assert.equal(Object.keys(senderDto).length, 3);
         });
 
+        it("toSenderProfile handles raw string ID, ObjectId, and id alias safely", () => {
+            const rawId = "65cb1111111111abcdef1111";
+            const stringDto = toSenderProfile(rawId);
+            assert.equal(stringDto._id, rawId);
+            assert.equal(stringDto.name, "Engaze Member");
+            assert.deepEqual(stringDto.photos, []);
+
+            const mockObjectId = {
+                _bsontype: "ObjectID",
+                toString: () => rawId,
+                toHexString: () => rawId,
+            };
+            const objIdDto = toSenderProfile(mockObjectId);
+            assert.equal(objIdDto._id, rawId);
+
+            const aliasDoc = { id: rawId, name: "Alias User" };
+            const aliasDto = toSenderProfile(aliasDoc);
+            assert.equal(aliasDto._id, rawId);
+            assert.equal(aliasDto.name, "Alias User");
+        });
+
         it("toMessageDto sanitizes embedded sender and message fields", () => {
             const rawMessage = {
                 _id: "msg_123456",
