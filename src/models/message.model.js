@@ -39,6 +39,10 @@ const messageSchema = new Schema(
 // Indexes for chronological retrieval and message history
 messageSchema.index({ conversation: 1, createdAt: 1 });
 messageSchema.index({ conversation: 1, _id: -1 });
+// Compound index for reverse-chronological and cursor-based message retrieval
+messageSchema.index({ conversation: 1, createdAt: -1, _id: -1 });
+// Compound index for fast unread message counts and batch read-state updates
+messageSchema.index({ conversation: 1, sender: 1, readBy: 1 });
 
 // Compound unique index with partialFilterExpression scoped to conversation, sender, and clientTempId.
 // Using partialFilterExpression avoids compound sparse index collisions on null/missing clientTempId,

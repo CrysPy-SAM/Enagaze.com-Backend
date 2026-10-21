@@ -52,6 +52,8 @@ notificationSchema.index({ recipient: 1, createdAt: -1 });
 
 // Compound index for unread count
 notificationSchema.index({ recipient: 1, read: 1 });
+// Compound index for unread count with sender/block filtering
+notificationSchema.index({ recipient: 1, read: 1, sender: 1 });
 
 // Partial unique compound index to deduplicate like, match, and request notifications
 notificationSchema.index(

@@ -38,6 +38,8 @@ const matchSchema = new Schema(
 
 // Index on users array for fast lookup of a user's matches
 matchSchema.index({ users: 1 });
+// Compound index for active mutual match feeds and sorted match pagination
+matchSchema.index({ users: 1, status: 1, createdAt: -1 });
 
 // Static helper to create a deterministic, canonical user pair string
 matchSchema.statics.getCanonicalPair = function (userId1, userId2) {

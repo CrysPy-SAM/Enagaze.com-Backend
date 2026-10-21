@@ -6,6 +6,7 @@ import { MatchRequest } from "../models/matchRequest.model.js";
 import { Block } from "../models/block.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { toSearchUserProfile } from "../serializers/profile.serializer.js";
+import { safeLean } from "../utils/queryHelper.js";
 
 /**
  * Escapes regex special characters to prevent ReDoS and regex injection.
@@ -175,11 +176,23 @@ export const searchUsers = async (req, res) => {
         const targetIds = pageCandidates.map((u) => u._id);
         const userPairs = targetIds.map((tId) => Match.getCanonicalPair(currentUserId, tId));
 
-        // 1. Check for active canonical connections
-        const activeMatches = await Match.find({
-            userPair: { $in: userPairs },
-            status: "active",
-        }).lean();
+        // 1. Concurrently check for active canonical connections and pending MatchRequests
+        const [activeMatches, pendingRequests] = await Promise.all([
+            safeLean(
+                Match.find({
+                    userPair: { $in: userPairs },
+                    status: "active",
+                })
+            ),
+            safeLean(
+                MatchRequest.find({
+                    $or: [
+                        { sender: currentUserId, recipient: { $in: targetIds }, status: "pending" },
+                        { recipient: currentUserId, sender: { $in: targetIds }, status: "pending" },
+                    ],
+                })
+            ),
+        ]);
 
         const matchIdMap = new Map(); // canonicalPair -> match._id
         const activeMatchIds = [];
@@ -190,20 +203,12 @@ export const searchUsers = async (req, res) => {
 
         // Fetch corresponding conversations for connected users
         const conversations = activeMatchIds.length > 0
-            ? await Conversation.find({ match: { $in: activeMatchIds } }).select("_id match").lean()
+            ? await safeLean(Conversation.find({ match: { $in: activeMatchIds } }).select("_id match"))
             : [];
         const matchToConvMap = new Map();
         for (const conv of conversations) {
             matchToConvMap.set(conv.match.toString(), conv._id.toString());
         }
-
-        // 2. Check for pending MatchRequests
-        const pendingRequests = await MatchRequest.find({
-            $or: [
-                { sender: currentUserId, recipient: { $in: targetIds }, status: "pending" },
-                { recipient: currentUserId, sender: { $in: targetIds }, status: "pending" },
-            ],
-        }).lean();
 
         const outgoingReqMap = new Map(); // recipientId -> requestId
         const incomingReqMap = new Map(); // senderId -> requestId
@@ -271,20 +276,16 @@ export const getPublicUserProfile = async (req, res) => {
             });
         }
 
-        // Check if either user has blocked the other
-        const isBlocked = await Block.isBlockedBidirectional(currentUserId, targetUserId);
-        if (isBlocked) {
-            return res.status(httpStatus.NOT_FOUND).json({
-                success: false,
-                message: "User profile not found",
-            });
-        }
+        // Concurrently check block status and fetch target user profile
+        const [isBlocked, targetUser] = await Promise.all([
+            Block.isBlockedBidirectional(currentUserId, targetUserId),
+            safeLean(
+                User.findById(targetUserId)
+                    .select("_id name username bio photos interests dob gender isProfileComplete")
+            ),
+        ]);
 
-        const targetUser = await User.findById(targetUserId)
-            .select("_id name username bio photos interests dob gender isProfileComplete")
-            .lean();
-
-        if (!targetUser) {
+        if (isBlocked || !targetUser) {
             return res.status(httpStatus.NOT_FOUND).json({
                 success: false,
                 message: "User profile not found",

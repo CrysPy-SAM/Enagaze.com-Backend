@@ -12,6 +12,7 @@ import {
 } from "../services/notification.service.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
+import { safeLean } from "../utils/queryHelper.js";
 import { getIO } from "./socketManager.js";
 
 // ==========================================
@@ -319,16 +320,18 @@ export const getIncomingMatchRequests = async (req, res) => {
 
         const blockedUserIds = await Block.getBlockedUserIds(req.user._id);
 
-        const requests = await MatchRequest.find({
-            recipient: req.user._id,
-            status: "pending",
-            sender: { $nin: blockedUserIds },
-        })
-            .sort({ createdAt: -1 })
-            .populate({
-                path: "sender",
-                select: "name dob gender bio photos interests isProfileComplete",
-            });
+        const requests = await safeLean(
+            MatchRequest.find({
+                recipient: req.user._id,
+                status: "pending",
+                sender: { $nin: blockedUserIds },
+            })
+                .sort({ createdAt: -1 })
+                .populate({
+                    path: "sender",
+                    select: "name dob gender bio photos interests isProfileComplete",
+                })
+        );
 
         const formatted = requests
             .filter((r) => r.sender && checkUserEligibility(r.sender).isEligible)
@@ -371,16 +374,18 @@ export const getOutgoingMatchRequests = async (req, res) => {
 
         const blockedUserIds = await Block.getBlockedUserIds(req.user._id);
 
-        const requests = await MatchRequest.find({
-            sender: req.user._id,
-            status: "pending",
-            recipient: { $nin: blockedUserIds },
-        })
-            .sort({ createdAt: -1 })
-            .populate({
-                path: "recipient",
-                select: "name dob gender bio photos interests isProfileComplete",
-            });
+        const requests = await safeLean(
+            MatchRequest.find({
+                sender: req.user._id,
+                status: "pending",
+                recipient: { $nin: blockedUserIds },
+            })
+                .sort({ createdAt: -1 })
+                .populate({
+                    path: "recipient",
+                    select: "name dob gender bio photos interests isProfileComplete",
+                })
+        );
 
         const formatted = requests
             .filter((r) => r.recipient && checkUserEligibility(r.recipient).isEligible)

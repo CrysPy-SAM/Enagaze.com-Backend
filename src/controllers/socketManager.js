@@ -12,6 +12,7 @@ import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
 import { toMessageDto, toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
+import { safeLean } from "../utils/queryHelper.js";
 import {
     isPlainObject,
     isValidObjectId,
@@ -251,8 +252,22 @@ export const connectToSocket = (server) => {
             }
 
             try {
+                const sendStart = Date.now();
+
+                // Stage 1: Parallelize caller profile and conversation lookups
+                const [callerUser, conversation] = await Promise.all([
+                    safeLean(User.findById(socket.userId).select("name dob gender bio photos interests isProfileComplete")),
+                    Conversation.findById(conversationId),
+                ]);
+
+                if (!callerUser) {
+                    const err = { message: "Authenticated user record not found" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
                 // Authoritative caller eligibility check
-                const callerUser = await User.findById(socket.userId).select("name dob gender bio photos interests isProfileComplete");
                 const eligibility = checkUserEligibility(callerUser);
                 if (!eligibility.isEligible) {
                     const err = {
@@ -265,7 +280,6 @@ export const connectToSocket = (server) => {
                     return;
                 }
 
-                const conversation = await Conversation.findById(conversationId);
                 if (!conversation) {
                     const err = { message: "Conversation not found" };
                     socket.emit("chat:error", err);
@@ -300,7 +314,7 @@ export const connectToSocket = (server) => {
 
                 // Verify match status if conversation is linked to a match
                 if (conversation.match && mongoose.connection.readyState !== 0) {
-                    const match = await Match.findById(conversation.match).select("status");
+                    const match = await safeLean(Match.findById(conversation.match).select("status"));
                     if (match && match.status === "unmatched") {
                         const err = { code: "MATCH_UNMATCHED", message: "This match has been unmatched" };
                         socket.emit("chat:error", err);
@@ -330,6 +344,7 @@ export const connectToSocket = (server) => {
                 }
 
                 // Persist new message: sender identity is derived STRICTLY from verified socket.userId
+                const persistStart = Date.now();
                 const newMsg = new Message({
                     conversation: conversationId,
                     sender: socket.userId,
@@ -347,6 +362,13 @@ export const connectToSocket = (server) => {
 
                 await newMsg.populate({ path: "sender", select: "name photos" });
                 const messageDto = toMessageDto(newMsg);
+                const persistMs = Date.now() - persistStart;
+
+                // Stage 4: Non-sensitive diagnostic timing metric
+                const totalDurationMs = Date.now() - sendStart;
+                if (process.env.NODE_ENV !== "test") {
+                    console.log(`[ChatLatency] conv=${conversationId} persistMs=${persistMs} totalMs=${totalDurationMs}`);
+                }
 
                 // Broadcast to conversation room AND all participant user rooms (deduplicated by socket.io)
                 const roomName = `conversation:${conversationId}`;
@@ -359,16 +381,18 @@ export const connectToSocket = (server) => {
                 broadcast.emit("chat:new-message", messageDto);
 
                 if (typeof ack === "function") {
-                    ack({ success: true, message: messageDto });
+                    ack({ success: true, message: messageDto, serverLatencyMs: totalDurationMs });
                 }
             } catch (e) {
                 // Handle idempotency race condition gracefully
                 if (e.code === 11000 && sanitizedTempId) {
-                    const existing = await Message.findOne({
+                    let existingQuery = Message.findOne({
                         conversation: conversationId,
                         sender: socket.userId,
                         clientTempId: sanitizedTempId,
                     }).populate({ path: "sender", select: "name photos" });
+                    if (typeof existingQuery.lean === "function") existingQuery = existingQuery.lean();
+                    const existing = await existingQuery;
 
                     if (existing && typeof ack === "function") {
                         return ack({ success: true, message: toMessageDto(existing), duplicate: true });

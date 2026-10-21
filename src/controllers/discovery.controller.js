@@ -13,6 +13,7 @@ import {
     createNotification,
     supersedeLikeNotifications,
 } from "../services/notification.service.js";
+import { safeLean } from "../utils/queryHelper.js";
 
 // ==========================================
 // 1. GET DISCOVERY PROFILES
@@ -475,20 +476,27 @@ const getMatches = async (req, res) => {
             users: blockedUserIds.length > 0 ? { $all: [req.user._id], $nin: blockedUserIds } : req.user._id,
             status: "active",
         };
-        const total = await Match.countDocuments(filter);
 
-        const matches = await Match.find(filter)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit)
-            .populate({
-                path: "users",
-                select: "name dob gender bio photos interests isProfileComplete",
-            });
+        // Query total count and paginated matches concurrently with lean hydration
+        const [total, matches] = await Promise.all([
+            Match.countDocuments(filter),
+            safeLean(
+                Match.find(filter)
+                    .sort({ createdAt: -1 })
+                    .skip(skip)
+                    .limit(limit)
+                    .populate({
+                        path: "users",
+                        select: "name dob gender bio photos interests isProfileComplete",
+                    })
+            ),
+        ]);
 
         // Fetch corresponding conversation IDs for these matches
         const matchIds = matches.map((m) => m._id);
-        const conversations = await Conversation.find({ match: { $in: matchIds } }).select("_id match");
+        const conversations = matchIds.length > 0
+            ? await safeLean(Conversation.find({ match: { $in: matchIds } }).select("_id match"))
+            : [];
         const matchToConvMap = new Map(conversations.map((c) => [c.match.toString(), c._id]));
 
         // Format each match with safe profile summary of the OTHER participant and its conversationId
@@ -552,10 +560,12 @@ const getLikesYou = async (req, res) => {
         const skip = (page - 1) * limit;
 
         // 2. Fetch incoming likes
-        const incomingLikes = await Swipe.find({
-            toUser: currentUser._id,
-            action: "like",
-        }).sort({ createdAt: -1 });
+        const incomingLikes = await safeLean(
+            Swipe.find({
+                toUser: currentUser._id,
+                action: "like",
+            }).sort({ createdAt: -1 })
+        );
 
         if (incomingLikes.length === 0) {
             return res.status(httpStatus.OK).json({
@@ -572,8 +582,8 @@ const getLikesYou = async (req, res) => {
 
         // 3. Exclude users already swiped by currentUser, existing matches, and blocked users
         const [mySwipes, existingMatches, blockedIds] = await Promise.all([
-            Swipe.find({ fromUser: currentUser._id }).select("toUser"),
-            Match.find({ users: currentUser._id }).select("users"),
+            safeLean(Swipe.find({ fromUser: currentUser._id }).select("toUser")),
+            safeLean(Match.find({ users: currentUser._id }).select("users")),
             Block.getBlockedUserIds(currentUser._id),
         ]);
 
@@ -618,10 +628,12 @@ const getLikesYou = async (req, res) => {
         }
 
         // 4. Fetch user records ensuring isProfileComplete: true
-        const candidateUsers = await User.find({
-            _id: { $in: pageCandidateIds },
-            isProfileComplete: true,
-        }).select("name dob gender bio photos interests isProfileComplete");
+        const candidateUsers = await safeLean(
+            User.find({
+                _id: { $in: pageCandidateIds },
+                isProfileComplete: true,
+            }).select("name dob gender bio photos interests isProfileComplete")
+        );
 
         // Preserve sort order from candidateMap
         const userMap = new Map(candidateUsers.map((u) => [u._id.toString(), u]));

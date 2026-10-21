@@ -7,6 +7,7 @@ import { Block } from "../models/block.model.js";
 import { getIO } from "./socketManager.js";
 import { toPublicProfile, toSenderProfile, toMessageDto } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
+import { safeLean } from "../utils/queryHelper.js";
 
 // ==========================================
 // 1. GET ALL CONVERSATIONS FOR CURRENT USER
@@ -15,14 +16,17 @@ const getConversations = async (req, res) => {
     try {
         const userId = req.user._id;
 
-        const blockedUserIds = await Block.getBlockedUserIds(userId);
+        // Run block list and mutual active matches lookups concurrently
+        const [blockedUserIds, userMatches] = await Promise.all([
+            Block.getBlockedUserIds(userId),
+            safeLean(Match.find({ users: userId, status: "active" }).select("_id users createdAt")),
+        ]);
         const blockedSet = new Set(blockedUserIds.map((id) => id.toString()));
 
         // Auto-sync: Ensure all active mutual matches for this user have a conversation record
-        const userMatches = await Match.find({ users: userId, status: "active" }).select("_id users createdAt");
         if (userMatches.length > 0) {
             const matchIds = userMatches.map((m) => m._id);
-            const existingConvs = await Conversation.find({ match: { $in: matchIds } }).select("match");
+            const existingConvs = await safeLean(Conversation.find({ match: { $in: matchIds } }).select("match"));
             const existingMatchIdSet = new Set(existingConvs.map((c) => c.match.toString()));
 
             const missingMatches = userMatches.filter((m) => !existingMatchIdSet.has(m._id.toString()));
@@ -40,63 +44,105 @@ const getConversations = async (req, res) => {
             }
         }
 
-        const conversations = await Conversation.find({ participants: userId })
-            .sort({ lastMessageAt: -1 })
-            .populate({
-                path: "match",
-                select: "status",
-            })
-            .populate({
-                path: "participants",
-                select: "name photos dob gender bio interests isProfileComplete",
-            })
-            .populate({
-                path: "lastMessage",
-                select: "content sender createdAt readBy",
-                populate: { path: "sender", select: "name photos" },
-            });
-
-        // Compute unread counts and format other participant
-        const formatted = await Promise.all(
-            conversations.map(async (conv) => {
-                // Exclude conversations where match is not active
-                if (!conv.match || conv.match.status !== "active") {
-                    return null;
-                }
-
-                const otherParticipant = conv.participants.find(
-                    (p) => p && p._id.toString() !== userId.toString()
-                );
-
-                if (!otherParticipant) return null;
-
-                // If either has blocked the other, exclude from active conversation list
-                if (blockedSet.has(otherParticipant._id.toString())) {
-                    return null;
-                }
-
-                const unreadCount = await Message.countDocuments({
-                    conversation: conv._id,
-                    sender: { $ne: userId },
-                    readBy: { $ne: userId },
-                });
-
-                const lastMsgDto = conv.lastMessage ? toMessageDto(conv.lastMessage) : null;
-
-                return {
-                    _id: conv._id,
-                    match: conv.match?._id || conv.match,
-                    otherParticipant: toPublicProfile(otherParticipant),
-                    lastMessage: lastMsgDto,
-                    lastMessageAt: conv.lastMessageAt,
-                    unreadCount,
-                };
-            })
+        const conversations = await safeLean(
+            Conversation.find({ participants: userId })
+                .sort({ lastMessageAt: -1 })
+                .populate({
+                    path: "match",
+                    select: "status",
+                })
+                .populate({
+                    path: "participants",
+                    select: "name photos dob gender bio interests isProfileComplete",
+                })
+                .populate({
+                    path: "lastMessage",
+                    select: "content sender createdAt readBy",
+                    populate: { path: "sender", select: "name photos" },
+                })
         );
+
+        // Filter active, unblocked conversations
+        const activeConvs = conversations.filter((conv) => {
+            if (!conv.match || conv.match.status !== "active") return false;
+            const otherParticipant = conv.participants.find(
+                (p) => p && p._id.toString() !== userId.toString()
+            );
+            if (!otherParticipant) return false;
+            if (blockedSet.has(otherParticipant._id.toString())) return false;
+            return true;
+        });
+
+        // Batch-aggregate unread message counts across all active conversations in a single query
+        const validConvIds = activeConvs.map((c) => c._id);
+        let unreadMap = new Map();
+        if (validConvIds.length > 0) {
+            if (typeof Message.aggregate === "function") {
+                try {
+                    const unreadAgg = await Message.aggregate([
+                        {
+                            $match: {
+                                conversation: { $in: validConvIds },
+                                sender: { $ne: userId },
+                                readBy: { $ne: userId },
+                            },
+                        },
+                        {
+                            $group: {
+                                _id: "$conversation",
+                                count: { $sum: 1 },
+                            },
+                        },
+                    ]);
+                    unreadMap = new Map(unreadAgg.map((u) => [u._id.toString(), u.count]));
+                } catch (_) {
+                    // Safe fallback for testing or mock environments
+                    const counts = await Promise.all(
+                        validConvIds.map((cId) =>
+                            Message.countDocuments({
+                                conversation: cId,
+                                sender: { $ne: userId },
+                                readBy: { $ne: userId },
+                            })
+                        )
+                    );
+                    validConvIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
+                }
+            } else {
+                const counts = await Promise.all(
+                    validConvIds.map((cId) =>
+                        Message.countDocuments({
+                            conversation: cId,
+                            sender: { $ne: userId },
+                            readBy: { $ne: userId },
+                        })
+                    )
+                );
+                validConvIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
+            }
+        }
+
+        // Format other participant and map pre-aggregated unread counts
+        const formatted = activeConvs.map((conv) => {
+            const otherParticipant = conv.participants.find(
+                (p) => p && p._id.toString() !== userId.toString()
+            );
+            const unreadCount = unreadMap.get(conv._id.toString()) || 0;
+            const lastMsgDto = conv.lastMessage ? toMessageDto(conv.lastMessage) : null;
+
+            return {
+                _id: conv._id,
+                match: conv.match?._id || conv.match,
+                otherParticipant: toPublicProfile(otherParticipant),
+                lastMessage: lastMsgDto,
+                lastMessageAt: conv.lastMessageAt,
+                unreadCount,
+            };
+        });
 
         return res.status(httpStatus.OK).json({
             success: true,
-            conversations: formatted.filter(Boolean),
+            conversations: formatted,
         });
     } catch (e) {
         console.error("Get conversations error:", e);
@@ -309,13 +355,15 @@ const getMessages = async (req, res) => {
                 afterFilter._id = { $gt: new mongoose.Types.ObjectId(req.query.after) };
             }
 
-            const missedMessages = await Message.find(afterFilter)
+            let missedQuery = Message.find(afterFilter)
                 .sort({ createdAt: 1, _id: 1 })
                 .limit(limit)
                 .populate({
                     path: "sender",
                     select: "name photos",
                 });
+            if (typeof missedQuery.lean === "function") missedQuery = missedQuery.lean();
+            const missedMessages = await missedQuery;
 
             return res.status(httpStatus.OK).json({
                 success: true,
@@ -349,13 +397,15 @@ const getMessages = async (req, res) => {
                 beforeFilter._id = { $lt: new mongoose.Types.ObjectId(req.query.before) };
             }
 
-            const olderMessagesDesc = await Message.find(beforeFilter)
+            let olderQuery = Message.find(beforeFilter)
                 .sort({ createdAt: -1, _id: -1 })
                 .limit(limit)
                 .populate({
                     path: "sender",
                     select: "name photos",
                 });
+            if (typeof olderQuery.lean === "function") olderQuery = olderQuery.lean();
+            const olderMessagesDesc = await olderQuery;
 
             const olderMessagesChronological = olderMessagesDesc.reverse();
             const nextBeforeCursor = olderMessagesDesc.length === limit && olderMessagesChronological[0]
@@ -376,10 +426,8 @@ const getMessages = async (req, res) => {
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const skip = (page - 1) * limit;
 
-        const total = await Message.countDocuments({ conversation: conversationId });
-
-        // Retrieve latest messages first for pagination, then sort chronologically
-        const messagesDesc = await Message.find({ conversation: conversationId })
+        // Execute count and page slice concurrently with lean query where supported
+        let pageQuery = Message.find({ conversation: conversationId })
             .sort({ createdAt: -1, _id: -1 })
             .skip(skip)
             .limit(limit)
@@ -387,6 +435,12 @@ const getMessages = async (req, res) => {
                 path: "sender",
                 select: "name photos",
             });
+        if (typeof pageQuery.lean === "function") pageQuery = pageQuery.lean();
+
+        const [total, messagesDesc] = await Promise.all([
+            Message.countDocuments({ conversation: conversationId }),
+            pageQuery,
+        ]);
 
         const messagesChronological = messagesDesc.reverse();
         const nextBeforeCursor = messagesChronological.length > 0 ? messagesChronological[0]._id : null;
@@ -601,7 +655,7 @@ const sendMessageRest = async (req, res) => {
         }
 
         if (conversation.match) {
-            const match = await Match.findById(conversation.match).select("status");
+            const match = await safeLean(Match.findById(conversation.match).select("status"));
             if (match && match.status === "unmatched") {
                 return res.status(httpStatus.FORBIDDEN).json({
                     success: false,
