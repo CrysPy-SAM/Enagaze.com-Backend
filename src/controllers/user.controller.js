@@ -1,3 +1,7 @@
+import mongoose from "mongoose";
+import { Match } from "../models/match.model.js";
+import { getIO } from "./socketManager.js";
+import { getPresenceForViewer } from "../services/presence.service.js";
 import httpStatus from "http-status";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -596,10 +600,151 @@ const googleLogin = async (req, res) => {
     }
 };
 
+// ==========================================
+// 6. GET USER PRIVACY SETTINGS
+// ==========================================
+const getPrivacySettings = async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id).select("privacySettings");
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "User not found",
+            });
+        }
+
+        const defaultSettings = {
+            lastSeen: "everyone",
+            lastSeenExceptions: [],
+            online: "everyone",
+        };
+
+        const privacySettings = {
+            lastSeen: user.privacySettings?.lastSeen || defaultSettings.lastSeen,
+            lastSeenExceptions: user.privacySettings?.lastSeenExceptions || defaultSettings.lastSeenExceptions,
+            online: user.privacySettings?.online || defaultSettings.online,
+        };
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            privacySettings,
+        });
+    } catch (e) {
+        console.error("Get privacy settings error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to load privacy settings",
+        });
+    }
+};
+
+// ==========================================
+// 7. UPDATE USER PRIVACY SETTINGS
+// ==========================================
+const updatePrivacySettings = async (req, res) => {
+    try {
+        const { lastSeen, lastSeenExceptions, online } = req.body;
+
+        const allowedLastSeen = ["everyone", "matches", "matches_except", "nobody"];
+        const allowedOnline = ["everyone", "same_as_last_seen"];
+
+        if (lastSeen !== undefined && !allowedLastSeen.includes(lastSeen)) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: `lastSeen must be one of: ${allowedLastSeen.join(", ")}`,
+            });
+        }
+
+        if (online !== undefined && !allowedOnline.includes(online)) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: `online must be one of: ${allowedOnline.join(", ")}`,
+            });
+        }
+
+        let validatedExceptions = undefined;
+        if (lastSeenExceptions !== undefined) {
+            if (!Array.isArray(lastSeenExceptions)) {
+                return res.status(httpStatus.BAD_REQUEST).json({
+                    success: false,
+                    message: "lastSeenExceptions must be an array of user IDs",
+                });
+            }
+
+            for (const id of lastSeenExceptions) {
+                if (!mongoose.Types.ObjectId.isValid(id)) {
+                    return res.status(httpStatus.BAD_REQUEST).json({
+                        success: false,
+                        message: `Invalid user ID in lastSeenExceptions: ${id}`,
+                    });
+                }
+            }
+            validatedExceptions = lastSeenExceptions;
+        }
+
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "User not found",
+            });
+        }
+
+        if (!user.privacySettings) {
+            user.privacySettings = {
+                lastSeen: "everyone",
+                lastSeenExceptions: [],
+                online: "everyone",
+            };
+        }
+
+        if (lastSeen !== undefined) user.privacySettings.lastSeen = lastSeen;
+        if (validatedExceptions !== undefined) user.privacySettings.lastSeenExceptions = validatedExceptions;
+        if (online !== undefined) user.privacySettings.online = online;
+
+        await user.save();
+
+        // Broadcast updated presence to active matches if socket IO is available
+        try {
+            const io = getIO();
+            if (io) {
+                const userMatches = await Match.find({ users: user._id, status: "active" }).populate("users", "privacySettings lastSeenAt");
+                for (const match of userMatches) {
+                    const partner = match.users.find((u) => u && u._id.toString() !== user._id.toString());
+                    if (partner) {
+                        const presence = getPresenceForViewer(user, partner, true);
+                        io.to(`user:${partner._id.toString()}`).emit("presence:update", {
+                            userId: user._id.toString(),
+                            isOnline: presence.isOnline,
+                            lastSeenAt: presence.lastSeenAt,
+                        });
+                    }
+                }
+            }
+        } catch (socketErr) {
+            console.error("Error broadcasting privacy setting update to sockets:", socketErr);
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            message: "Privacy settings updated successfully",
+            privacySettings: user.privacySettings,
+        });
+    } catch (e) {
+        console.error("Update privacy settings error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to update privacy settings",
+        });
+    }
+};
+
 export {
     login,
     register,
     getMyProfile,
     updateMyProfile,
-    googleLogin
+    googleLogin,
+    getPrivacySettings,
+    updatePrivacySettings,
 };

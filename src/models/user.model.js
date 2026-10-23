@@ -98,7 +98,29 @@ const userSchema = new Schema(
             type: String,
             enum: ["user", "moderator", "admin"],
             default: "user",
-        }
+        },
+        lastSeenAt: {
+            type: Date,
+            default: null,
+        },
+        privacySettings: {
+            lastSeen: {
+                type: String,
+                enum: ["everyone", "matches", "matches_except", "nobody"],
+                default: "everyone",
+            },
+            lastSeenExceptions: [
+                {
+                    type: Schema.Types.ObjectId,
+                    ref: "User",
+                },
+            ],
+            online: {
+                type: String,
+                enum: ["everyone", "same_as_last_seen"],
+                default: "everyone",
+            },
+        },
     },
     {
         timestamps: true,

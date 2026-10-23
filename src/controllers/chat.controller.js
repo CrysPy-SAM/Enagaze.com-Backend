@@ -6,6 +6,7 @@ import { Match } from "../models/match.model.js";
 import { Block } from "../models/block.model.js";
 import { getIO } from "./socketManager.js";
 import { toPublicProfile, toSenderProfile, toMessageDto } from "../serializers/profile.serializer.js";
+import { getPresenceForViewer } from "../services/presence.service.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
 import { safeLean } from "../utils/queryHelper.js";
 
@@ -53,7 +54,7 @@ const getConversations = async (req, res) => {
                 })
                 .populate({
                     path: "participants",
-                    select: "name photos dob gender bio interests isProfileComplete",
+                    select: "name photos dob gender bio interests isProfileComplete lastSeenAt privacySettings",
                 })
                 .populate({
                     path: "lastMessage",
@@ -129,11 +130,12 @@ const getConversations = async (req, res) => {
             );
             const unreadCount = unreadMap.get(conv._id.toString()) || 0;
             const lastMsgDto = conv.lastMessage ? toMessageDto(conv.lastMessage) : null;
+            const presence = otherParticipant ? getPresenceForViewer(otherParticipant, req.user, true) : null;
 
             return {
                 _id: conv._id,
                 match: conv.match?._id || conv.match,
-                otherParticipant: toPublicProfile(otherParticipant),
+                otherParticipant: toPublicProfile(otherParticipant, presence),
                 lastMessage: lastMsgDto,
                 lastMessageAt: conv.lastMessageAt,
                 unreadCount,
@@ -169,7 +171,7 @@ const getOrCreateConversationByMatch = async (req, res) => {
     try {
         const match = await Match.findById(matchId).populate({
             path: "users",
-            select: "name photos dob gender bio interests isProfileComplete",
+            select: "name photos dob gender bio interests isProfileComplete lastSeenAt privacySettings",
         });
 
         if (!match) {
@@ -246,12 +248,14 @@ const getOrCreateConversationByMatch = async (req, res) => {
             });
         }
 
+        const presence = otherParticipant ? getPresenceForViewer(otherParticipant, req.user, true) : null;
+
         return res.status(httpStatus.OK).json({
             success: true,
             conversation: {
                 _id: conversation._id,
                 match: match._id,
-                otherParticipant: toPublicProfile(otherParticipant),
+                otherParticipant: toPublicProfile(otherParticipant, presence),
                 lastMessage: conversation.lastMessage,
                 lastMessageAt: conversation.lastMessageAt,
             },

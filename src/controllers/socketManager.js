@@ -12,6 +12,14 @@ import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
 import { toMessageDto, toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
+import {
+    userConnected,
+    userDisconnected,
+    isUserOnline,
+    canViewerSeeLastSeen,
+    canViewerSeeOnline,
+    getPresenceForViewer,
+} from "../services/presence.service.js";
 import { safeLean } from "../utils/queryHelper.js";
 import {
     isPlainObject,
@@ -33,6 +41,38 @@ export const _resetInMemoryDirectCalls = () => {
     }
     activeDirectCalls.clear();
     userToDirectCall.clear();
+};
+
+
+export const broadcastPresenceUpdate = async (io, userId, isOnline, lastSeenAt = null) => {
+    if (!io || !userId) return;
+    if (mongoose.connection?.readyState !== 1) return;
+    try {
+        const user = await User.findById(userId).select("privacySettings lastSeenAt");
+        if (!user) return;
+
+        const effectiveLastSeen = lastSeenAt || user.lastSeenAt || null;
+
+        const matches = await Match.find({ users: userId, status: "active" })
+            .populate({ path: "users", select: "privacySettings lastSeenAt" });
+
+        for (const match of matches) {
+            const partner = match.users.find((u) => u && u._id.toString() !== userId.toString());
+            if (partner) {
+                const partnerId = partner._id.toString();
+                const canSeeOnline = isOnline && canViewerSeeOnline(user, partner, true);
+                const canSeeLastSeen = canViewerSeeLastSeen(user, partner, true);
+
+                io.to(`user:${partnerId}`).emit("presence:update", {
+                    userId: userId.toString(),
+                    isOnline: Boolean(canSeeOnline),
+                    lastSeenAt: canSeeLastSeen ? effectiveLastSeen : null,
+                });
+            }
+        }
+    } catch (err) {
+        console.error("broadcastPresenceUpdate error:", err);
+    }
 };
 
 export const getIO = () => ioInstance;
@@ -78,6 +118,12 @@ export const connectToSocket = (server) => {
         // Automatically join authenticated user room for real-time delivery and match notifications
         if (socket.userId) {
             socket.join(`user:${socket.userId.toString()}`);
+            const wasOffline = userConnected(socket.userId, socket.id);
+            if (wasOffline) {
+                broadcastPresenceUpdate(io, socket.userId, true).catch((err) => {
+                    console.error("Error broadcasting online presence:", err);
+                });
+            }
         }
 
         // ==========================================
@@ -86,6 +132,44 @@ export const connectToSocket = (server) => {
         registerRandomCallHandlers(io, socket);
 
         // ==========================================
+        // Event: Query presence of a specific user or match partner
+        socket.on("presence:get", async (data, ack) => {
+            if (!socket.userId) {
+                if (typeof ack === "function") ack({ success: false, message: "Authentication required" });
+                return;
+            }
+            const { targetUserId } = data || {};
+            if (!targetUserId || !mongoose.Types.ObjectId.isValid(targetUserId)) {
+                if (typeof ack === "function") ack({ success: false, message: "Valid targetUserId required" });
+                return;
+            }
+
+            try {
+                const [targetUser, viewerUser] = await Promise.all([
+                    User.findById(targetUserId).select("privacySettings lastSeenAt"),
+                    User.findById(socket.userId).select("privacySettings"),
+                ]);
+
+                if (!targetUser) {
+                    if (typeof ack === "function") ack({ success: false, message: "User not found" });
+                    return;
+                }
+
+                const isMatch = await Match.exists({
+                    users: { $all: [socket.userId, targetUserId] },
+                    status: "active",
+                });
+
+                const presence = getPresenceForViewer(targetUser, viewerUser, Boolean(isMatch));
+                if (typeof ack === "function") {
+                    ack({ success: true, userId: targetUserId, ...presence });
+                }
+            } catch (e) {
+                console.error("presence:get error:", e);
+                if (typeof ack === "function") ack({ success: false, message: "Failed to get presence" });
+            }
+        });
+
         // 2. MATCH-BASED PRIVATE CHAT EVENTS
         // ==========================================
 
@@ -988,6 +1072,18 @@ export const connectToSocket = (server) => {
         socket.on("disconnect", () => {
             // Clean up rate limits on socket disconnect
             clearSocketRateLimits(socket.id);
+
+            // Handle presence tracking with disconnect grace period
+            if (socket.userId) {
+                userDisconnected(socket.userId, socket.id, async (lastSeenAt) => {
+                    try {
+                        await User.findByIdAndUpdate(socket.userId, { lastSeenAt });
+                        await broadcastPresenceUpdate(io, socket.userId, false, lastSeenAt);
+                    } catch (err) {
+                        console.error("Error processing disconnect presence grace expiration:", err);
+                    }
+                });
+            }
 
             // Clean up any direct call session in which this user was participating
             if (socket.userId && userToDirectCall.has(socket.userId)) {

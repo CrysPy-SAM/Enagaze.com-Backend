@@ -4,7 +4,9 @@ import {
     register,
     getMyProfile,
     updateMyProfile,
-    googleLogin
+    googleLogin,
+    getPrivacySettings,
+    updatePrivacySettings
 } from "../controllers/user.controller.js";
 import {
     searchUsers,
@@ -45,6 +47,11 @@ router.route("/profile/public/:userId")
 router.route("/profile/me")
     .get(protect, getMyProfile)
     .put(protect, updateMyProfile);
+
+// Protected privacy settings endpoints
+router.route("/privacy")
+    .get(protect, getPrivacySettings)
+    .put(protect, updatePrivacySettings);
 
 // Profile photo upload pipeline endpoints
 router.route("/profile/photo/upload-url")

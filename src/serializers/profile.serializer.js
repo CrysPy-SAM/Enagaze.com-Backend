@@ -32,6 +32,8 @@ export const calculateAge = (dob) => {
  * - photos: Array<String>
  * - interests: Array<String>
  * - isProfileComplete: Boolean
+ * - isOnline: Boolean (optional, when presence is evaluated)
+ * - lastSeenAt: Date | null (optional, when presence is evaluated)
  * 
  * FORBIDDEN (NEVER RETURNED):
  * - username (login identifier)
@@ -42,11 +44,13 @@ export const calculateAge = (dob) => {
  * - token
  * - datingPreferences
  * - authProvider
+ * - privacySettings (internal privacy configuration)
  * 
  * @param {Object|null|undefined} user - Mongoose document or plain object
+ * @param {Object|null} [presence=null] - Pre-evaluated presence info { isOnline, lastSeenAt }
  * @returns {Object|null}
  */
-export const toPublicProfile = (user) => {
+export const toPublicProfile = (user, presence = null) => {
     if (!user) return null;
 
     const doc = typeof user.toObject === "function"
@@ -57,7 +61,7 @@ export const toPublicProfile = (user) => {
         ? doc.age
         : calculateAge(doc.dob);
 
-    return {
+    const result = {
         _id: doc._id ? doc._id.toString() : undefined,
         name: typeof doc.name === "string" && doc.name.trim() ? doc.name.trim() : "Engaze Member",
         age,
@@ -67,6 +71,13 @@ export const toPublicProfile = (user) => {
         interests: Array.isArray(doc.interests) ? doc.interests : [],
         isProfileComplete: Boolean(doc.isProfileComplete),
     };
+
+    if (presence && typeof presence === "object") {
+        result.isOnline = Boolean(presence.isOnline);
+        result.lastSeenAt = presence.lastSeenAt || null;
+    }
+
+    return result;
 };
 
 /**
