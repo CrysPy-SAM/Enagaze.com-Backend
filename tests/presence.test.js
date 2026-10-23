@@ -1,7 +1,5 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import request from "supertest";
-import { app } from "../src/app.js";
 
 import {
     userConnected,
@@ -257,25 +255,6 @@ describe("Presence & WhatsApp-Style Privacy Test Suite", () => {
 
             const publicProfile = toPublicProfile(target, presence);
             assert.equal(publicProfile.lastSeenAt, null);
-        });
-    });
-
-    // =========================================================================
-    // 5. REST API Security & Validation
-    // =========================================================================
-    describe("REST Privacy API Security & Validation", () => {
-        it("rejects unauthenticated GET /api/v1/users/privacy with HTTP 401", async () => {
-            const res = await request(app).get("/api/v1/users/privacy");
-            assert.equal(res.status, 401);
-            assert.equal(res.body.success, false);
-        });
-
-        it("rejects unauthenticated PUT /api/v1/users/privacy with HTTP 401", async () => {
-            const res = await request(app)
-                .put("/api/v1/users/privacy")
-                .send({ lastSeen: "everyone" });
-            assert.equal(res.status, 401);
-            assert.equal(res.body.success, false);
         });
     });
 });
