@@ -555,30 +555,14 @@ const getLikesYou = async (req, res) => {
             });
         }
 
-        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
-        const skip = (page - 1) * limit;
+        // 2. Validate and sanitize pagination inputs
+        const parsedPage = parseInt(req.query.page, 10);
+        const page = (!isNaN(parsedPage) && parsedPage >= 1) ? parsedPage : 1;
 
-        // 2. Fetch incoming likes
-        const incomingLikes = await safeLean(
-            Swipe.find({
-                toUser: currentUser._id,
-                action: "like",
-            }).sort({ createdAt: -1 })
-        );
+        const parsedLimit = parseInt(req.query.limit, 10);
+        const limit = (!isNaN(parsedLimit) && parsedLimit >= 1) ? Math.min(50, parsedLimit) : 20;
 
-        if (incomingLikes.length === 0) {
-            return res.status(httpStatus.OK).json({
-                success: true,
-                profiles: [],
-                pagination: {
-                    page,
-                    limit,
-                    total: 0,
-                    totalPages: 1,
-                },
-            });
-        }
+        const targetSkip = (page - 1) * limit;
 
         // 3. Exclude users already swiped by currentUser, existing matches, and blocked users
         const [mySwipes, existingMatches, blockedIds] = await Promise.all([
@@ -595,65 +579,140 @@ const getLikesYou = async (req, res) => {
         );
         const blockedSet = new Set(blockedIds.map((id) => id.toString()));
 
-        // Filter and collect candidate user IDs and their like timestamps
-        const candidateMap = new Map(); // userId -> likedAt
-        for (const swipeRecord of incomingLikes) {
-            const senderIdStr = swipeRecord.fromUser.toString();
-            if (
-                senderIdStr !== currentUser._id.toString() &&
-                !swipedUserIds.has(senderIdStr) &&
-                !matchedUserIds.has(senderIdStr) &&
-                !blockedSet.has(senderIdStr) &&
-                !candidateMap.has(senderIdStr)
-            ) {
-                candidateMap.set(senderIdStr, swipeRecord.createdAt);
+        const excludedIds = Array.from(new Set([
+            currentUser._id.toString(),
+            ...swipedUserIds,
+            ...matchedUserIds,
+            ...blockedSet,
+        ]));
+
+        // 4. Construct base query for incoming likes
+        const swipeFilter = {
+            toUser: currentUser._id,
+            action: "like",
+        };
+
+        // 5. Bounded database batch-fetch and candidate filtering
+        // Processes candidates in bounded batches from MongoDB without loading the entire collection into memory.
+        const BATCH_SIZE = Math.min(100, Math.max(limit * 2, 40));
+        const MAX_TOTAL_SCANNED = 1000;
+
+        let currentSwipeSkip = 0;
+        let validSkipped = 0;
+        let validProfiles = [];
+        let totalScanned = 0;
+        const seenCandidateIds = new Set();
+        let totalEligibleCount = 0;
+
+        while (totalScanned < MAX_TOTAL_SCANNED) {
+            let query = Swipe.find(swipeFilter);
+            if (typeof query.sort === "function") {
+                query = query.sort({ createdAt: -1, _id: -1 });
+            }
+            if (typeof query.skip === "function") {
+                query = query.skip(currentSwipeSkip);
+            }
+            if (typeof query.limit === "function") {
+                query = query.limit(BATCH_SIZE);
+            }
+            if (typeof query.select === "function") {
+                query = query.select("fromUser createdAt _id");
+            }
+
+            let batchSwipes = await safeLean(query);
+
+            if (!batchSwipes || (Array.isArray(batchSwipes) && batchSwipes.length === 0)) {
+                break;
+            }
+
+            // Fallback slicing for test mocks where skip/limit may not be implemented
+            if (Array.isArray(batchSwipes) && batchSwipes.length > BATCH_SIZE) {
+                batchSwipes = batchSwipes.slice(currentSwipeSkip, currentSwipeSkip + BATCH_SIZE);
+            }
+
+            if (!batchSwipes || batchSwipes.length === 0) {
+                break;
+            }
+
+            totalScanned += batchSwipes.length;
+            currentSwipeSkip += batchSwipes.length;
+
+            // Deduplicate and filter out already swiped, matched, or blocked users
+            const batchCandidateIds = [];
+            const candidateLikedAtMap = new Map();
+
+            for (const s of batchSwipes) {
+                if (!s || !s.fromUser) continue;
+                const sIdStr = s.fromUser.toString();
+
+                if (
+                    sIdStr !== currentUser._id.toString() &&
+                    !swipedUserIds.has(sIdStr) &&
+                    !matchedUserIds.has(sIdStr) &&
+                    !blockedSet.has(sIdStr) &&
+                    !seenCandidateIds.has(sIdStr)
+                ) {
+                    seenCandidateIds.add(sIdStr);
+                    candidateLikedAtMap.set(sIdStr, s.createdAt);
+                    batchCandidateIds.push(s.fromUser);
+                }
+            }
+
+            if (batchCandidateIds.length > 0) {
+                const candidateUsers = await safeLean(
+                    User.find({
+                        _id: { $in: batchCandidateIds },
+                        isProfileComplete: true,
+                    }).select("name dob gender bio photos interests isProfileComplete")
+                );
+
+                const userMap = new Map((candidateUsers || []).map((u) => [u._id.toString(), u]));
+
+                for (const senderId of batchCandidateIds) {
+                    const senderStr = senderId.toString();
+                    const userDoc = userMap.get(senderStr);
+                    if (!userDoc) continue;
+
+                    const eligibility = checkUserEligibility(userDoc);
+                    if (!eligibility.isEligible) continue;
+
+                    const publicProfile = toPublicProfile(userDoc);
+                    if (!publicProfile) continue;
+
+                    totalEligibleCount++;
+
+                    if (validSkipped < targetSkip) {
+                        validSkipped++;
+                    } else if (validProfiles.length < limit) {
+                        validProfiles.push({
+                            ...publicProfile,
+                            likedAt: candidateLikedAtMap.get(senderStr) || null,
+                        });
+                    }
+                }
+            }
+
+            // If we have collected enough profiles for this page and batch is complete
+            if (validProfiles.length >= limit && batchSwipes.length < BATCH_SIZE) {
+                break;
+            }
+
+            // Stop if the batch returned fewer items than BATCH_SIZE (database exhausted)
+            if (batchSwipes.length < BATCH_SIZE) {
+                break;
+            }
+
+            // If we have filled the requested page, we can terminate early to avoid scanning more documents
+            if (validProfiles.length >= limit) {
+                break;
             }
         }
 
-        const allCandidateIds = Array.from(candidateMap.keys());
-        const total = allCandidateIds.length;
-        const pageCandidateIds = allCandidateIds.slice(skip, skip + limit);
-
-        if (pageCandidateIds.length === 0) {
-            return res.status(httpStatus.OK).json({
-                success: true,
-                profiles: [],
-                pagination: {
-                    page,
-                    limit,
-                    total,
-                    totalPages: Math.ceil(total / limit) || 1,
-                },
-            });
-        }
-
-        // 4. Fetch user records ensuring isProfileComplete: true
-        const candidateUsers = await safeLean(
-            User.find({
-                _id: { $in: pageCandidateIds },
-                isProfileComplete: true,
-            }).select("name dob gender bio photos interests isProfileComplete")
-        );
-
-        // Preserve sort order from candidateMap
-        const userMap = new Map(candidateUsers.map((u) => [u._id.toString(), u]));
-
-        const profiles = pageCandidateIds
-            .map((id) => {
-                const user = userMap.get(id);
-                if (!user) return null;
-                const publicProfile = toPublicProfile(user);
-                if (!publicProfile) return null;
-                return {
-                    ...publicProfile,
-                    likedAt: candidateMap.get(id) || null,
-                };
-            })
-            .filter(Boolean);
+        const total = totalEligibleCount;
 
         return res.status(httpStatus.OK).json({
             success: true,
-            profiles,
+            profiles: validProfiles,
             pagination: {
                 page,
                 limit,

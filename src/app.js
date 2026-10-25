@@ -17,6 +17,7 @@ import moderationRoutes from "./routes/moderation.routes.js";
 import webrtcRoutes from "./routes/webrtc.routes.js";
 import notificationRoutes from "./routes/notification.routes.js";
 import { validateJwtConfig } from "./config/jwt.js";
+import { getMongoConnectionOptions } from "./config/database.js";
 import { corsOptions } from "./config/cors.js";
 import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
 
@@ -235,10 +236,22 @@ const start = async ({ exitOnError = true } = {}) => {
     throw new Error(errorMsg);
   }
 
+  // Validate MongoDB connection configuration before establishing connection
+  let mongoOptions;
+  try {
+    mongoOptions = getMongoConnectionOptions();
+  } catch (configErr) {
+    console.error(`❌ Fatal Startup Configuration Error: ${configErr.message}`);
+    if (exitOnError) {
+      process.exit(1);
+    }
+    throw configErr;
+  }
+
   // 1. Establish required database connection before opening network listener
   let connectionDb;
   try {
-    connectionDb = await mongoose.connect(process.env.MONGO_URI);
+    connectionDb = await mongoose.connect(process.env.MONGO_URI, mongoOptions);
     console.log(`✅ MONGO Connected DB Host: ${connectionDb.connection.host}`);
   } catch (dbErr) {
     const safeMsg = formatSafeDatabaseError(dbErr);
@@ -400,4 +413,4 @@ if (isMainModule) {
 const _resetShutdownForTesting = () => { isShuttingDown = false; };
 const _setIsShuttingDownForTesting = (val) => { isShuttingDown = Boolean(val); };
 
-export { app, server, start, gracefulShutdown, formatSafeDatabaseError, _resetShutdownForTesting, _setIsShuttingDownForTesting };
+export { app, server, start, gracefulShutdown, formatSafeDatabaseError, getMongoConnectionOptions, _resetShutdownForTesting, _setIsShuttingDownForTesting };

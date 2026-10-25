@@ -18,11 +18,11 @@ describe("Phase 2D.1: Additive Index Migration Specification & Safety Suite", ()
             assert.strictEqual(emailIdx.options.unique, undefined, "Strict safety: unique: true must NOT be defined in Phase 2D.1");
         });
 
-        it("Candidate B (Swipe.likes): defines compound equality and reverse-chronological sort index", () => {
+        it("Candidate B (Swipe.likes): defines compound equality and deterministic reverse-chronological sort index", () => {
             const swipeIdx = APPROVED_INDEXES.find((i) => i.collection === "swipes");
             assert.ok(swipeIdx, "Candidate B (Swipe) must be defined");
-            assert.deepStrictEqual(swipeIdx.spec, { toUser: 1, action: 1, createdAt: -1 });
-            assert.strictEqual(swipeIdx.options.name, "toUser_1_action_1_createdAt_-1");
+            assert.deepStrictEqual(swipeIdx.spec, { toUser: 1, action: 1, createdAt: -1, _id: -1 });
+            assert.strictEqual(swipeIdx.options.name, "toUser_1_action_1_createdAt_-1__id_-1");
             assert.strictEqual(swipeIdx.options.background, true);
             assert.strictEqual(swipeIdx.options.unique, undefined);
         });
@@ -161,7 +161,7 @@ describe("Phase 2D.1: Additive Index Migration Specification & Safety Suite", ()
             assert.strictEqual(created[0].options.sparse, true);
 
             assert.strictEqual(created[1].collection, "swipes");
-            assert.deepStrictEqual(created[1].spec, { toUser: 1, action: 1, createdAt: -1 });
+            assert.deepStrictEqual(created[1].spec, { toUser: 1, action: 1, createdAt: -1, _id: -1 });
 
             assert.strictEqual(created[2].collection, "notifications");
             assert.deepStrictEqual(created[2].spec, { recipient: 1, read: 1, createdAt: -1 });

@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import mongoose from "mongoose";
+import { getMongoConnectionOptions } from "../src/config/database.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,13 +29,13 @@ export const APPROVED_INDEXES = [
     {
         collection: "swipes",
         modelName: "Swipe",
-        spec: { toUser: 1, action: 1, createdAt: -1 },
+        spec: { toUser: 1, action: 1, createdAt: -1, _id: -1 },
         options: {
-            name: "toUser_1_action_1_createdAt_-1",
+            name: "toUser_1_action_1_createdAt_-1__id_-1",
             background: true,
         },
-        description: "Compound equality and reverse-chronological sort index supporting incoming likes feeds without in-memory sorting",
-        supportedQuery: "Swipe.find({ toUser, action: 'like' }).sort({ createdAt: -1 }) in src/controllers/discovery.controller.js",
+        description: "Compound equality and deterministic reverse-chronological sort index supporting incoming likes feeds without in-memory sorting",
+        supportedQuery: "Swipe.find({ toUser, action: 'like' }).sort({ createdAt: -1, _id: -1 }) in src/controllers/discovery.controller.js",
     },
     {
         collection: "notifications",
@@ -127,7 +128,8 @@ export async function runIndexMigration({
             db = dbClient;
         } else {
             logger.log("Connecting to MongoDB database...");
-            const mongooseConn = await mongoose.connect(mongoUri);
+            const mongoOptions = getMongoConnectionOptions();
+            const mongooseConn = await mongoose.connect(mongoUri, mongoOptions);
             connectionToClose = mongooseConn;
             db = mongooseConn.connection.db;
             logger.log("Connected successfully. Verifying and creating approved indexes...");
