@@ -56,16 +56,27 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: "40kb" }));
 app.use(express.urlencoded({ limit: "40kb", extended: true }));
 
-// Liveness check: confirms the Node.js process is running and accepting HTTP requests
-app.get("/", (req, res) => {
+// Liveness check handler: confirms the Node.js process is running and accepting HTTP requests
+const handleLivenessCheck = (req, res) => {
   res.status(200).json({
     status: "ok",
     service: "Engaze.com Backend API",
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
-});
+};
 
+// Root and standard liveness endpoints
+app.get("/", handleLivenessCheck);
+app.get("/health", handleLivenessCheck);
+app.get("/livez", (req, res) => {
+  res.status(200).json({
+    status: "alive",
+    service: "Engaze.com Backend API",
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
 app.get("/api/v1/health/live", (req, res) => {
   res.status(200).json({
     status: "alive",
@@ -78,20 +89,44 @@ app.get("/api/v1/health/live", (req, res) => {
 // Readiness check handler: confirms application dependencies (MongoDB) are ready to serve traffic
 const handleReadinessCheck = (req, res) => {
   const isDbConnected = mongoose.connection.readyState === 1;
-  const statusCode = isDbConnected ? 200 : 503;
+  const isReady = isDbConnected && !isShuttingDown;
+  const statusCode = isReady ? 200 : 503;
 
   res.status(statusCode).json({
-    status: isDbConnected ? "healthy" : "unhealthy",
-    ready: isDbConnected,
+    status: isReady ? "healthy" : "unhealthy",
+    ready: isReady,
     database: isDbConnected ? "connected" : "disconnected",
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
 };
 
-// Backward-compatible primary health endpoint and explicit readiness endpoint
+// Backward-compatible primary health endpoint, Kubernetes readyz probe, and explicit readiness endpoints
+app.get("/readyz", handleReadinessCheck);
 app.get("/api/v1/health", handleReadinessCheck);
 app.get("/api/v1/health/ready", handleReadinessCheck);
+app.get("/api/v1/health/readyz", handleReadinessCheck);
+
+// Drain middleware: reject incoming application traffic with 503 during graceful shutdown
+app.use((req, res, next) => {
+  if (isShuttingDown) {
+    const p = req.path || "";
+    const isHealthCheck =
+      p === "/" ||
+      p === "/health" ||
+      p === "/livez" ||
+      p === "/readyz" ||
+      p.startsWith("/api/v1/health");
+    if (!isHealthCheck) {
+      res.set("Connection", "close");
+      return res.status(503).json({
+        status: "shutting_down",
+        message: "Server is shutting down. Please retry shortly.",
+      });
+    }
+  }
+  next();
+});
 
 // Global rate limiting on API routes (bypassed for root and health/readiness probes above)
 app.use("/api/v1", globalApiLimiter);
@@ -153,6 +188,24 @@ const formatSafeDatabaseError = (err) => {
   return `Database connection failed (${errName}${errCode}). Please verify network reachability, database service status, and MONGO_URI configuration.`;
 };
 
+// Runtime database event listeners for resilience and visibility
+mongoose.connection.on("disconnected", () => {
+  if (!isShuttingDown) {
+    console.warn("⚠️ Warning: MongoDB disconnected. Readiness probes will report 503 until reconnected.");
+  }
+});
+
+mongoose.connection.on("reconnected", () => {
+  console.log("✅ MongoDB connection re-established.");
+});
+
+mongoose.connection.on("error", (err) => {
+  if (!isShuttingDown) {
+    const safeMsg = formatSafeDatabaseError(err);
+    console.error(`❌ MongoDB Runtime Error: ${safeMsg}`);
+  }
+});
+
 /**
  * Starts the HTTP and Socket.IO server after establishing required database connection.
  * On unrecoverable database connection failure:
@@ -170,6 +223,9 @@ const formatSafeDatabaseError = (err) => {
  * @returns {Promise<{ app: Express, server: http.Server, connectionDb: mongoose.Connection }>}
  */
 const start = async ({ exitOnError = true } = {}) => {
+  // Validate JWT configuration before establishing database or starting network listeners
+  validateJwtConfig({ exitOnError });
+
   if (!process.env.MONGO_URI || !process.env.MONGO_URI.trim()) {
     const errorMsg = "Fatal Startup Error: MONGO_URI environment variable is required to start the server.";
     console.error(`❌ ${errorMsg}`);
@@ -271,10 +327,27 @@ const gracefulShutdown = async (
       }
     });
 
-    // 2. Disconnect active Socket.IO clients before waiting for server close callback.
+    // 2. Notify and disconnect active Socket.IO clients before waiting for server close callback.
     // In Node.js, server.close() will not resolve if upgraded WebSocket connections
     // remain open; disconnecting clients allows server.close() to complete without deadlocking.
     if (io) {
+      try {
+        io.emit("server_restarting", {
+          message: "Server is restarting. Please reconnect shortly.",
+          reconnectDelayMs: 2000,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (emitErr) {
+        console.error("Error broadcasting server_restarting event:", emitErr.message);
+      }
+
+      // Allow a brief flush window for connected sockets to receive the restart notice
+      const activeSocketCount = io.sockets?.sockets?.size || 0;
+      const flushDelay = Math.min(100, Math.floor(timeoutMs / 2));
+      if (activeSocketCount > 0 && flushDelay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, flushDelay));
+      }
+
       io.disconnectSockets(true);
       if (io.engine && typeof io.engine.close === "function") {
         io.engine.close();
@@ -325,5 +398,6 @@ if (isMainModule) {
 }
 
 const _resetShutdownForTesting = () => { isShuttingDown = false; };
+const _setIsShuttingDownForTesting = (val) => { isShuttingDown = Boolean(val); };
 
-export { app, server, start, gracefulShutdown, formatSafeDatabaseError, _resetShutdownForTesting };
+export { app, server, start, gracefulShutdown, formatSafeDatabaseError, _resetShutdownForTesting, _setIsShuttingDownForTesting };

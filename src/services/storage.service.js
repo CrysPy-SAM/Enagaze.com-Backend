@@ -14,6 +14,7 @@ import {
     signS3Request,
     sha256Hex,
 } from "./s3Signer.service.js";
+import { getJwtSecret } from "../config/jwt.js";
 
 const UPLOAD_TOKEN_TTL_SECONDS = 300; // 5 minutes
 
@@ -31,7 +32,7 @@ const mockStorageObjects = new Map();
  * @returns {string} token
  */
 export function createUploadToken(claims) {
-    const secret = process.env.JWT_SECRET || "engaze_jwt_dev_secret_key_12345";
+    const secret = getJwtSecret();
     const payload = {
         userId: String(claims.userId),
         key: String(claims.key),
@@ -69,7 +70,7 @@ export function verifyUploadToken(tokenString, expectedUserId, expectedKey) {
     }
 
     const [serialized, receivedSig] = parts;
-    const secret = process.env.JWT_SECRET || "engaze_jwt_dev_secret_key_12345";
+    const secret = getJwtSecret();
 
     const expectedSig = crypto
         .createHmac("sha256", secret)

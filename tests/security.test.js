@@ -9,7 +9,7 @@ import jwt from "jsonwebtoken";
 import { validateJwtConfig, getJwtSecret, normalizeSecret, JWT_EXPIRES_IN } from "../src/config/jwt.js";
 import { isOriginAllowed, corsOptions, getAllowedOrigins } from "../src/config/cors.js";
 import mongoose from "mongoose";
-import { app } from "../src/app.js";
+import { app, start } from "../src/app.js";
 
 describe("Batch 1 Security Hardening Test Suite", () => {
     const originalEnv = { ...process.env };
@@ -155,6 +155,80 @@ describe("Batch 1 Security Hardening Test Suite", () => {
             const decoded = jwt.verify(token, getJwtSecret());
             assert.equal(decoded.id, "user_123");
             assert.equal(decoded.username, "alice");
+        });
+
+        it("start() fails closed in production before connecting to database or opening listener when JWT_SECRET is missing", async () => {
+            process.env.NODE_ENV = "production";
+            delete process.env.JWT_SECRET;
+            process.env.MONGO_URI = "mongodb://127.0.0.1:27017/test_db";
+
+            let mongooseConnectCalled = false;
+            const origConnect = mongoose.connect;
+            mongoose.connect = async () => {
+                mongooseConnectCalled = true;
+                return { connection: { host: "127.0.0.1" } };
+            };
+
+            try {
+                await assert.rejects(
+                    async () => {
+                        await start({ exitOnError: false });
+                    },
+                    /JWT_SECRET environment variable is required in production/
+                );
+                assert.equal(mongooseConnectCalled, false, "Database connection must not be attempted when JWT_SECRET is missing in production");
+            } finally {
+                mongoose.connect = origConnect;
+            }
+        });
+
+        it("start() fails closed in production when JWT_SECRET is an insecure placeholder", async () => {
+            process.env.NODE_ENV = "production";
+            process.env.JWT_SECRET = "engaze_super_secret_jwt_key_2026_dev_secure";
+            process.env.MONGO_URI = "mongodb://127.0.0.1:27017/test_db";
+
+            let mongooseConnectCalled = false;
+            const origConnect = mongoose.connect;
+            mongoose.connect = async () => {
+                mongooseConnectCalled = true;
+                return { connection: { host: "127.0.0.1" } };
+            };
+
+            try {
+                await assert.rejects(
+                    async () => {
+                        await start({ exitOnError: false });
+                    },
+                    /cannot use an insecure development placeholder in production/
+                );
+                assert.equal(mongooseConnectCalled, false, "Database connection must not be attempted when JWT_SECRET is insecure in production");
+            } finally {
+                mongoose.connect = origConnect;
+            }
+        });
+
+        it("configuration error messages do not disclose secret values", () => {
+            process.env.NODE_ENV = "production";
+            const customWeakSecret = "weak_secret_with_marker_77777";
+            process.env.JWT_SECRET = customWeakSecret;
+
+            const capturedLogs = [];
+            const origConsoleError = console.error;
+            console.error = (...args) => capturedLogs.push(args.join(" "));
+
+            try {
+                assert.throws(
+                    () => validateJwtConfig({ exitOnError: false }),
+                    (err) => {
+                        assert.ok(!err.message.includes(customWeakSecret), "Error message must not leak secret");
+                        return true;
+                    }
+                );
+                const logText = capturedLogs.join("\n");
+                assert.ok(!logText.includes(customWeakSecret), "Error log must not leak secret");
+            } finally {
+                console.error = origConsoleError;
+            }
         });
     });
 

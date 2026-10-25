@@ -1,5 +1,6 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "crypto";
 import mongoose from "mongoose";
 
 import { User } from "../src/models/user.model.js";
@@ -882,6 +883,202 @@ describe("Prompt 16: Production-Ready S3/R2 Profile Photo Storage Integration Su
             assert.equal(result.success, true);
             assert.equal(deletedKeys.length, 1);
             assert.ok(deletedKeys[0].includes("old_private.jpg"));
+        });
+    });
+
+    describe("9. Upload Token Security & Signing Secret Failsafe", () => {
+        let envBackup;
+
+        beforeEach(() => {
+            envBackup = {
+                NODE_ENV: process.env.NODE_ENV,
+                JWT_SECRET: process.env.JWT_SECRET,
+            };
+        });
+
+        afterEach(() => {
+            if (envBackup.NODE_ENV !== undefined) {
+                process.env.NODE_ENV = envBackup.NODE_ENV;
+            } else {
+                delete process.env.NODE_ENV;
+            }
+            if (envBackup.JWT_SECRET !== undefined) {
+                process.env.JWT_SECRET = envBackup.JWT_SECRET;
+            } else {
+                delete process.env.JWT_SECRET;
+            }
+        });
+
+        it("creates an upload token with valid configuration and correct structure", () => {
+            process.env.NODE_ENV = "test";
+            process.env.JWT_SECRET = "secure_test_signing_key_for_storage_tokens_2026";
+
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+            const token = createUploadToken({
+                userId: userAliceId,
+                key,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+                targetIndex: 0,
+            });
+
+            assert.equal(typeof token, "string");
+            const parts = token.split(".");
+            assert.equal(parts.length, 2, "Token must be composed of serialized payload and HMAC signature separated by a dot");
+
+            const payload = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+            assert.equal(payload.userId, String(userAliceId));
+            assert.equal(payload.key, key);
+            assert.equal(payload.expectedMime, "image/jpeg");
+            assert.equal(payload.maxSizeBytes, 5 * 1024 * 1024);
+            assert.equal(payload.targetIndex, 0);
+            assert.ok(payload.expiresAt > Date.now());
+        });
+
+        it("successfully verifies a valid upload token and decodes claims", () => {
+            process.env.NODE_ENV = "test";
+            process.env.JWT_SECRET = "secure_test_signing_key_for_storage_tokens_2026";
+
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+            const token = createUploadToken({
+                userId: userAliceId,
+                key,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+            });
+
+            const verified = verifyUploadToken(token, userAliceId, key);
+            assert.equal(verified.userId, String(userAliceId));
+            assert.equal(verified.key, key);
+            assert.equal(verified.expectedMime, "image/jpeg");
+        });
+
+        it("rejects invalid, tampered, or malformed tokens", () => {
+            process.env.NODE_ENV = "test";
+            process.env.JWT_SECRET = "secure_test_signing_key_for_storage_tokens_2026";
+
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+            const validToken = createUploadToken({
+                userId: userAliceId,
+                key,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+            });
+
+            // Missing token
+            assert.throws(
+                () => verifyUploadToken(null, userAliceId, key),
+                /Missing upload authorization token/
+            );
+
+            // Malformed token (missing dot)
+            assert.throws(
+                () => verifyUploadToken("malformed-token-without-dot", userAliceId, key),
+                /Malformed upload authorization token/
+            );
+
+            // Tampered signature
+            const [serializedPart] = validToken.split(".");
+            const tamperedSigToken = `${serializedPart}.tampered_signature_bytes`;
+            assert.throws(
+                () => verifyUploadToken(tamperedSigToken, userAliceId, key),
+                /Invalid upload authorization token signature/
+            );
+
+            // Tampered payload
+            const tamperedPayload = Buffer.from(JSON.stringify({
+                userId: String(userBobId),
+                key,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+                expiresAt: Date.now() + 60000,
+            })).toString("base64url");
+            const [, validSig] = validToken.split(".");
+            assert.throws(
+                () => verifyUploadToken(`${tamperedPayload}.${validSig}`, userBobId, key),
+                /Invalid upload authorization token signature/
+            );
+        });
+
+        it("rejects expired upload tokens", () => {
+            process.env.NODE_ENV = "test";
+            process.env.JWT_SECRET = "secure_test_signing_key_for_storage_tokens_2026";
+
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+            const expiredToken = createUploadToken({
+                userId: userAliceId,
+                key,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+                expiresAt: Date.now() - 5000,
+            });
+
+            assert.throws(
+                () => verifyUploadToken(expiredToken, userAliceId, key),
+                /Upload authorization token has expired/
+            );
+        });
+
+        it("fails closed in production when signing secret is missing or empty", () => {
+            process.env.NODE_ENV = "production";
+            delete process.env.JWT_SECRET;
+
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+
+            assert.throws(
+                () => createUploadToken({ userId: userAliceId, key, expectedMime: "image/jpeg" }),
+                /FATAL: JWT_SECRET environment variable is missing in production/
+            );
+
+            assert.throws(
+                () => verifyUploadToken("some.token", userAliceId, key),
+                /FATAL: JWT_SECRET environment variable is missing in production/
+            );
+        });
+
+        it("fails closed in production when signing secret is insecure or shorter than 32 characters", () => {
+            process.env.NODE_ENV = "production";
+            process.env.JWT_SECRET = "too_short_secret";
+
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+
+            assert.throws(
+                () => createUploadToken({ userId: userAliceId, key, expectedMime: "image/jpeg" }),
+                /FATAL: Insecure JWT_SECRET used in production/
+            );
+
+            assert.throws(
+                () => verifyUploadToken("some.token", userAliceId, key),
+                /FATAL: Insecure JWT_SECRET used in production/
+            );
+        });
+
+        it("confirms that no predictable hardcoded secret is accepted as fallback", () => {
+            process.env.NODE_ENV = "test";
+            process.env.JWT_SECRET = "production_grade_random_secret_string_configured_properly";
+
+            const key = `profile-photos/${userAliceId}/avatar.jpg`;
+            const payloadObj = {
+                userId: String(userAliceId),
+                key,
+                expectedMime: "image/jpeg",
+                maxSizeBytes: 5 * 1024 * 1024,
+                expiresAt: Date.now() + 60000,
+            };
+            const serialized = Buffer.from(JSON.stringify(payloadObj)).toString("base64url");
+
+            // Forged with former hardcoded fallback: "engaze_jwt_dev_secret_key_12345"
+            const forgedSig = crypto
+                .createHmac("sha256", "engaze_jwt_dev_secret_key_12345")
+                .update(serialized)
+                .digest("base64url");
+            const forgedToken = `${serialized}.${forgedSig}`;
+
+            // Must reject forged token signed with old fallback
+            assert.throws(
+                () => verifyUploadToken(forgedToken, userAliceId, key),
+                /Invalid upload authorization token signature/
+            );
         });
     });
 });

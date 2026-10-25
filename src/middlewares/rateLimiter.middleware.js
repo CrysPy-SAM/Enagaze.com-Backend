@@ -24,7 +24,12 @@ export const globalApiLimiter = rateLimit({
     legacyHeaders: false,
     handler: createRateLimitHandler("API request rate limit exceeded. Please slow down."),
     // Do not rate limit health check endpoints needed by Render monitors
-    skip: (req) => req.path === "/" || req.path === "/api/v1/health",
+    skip: (req) =>
+        req.path === "/" ||
+        req.path === "/health" ||
+        req.path === "/livez" ||
+        req.path === "/readyz" ||
+        req.path.startsWith("/api/v1/health"),
 });
 
 /**

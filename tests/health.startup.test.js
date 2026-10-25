@@ -6,7 +6,7 @@ import http from "node:http";
 import jwt from "jsonwebtoken";
 import { io as ioc } from "socket.io-client";
 
-import { app, server, start, gracefulShutdown, formatSafeDatabaseError, _resetShutdownForTesting } from "../src/app.js";
+import { app, server, start, gracefulShutdown, formatSafeDatabaseError, _resetShutdownForTesting, _setIsShuttingDownForTesting } from "../src/app.js";
 import { getJwtSecret } from "../src/config/jwt.js";
 
 describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () => {
@@ -64,6 +64,69 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
             assert.equal(res.body.status, "alive");
             assert.equal(typeof res.body.uptime, "number");
             assert.ok(res.body.timestamp);
+        });
+
+        it("Liveness probe (GET /health) returns 200 OK liveness status", async () => {
+            Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
+
+            const res = await request(app).get("/health");
+            assert.equal(res.status, 200);
+            assert.equal(res.body.status, "ok");
+            assert.equal(res.body.service, "Engaze.com Backend API");
+            assert.equal(typeof res.body.uptime, "number");
+            assert.ok(res.body.timestamp);
+        });
+
+        it("Liveness probe (GET /livez) returns 200 alive status", async () => {
+            Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
+
+            const res = await request(app).get("/livez");
+            assert.equal(res.status, 200);
+            assert.equal(res.body.status, "alive");
+            assert.equal(typeof res.body.uptime, "number");
+            assert.ok(res.body.timestamp);
+        });
+
+        it("Readiness probe (GET /readyz) succeeds with 200 when database is connected", async () => {
+            Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
+
+            const res = await request(app).get("/readyz");
+            assert.equal(res.status, 200);
+            assert.equal(res.body.status, "healthy");
+            assert.equal(res.body.ready, true);
+            assert.equal(res.body.database, "connected");
+        });
+
+        it("Readiness probe (GET /readyz) fails with 503 when database is disconnected", async () => {
+            Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
+
+            const res = await request(app).get("/readyz");
+            assert.equal(res.status, 503);
+            assert.equal(res.body.status, "unhealthy");
+            assert.equal(res.body.ready, false);
+            assert.equal(res.body.database, "disconnected");
+        });
+
+        it("Readiness probe (GET /readyz and GET /api/v1/health) fails with 503 when server is shutting down", async () => {
+            Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
+
+            _setIsShuttingDownForTesting(true);
+            try {
+                const resReadyz = await request(app).get("/readyz");
+                assert.equal(resReadyz.status, 503);
+                assert.equal(resReadyz.body.ready, false);
+
+                const resHealth = await request(app).get("/api/v1/health");
+                assert.equal(resHealth.status, 503);
+                assert.equal(resHealth.body.ready, false);
+
+                const resDrain = await request(app).post("/api/v1/users/login").send({});
+                assert.equal(resDrain.status, 503);
+                assert.equal(resDrain.body.status, "shutting_down");
+                assert.equal(resDrain.headers.connection, "close");
+            } finally {
+                _resetShutdownForTesting();
+            }
         });
 
         it("Readiness probe (GET /api/v1/health) succeeds with 200 when database is connected (readyState === 1)", async () => {
@@ -525,6 +588,107 @@ describe("Prompt 11.1: Backend Startup, Health, Liveness & Readiness Suite", () 
                 if (started?.server?.listening) {
                     await new Promise((res) => started.server.close(res));
                 }
+            }
+        });
+
+        it("gracefulShutdown broadcasts server_restarting event with reconnect hints to connected Socket.IO clients", async () => {
+            app.set("port", 0);
+            process.env.MONGO_URI = "mongodb://127.0.0.1:27017/test_db";
+
+            const origConnect = mongoose.connect;
+            const origDisconnect = mongoose.disconnect;
+
+            mongoose.connect = async () => {
+                Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
+                return { connection: { host: "127.0.0.1" } };
+            };
+            mongoose.disconnect = async () => {
+                Object.defineProperty(mongoose.connection, "readyState", { value: 0, configurable: true, writable: true });
+            };
+
+            let started;
+            let client;
+            try {
+                started = await start({ exitOnError: false });
+                const port = started.server.address().port;
+
+                const testToken = jwt.sign(
+                    { id: new mongoose.Types.ObjectId().toString(), username: "test_restart_user" },
+                    getJwtSecret(),
+                    { expiresIn: "1h" }
+                );
+
+                client = ioc(`http://127.0.0.1:${port}`, {
+                    transports: ["websocket"],
+                    reconnection: false,
+                    auth: { token: testToken },
+                });
+
+                await new Promise((resolve, reject) => {
+                    client.on("connect", resolve);
+                    client.on("connect_error", reject);
+                });
+
+                client.on("connect_error", () => {});
+                client.on("error", () => {});
+                if (client.io) client.io.on("error", () => {});
+
+                let receivedRestartNotice = null;
+                client.on("server_restarting", (data) => {
+                    receivedRestartNotice = data;
+                });
+
+                await gracefulShutdown("SIGTERM", { exit: false, timeoutMs: 3000 });
+
+                assert.ok(receivedRestartNotice, "Client must receive server_restarting notice before disconnection");
+                assert.ok(receivedRestartNotice.message.includes("Server is restarting"));
+                assert.equal(typeof receivedRestartNotice.reconnectDelayMs, "number");
+                assert.ok(receivedRestartNotice.timestamp);
+                assert.equal(client.connected, false, "Client must be disconnected after notice");
+            } finally {
+                if (client) {
+                    client.disconnect();
+                    client.close();
+                }
+                mongoose.connect = origConnect;
+                mongoose.disconnect = origDisconnect;
+                if (started?.server?.listening) {
+                    await new Promise((res) => started.server.close(res));
+                }
+                _resetShutdownForTesting();
+            }
+        });
+
+        it("gracefulShutdown logs error and exits with 1 when resource cleanup fails", async () => {
+            const origConsoleError = console.error;
+            const capturedErrors = [];
+            console.error = (...args) => capturedErrors.push(args.join(" "));
+
+            const origDisconnect = mongoose.disconnect;
+            Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
+            mongoose.disconnect = async () => {
+                throw new Error("Simulated Mongoose disconnect network error");
+            };
+
+            const originalExit = process.exit;
+            let exitCalled = false;
+            let exitCode = null;
+            process.exit = (code) => {
+                exitCalled = true;
+                exitCode = code;
+            };
+
+            try {
+                await gracefulShutdown("SIGTERM", { exit: true });
+                assert.equal(exitCalled, true, "Must exit process on cleanup error");
+                assert.equal(exitCode, 1, "Must exit with code 1 on cleanup error");
+                const errText = capturedErrors.join("\n");
+                assert.ok(errText.includes("Simulated Mongoose disconnect network error"));
+            } finally {
+                mongoose.disconnect = origDisconnect;
+                console.error = origConsoleError;
+                process.exit = originalExit;
+                _resetShutdownForTesting();
             }
         });
     });
