@@ -25,6 +25,8 @@ import {
   validateSocketRedisAdapterConfig,
   isPresenceRedisEnabled,
   validatePresenceRedisConfig,
+  isMatchmakingRedisEnabled,
+  validateMatchmakingRedisConfig,
 } from "./config/redis.js";
 import { initRedisClient, closeRedisClient, getRedisClient, getRedisStatus } from "./services/redis.service.js";
 import {
@@ -38,6 +40,11 @@ import {
   getSocketRedisAdapterClients,
   getSocketRedisAdapterStatus,
 } from "./services/socketRedisAdapter.service.js";
+import {
+  initMatchmakingRedisService,
+  closeMatchmakingRedisService,
+  getMatchmakingRedisStatus,
+} from "./services/randomMatchmakingRedis.service.js";
 import { corsOptions } from "./config/cors.js";
 import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
 
@@ -116,7 +123,9 @@ const handleReadinessCheck = (req, res) => {
   const isAdapterReady = !adapterStatus.enabled || adapterStatus.ready;
   const presenceStatus = getPresenceStatus();
   const isPresenceReady = !presenceStatus.enabled || presenceStatus.ready;
-  const isReady = isDbConnected && isRedisReady && isAdapterReady && isPresenceReady && !isShuttingDown;
+  const matchmakingStatus = getMatchmakingRedisStatus();
+  const isMatchmakingReady = !matchmakingStatus.enabled || matchmakingStatus.ready;
+  const isReady = isDbConnected && isRedisReady && isAdapterReady && isPresenceReady && isMatchmakingReady && !isShuttingDown;
   const statusCode = isReady ? 200 : 503;
 
   const payload = {
@@ -137,6 +146,10 @@ const handleReadinessCheck = (req, res) => {
 
   if (presenceStatus.enabled) {
     payload.presence = presenceStatus.ready ? "connected" : "disconnected";
+  }
+
+  if (matchmakingStatus.enabled) {
+    payload.matchmaking = matchmakingStatus.ready ? "connected" : "disconnected";
   }
 
   res.status(statusCode).json(payload);
@@ -338,6 +351,37 @@ const start = async ({ exitOnError = true } = {}) => {
     }
   }
 
+  // Initialize and verify Redis-backed random matchmaking if enabled
+  if (isMatchmakingRedisEnabled()) {
+    try {
+      validateMatchmakingRedisConfig();
+      await initMatchmakingRedisService({ redisClient });
+      console.log("✅ Redis-backed random matchmaking initialized.");
+    } catch (matchmakingErr) {
+      console.error(`❌ Fatal Matchmaking Redis Startup Error: ${matchmakingErr.message}`);
+      try {
+        await closeMatchmakingRedisService();
+      } catch (_) {}
+      try {
+        await closePresenceService({ timeoutMs: 2000 });
+      } catch (_) {}
+      if (socketAdapterClients) {
+        try {
+          await closeSocketRedisAdapter({ timeoutMs: 2000 });
+        } catch (_) {}
+      }
+      if (redisClient) {
+        try {
+          await closeRedisClient({ timeoutMs: 2000 });
+        } catch (_) {}
+      }
+      if (exitOnError) {
+        process.exit(1);
+      }
+      throw matchmakingErr;
+    }
+  }
+
   if (!process.env.MONGO_URI || !process.env.MONGO_URI.trim()) {
     const errorMsg = "Fatal Startup Error: MONGO_URI environment variable is required to start the server.";
     console.error(`❌ ${errorMsg}`);
@@ -521,7 +565,17 @@ const gracefulShutdown = async (
     // 3. Await HTTP server drain completion
     await serverClosePromise;
 
-    // 4. Disconnect Presence, Socket.IO Redis adapter, and Redis client cleanly if initialized
+    // 4. Disconnect Matchmaking, Presence, Socket.IO Redis adapter, and Redis client cleanly if initialized
+    try {
+      const matchmakingStatus = getMatchmakingRedisStatus();
+      if (matchmakingStatus.enabled) {
+        await closeMatchmakingRedisService();
+        console.log("Matchmaking Redis service resources cleaned up cleanly.");
+      }
+    } catch (matchmakingCloseErr) {
+      console.error("Error closing Matchmaking Redis service:", matchmakingCloseErr.message);
+    }
+
     try {
       const presenceStatus = getPresenceStatus();
       if (presenceStatus.enabled) {
@@ -620,9 +674,14 @@ export {
   getSocketRedisAdapterStatus,
   isPresenceRedisEnabled,
   validatePresenceRedisConfig,
+  isMatchmakingRedisEnabled,
+  validateMatchmakingRedisConfig,
   initPresenceService,
   closePresenceService,
   getPresenceStatus,
+  initMatchmakingRedisService,
+  closeMatchmakingRedisService,
+  getMatchmakingRedisStatus,
   _resetShutdownForTesting,
   _setIsShuttingDownForTesting,
 };

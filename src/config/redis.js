@@ -52,6 +52,21 @@ export function isPresenceRedisEnabled(env = process.env) {
 }
 
 /**
+ * Checks whether Redis-backed random matchmaking is explicitly enabled.
+ * Defaults to false if MATCHMAKING_REDIS_ENABLED is absent, empty, or false.
+ *
+ * @param {Object} [env=process.env]
+ * @returns {boolean}
+ */
+export function isMatchmakingRedisEnabled(env = process.env) {
+    if (!env || !env.MATCHMAKING_REDIS_ENABLED) {
+        return false;
+    }
+    const val = String(env.MATCHMAKING_REDIS_ENABLED).trim().toLowerCase();
+    return val === "true" || val === "1";
+}
+
+/**
  * Validates Redis configuration settings.
  * When REDIS_ENABLED=true, requires a valid redis:// or rediss:// connection URL.
  * Never includes raw URL, usernames, or passwords in error messages.
@@ -180,6 +195,80 @@ export function validatePresenceRedisConfig(env = process.env) {
         leaseTtlMs,
         renewalIntervalMs,
         keyPrefix: keyPrefix || "engaze:presence",
+        redisConfig,
+    };
+}
+
+/**
+ * Validates Matchmaking Redis configuration settings.
+ * When MATCHMAKING_REDIS_ENABLED=true, requires:
+ * 1. REDIS_ENABLED=true and a valid REDIS_URL via validateRedisConfig.
+ * 2. PRESENCE_REDIS_ENABLED=true (to track cross-instance online candidate status).
+ * 3. SOCKET_IO_REDIS_ADAPTER_ENABLED=true (for cross-instance WebRTC signaling & event delivery).
+ *
+ * @param {Object} [env=process.env]
+ * @returns {{ enabled: boolean, keyPrefix: string, queueKey: string, queueTtlMs: number, callTtlMs: number, reservationTtlMs: number, redisConfig?: object }}
+ * @throws {Error} Sanitized configuration error
+ */
+export function validateMatchmakingRedisConfig(env = process.env) {
+    if (!isMatchmakingRedisEnabled(env)) {
+        return {
+            enabled: false,
+            keyPrefix: "engaze:matchmaking",
+            queueKey: "engaze:matchmaking:queue",
+            queueTtlMs: 120000,
+            callTtlMs: 300000,
+            reservationTtlMs: 30000,
+        };
+    }
+
+    if (!isRedisEnabled(env)) {
+        throw new Error(
+            "Invalid Matchmaking Redis configuration: REDIS_ENABLED=true is required when MATCHMAKING_REDIS_ENABLED=true."
+        );
+    }
+
+    if (!isPresenceRedisEnabled(env)) {
+        throw new Error(
+            "Invalid Matchmaking Redis configuration: PRESENCE_REDIS_ENABLED=true is required when MATCHMAKING_REDIS_ENABLED=true."
+        );
+    }
+
+    if (!isSocketRedisAdapterEnabled(env)) {
+        throw new Error(
+            "Invalid Matchmaking Redis configuration: SOCKET_IO_REDIS_ADAPTER_ENABLED=true is required when MATCHMAKING_REDIS_ENABLED=true."
+        );
+    }
+
+    const redisConfig = validateRedisConfig(env);
+
+    const keyPrefix = env.MATCHMAKING_REDIS_KEY_PREFIX ? String(env.MATCHMAKING_REDIS_KEY_PREFIX).trim() : "engaze:matchmaking";
+
+    let queueTtlMs = 120000;
+    if (env.MATCHMAKING_QUEUE_TTL_MS) {
+        const parsed = parseInt(env.MATCHMAKING_QUEUE_TTL_MS, 10);
+        if (!isNaN(parsed) && parsed > 0) queueTtlMs = parsed;
+    }
+
+    let callTtlMs = 300000;
+    if (env.MATCHMAKING_CALL_TTL_MS) {
+        const parsed = parseInt(env.MATCHMAKING_CALL_TTL_MS, 10);
+        if (!isNaN(parsed) && parsed > 0) callTtlMs = parsed;
+    }
+
+    let reservationTtlMs = 30000;
+    if (env.MATCHMAKING_RESERVATION_TTL_MS) {
+        const parsed = parseInt(env.MATCHMAKING_RESERVATION_TTL_MS, 10);
+        if (!isNaN(parsed) && parsed > 0) reservationTtlMs = parsed;
+    }
+
+    return {
+        enabled: true,
+        keyPrefix: keyPrefix || "engaze:matchmaking",
+        queueKey: `${keyPrefix || "engaze:matchmaking"}:queue`,
+        queueTtlMs,
+        callTtlMs,
+        reservationTtlMs,
         redisConfig,
     };
 }

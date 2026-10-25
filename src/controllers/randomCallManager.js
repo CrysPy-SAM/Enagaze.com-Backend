@@ -9,6 +9,19 @@ import {
     checkSocketRateLimit,
     clearSocketRateLimits,
 } from "../utils/socketValidator.js";
+import { isMatchmakingRedisEnabled } from "../config/redis.js";
+import {
+    findAndReserveMatchRedis,
+    dequeueUserRedis,
+    getCallSessionRedis,
+    getCallIdForSocketRedis,
+    getCallIdForUserRedis,
+    setUserConsentRedis,
+    setMediaReadyRedis,
+    endCallSessionRedis,
+    endActiveCallBetweenUsersRedis,
+} from "../services/randomMatchmakingRedis.service.js";
+import { isUserOnline } from "../services/presence.service.js";
 
 // In-memory matchmaking state
 const matchmakingQueue = [];
@@ -115,6 +128,12 @@ export async function matchOrQueueUser(io, socket, ack) {
 
     // Fetch user profile for matchmaking card
     const userProfile = toPublicProfile(user);
+
+    // If Redis matchmaking is enabled, coordinate queue and reservation via Redis/Valkey
+    if (isMatchmakingRedisEnabled()) {
+        await findAndReserveMatchRedis({ io, socket, userId: socket.userId, userProfile, ack });
+        return;
+    }
 
     // Atomic candidate search: Find eligible peer already waiting in queue
     let candidate = null;
@@ -266,9 +285,16 @@ export function registerRandomCallHandlers(io, socket) {
         const userIdStr = socket.userId.toString();
 
         // If user is currently in an active call, terminate it first
-        if (socketToCall.has(socket.id) || userToCall.has(userIdStr)) {
-            const currentCallId = socketToCall.get(socket.id) || userToCall.get(userIdStr);
-            endActiveCall(currentCallId, socket.id, "started_new_search", io);
+        if (isMatchmakingRedisEnabled()) {
+            const currentCallId = (await getCallIdForSocketRedis(socket.id)) || (await getCallIdForUserRedis(userIdStr));
+            if (currentCallId) {
+                await endCallSessionRedis({ callId: currentCallId, initiatorSocketId: socket.id, reason: "started_new_search", io });
+            }
+        } else {
+            if (socketToCall.has(socket.id) || userToCall.has(userIdStr)) {
+                const currentCallId = socketToCall.get(socket.id) || userToCall.get(userIdStr);
+                endActiveCall(currentCallId, socket.id, "started_new_search", io);
+            }
         }
 
         await matchOrQueueUser(io, socket, ack);
@@ -277,7 +303,7 @@ export function registerRandomCallHandlers(io, socket) {
     // -------------------------------------------------------------
     // 2. Cancel / Leave Matchmaking Queue
     // -------------------------------------------------------------
-    socket.on("random:leave-queue", (data, ack) => {
+    socket.on("random:leave-queue", async (data, ack) => {
         if (!socket.userId) {
             const err = { message: "Authentication required" };
             socket.emit("random:error", err);
@@ -293,6 +319,16 @@ export function registerRandomCallHandlers(io, socket) {
         }
 
         const userIdStr = socket.userId.toString();
+
+        if (isMatchmakingRedisEnabled()) {
+            const { removed } = await dequeueUserRedis({ userId: userIdStr, socketId: socket.id });
+            socket.emit("random:queue-left", { success: true });
+            if (typeof ack === "function") {
+                ack({ success: true, wasQueued: removed });
+            }
+            return;
+        }
+
         const removed = removeFromQueue(socket.id, userIdStr);
 
         socket.emit("random:queue-left", { success: true });
@@ -340,6 +376,37 @@ export function registerRandomCallHandlers(io, socket) {
             const err = { message: "Invalid consent parameter: boolean expected" };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (isMatchmakingRedisEnabled()) {
+            const call = await getCallSessionRedis(callId);
+            if (!call) {
+                const err = { message: "Active call session not found or has ended" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const callerPeer = call.peers.find(
+                (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
+            );
+            if (!callerPeer) {
+                const err = { message: "Unauthorized consent attempt: not an active call participant" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const activeCallId = (await getCallIdForSocketRedis(socket.id)) || (await getCallIdForUserRedis(socket.userId.toString()));
+            if (activeCallId !== callId) {
+                const err = { message: "Mismatched or stale call session" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            await setUserConsentRedis({ callId, userId: socket.userId, consent, io, socket, ack });
             return;
         }
 
@@ -442,6 +509,44 @@ export function registerRandomCallHandlers(io, socket) {
             return;
         }
 
+        if (isMatchmakingRedisEnabled()) {
+            const call = await getCallSessionRedis(callId);
+            if (!call) {
+                const err = { message: "Active call session not found or has ended" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const callerPeer = call.peers.find(
+                (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
+            );
+            if (!callerPeer) {
+                const err = { message: "Unauthorized media-ready attempt: not an active call participant" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const activeCallId = (await getCallIdForSocketRedis(socket.id)) || (await getCallIdForUserRedis(socket.userId.toString()));
+            if (activeCallId !== callId) {
+                const err = { message: "Mismatched or stale call session" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (call.state === "consent_pending") {
+                const err = { message: "Mutual consent required before media setup" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            await setMediaReadyRedis({ callId, userId: socket.userId, io, socket, ack });
+            return;
+        }
+
         const call = activeCalls.get(callId);
         if (!call) {
             const err = { message: "Active call session not found or has ended" };
@@ -530,6 +635,41 @@ export function registerRandomCallHandlers(io, socket) {
             return;
         }
 
+        if (isMatchmakingRedisEnabled()) {
+            const call = await getCallSessionRedis(callId);
+            if (!call) {
+                if (typeof ack === "function") ack({ success: true, wasActive: false });
+                return;
+            }
+
+            const callerPeer = call.peers.find(
+                (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
+            );
+            if (!callerPeer) {
+                const err = { message: "Unauthorized media-failed attempt: not an active call participant" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const activeCallId = (await getCallIdForSocketRedis(socket.id)) || (await getCallIdForUserRedis(socket.userId.toString()));
+            if (activeCallId !== callId) {
+                if (typeof ack === "function") ack({ success: true, wasActive: false });
+                return;
+            }
+
+            socket.emit("random:call-ended", {
+                callId,
+                reason: "media_failed",
+            });
+            await endCallSessionRedis({ callId, initiatorSocketId: socket.id, reason: "partner_media_failed", io });
+
+            if (typeof ack === "function") {
+                ack({ success: true, status: "media_failed" });
+            }
+            return;
+        }
+
         const call = activeCalls.get(callId);
         if (!call) {
             if (typeof ack === "function") ack({ success: true, wasActive: false });
@@ -604,6 +744,95 @@ export function registerRandomCallHandlers(io, socket) {
             const err = { message: "Invalid or oversized signaling payload" };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (isMatchmakingRedisEnabled()) {
+            const call = await getCallSessionRedis(callId);
+            if (!call) {
+                const err = { message: "Active call session not found or has ended" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const callerPeer = call.peers.find(
+                (p) => p.socketId === socket.id && p.userId === socket.userId.toString()
+            );
+            if (!callerPeer) {
+                const err = { message: "Unauthorized signaling attempt: not an active call participant" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const activeCallId = (await getCallIdForSocketRedis(socket.id)) || (await getCallIdForUserRedis(socket.userId.toString()));
+            if (activeCallId !== callId) {
+                const err = { message: "Mismatched or stale call session" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (call.state !== "media_ready") {
+                const err = {
+                    code: "SIGNAL_GATE_RESTRICTED",
+                    message: "Signaling forbidden: both participants must consent and finish media setup before WebRTC signaling",
+                };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const partner = call.peers.find((p) => p.socketId !== socket.id);
+            if (!partner) {
+                const err = { message: "Partner peer is no longer in call" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (recipientId && recipientId !== partner.userId && recipientId !== partner.socketId) {
+                const err = { message: "Unauthorized recipient mismatch" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const partnerSocket = io?.sockets?.sockets?.get?.(partner.socketId);
+            let isConnected = false;
+            if (partnerSocket && partnerSocket.connected) {
+                isConnected = true;
+            } else {
+                isConnected = await isUserOnline(partner.userId);
+            }
+
+            if (!isConnected) {
+                await endCallSessionRedis({ callId, initiatorSocketId: socket.id, reason: "partner_disconnected", io });
+                const err = { message: "Partner disconnected" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const isBlocked = await Block.isBlockedBidirectional(socket.userId, partner.userId);
+            if (isBlocked) {
+                await endCallSessionRedis({ callId, initiatorSocketId: socket.id, reason: "ended_by_partner", io });
+                const err = { message: "Call session ended" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            io.to(partner.socketId).emit("random:signal", {
+                callId,
+                signalData,
+                senderId: socket.userId.toString(),
+            });
+
+            if (typeof ack === "function") {
+                ack({ success: true });
+            }
             return;
         }
 
@@ -698,7 +927,7 @@ export function registerRandomCallHandlers(io, socket) {
     // -------------------------------------------------------------
     // 4. End Call / Hangup
     // -------------------------------------------------------------
-    socket.on("random:end-call", (data, ack) => {
+    socket.on("random:end-call", async (data, ack) => {
         if (!socket.userId) {
             const err = { message: "Authentication required" };
             socket.emit("random:error", err);
@@ -710,6 +939,28 @@ export function registerRandomCallHandlers(io, socket) {
             const err = { message: "Invalid payload format" };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
+            return;
+        }
+
+        if (isMatchmakingRedisEnabled()) {
+            const activeCallId = (await getCallIdForSocketRedis(socket.id)) || (await getCallIdForUserRedis(socket.userId.toString()));
+            if (!activeCallId) {
+                if (typeof ack === "function") ack({ success: true, wasActive: false });
+                return;
+            }
+
+            if (data?.callId && data.callId !== activeCallId) {
+                const err = { message: "Cannot end a call you are not participating in" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            await endCallSessionRedis({ callId: activeCallId, initiatorSocketId: socket.id, reason: "ended_by_user", io });
+
+            if (typeof ack === "function") {
+                ack({ success: true, wasActive: true });
+            }
             return;
         }
 
@@ -761,6 +1012,23 @@ export function registerRandomCallHandlers(io, socket) {
             return;
         }
 
+        if (isMatchmakingRedisEnabled()) {
+            const activeCallId = (await getCallIdForSocketRedis(socket.id)) || (await getCallIdForUserRedis(socket.userId.toString()));
+            if (data?.callId && activeCallId && data.callId !== activeCallId) {
+                const err = { message: "Cannot skip a call you are not participating in" };
+                socket.emit("random:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (activeCallId) {
+                await endCallSessionRedis({ callId: activeCallId, initiatorSocketId: socket.id, reason: "skipped_by_partner", io });
+            }
+
+            await matchOrQueueUser(io, socket, ack);
+            return;
+        }
+
         const activeCallId = socketToCall.get(socket.id);
         if (data?.callId && activeCallId && data.callId !== activeCallId) {
             const err = { message: "Cannot skip a call you are not participating in" };
@@ -780,14 +1048,24 @@ export function registerRandomCallHandlers(io, socket) {
     // -------------------------------------------------------------
     // 6. Disconnect Cleanup
     // -------------------------------------------------------------
-    socket.on("disconnect", () => {
-        // 1. Remove this specific socket from matchmaking queue if present
-        removeFromQueue(socket.id);
+    socket.on("disconnect", async () => {
+        if (isMatchmakingRedisEnabled()) {
+            try {
+                await dequeueUserRedis({ socketId: socket.id, userId: socket.userId ? socket.userId.toString() : "" });
+                const callId = await getCallIdForSocketRedis(socket.id);
+                if (callId) {
+                    await endCallSessionRedis({ callId, initiatorSocketId: socket.id, reason: "partner_disconnected", io });
+                }
+            } catch (_) {}
+        } else {
+            // 1. Remove this specific socket from matchmaking queue if present
+            removeFromQueue(socket.id);
 
-        // 2. Terminate active call if this socket was a participant
-        const callId = socketToCall.get(socket.id);
-        if (callId) {
-            endActiveCall(callId, socket.id, "partner_disconnected", io);
+            // 2. Terminate active call if this socket was a participant
+            const callId = socketToCall.get(socket.id);
+            if (callId) {
+                endActiveCall(callId, socket.id, "partner_disconnected", io);
+            }
         }
 
         // 3. Clear rate limits for this socket
@@ -799,6 +1077,9 @@ export function registerRandomCallHandlers(io, socket) {
  * Safely terminate any active call between two users (e.g. upon block/report)
  */
 export function endActiveCallBetweenUsers(userIdA, userIdB, io) {
+    if (isMatchmakingRedisEnabled()) {
+        return endActiveCallBetweenUsersRedis(userIdA, userIdB, io);
+    }
     if (!userIdA || !userIdB) return null;
     const userAStr = userIdA.toString();
     const userBStr = userIdB.toString();
