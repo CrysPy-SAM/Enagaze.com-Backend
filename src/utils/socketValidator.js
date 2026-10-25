@@ -1,4 +1,9 @@
 import mongoose from "mongoose";
+import { isRateLimitRedisEnabled } from "../config/redis.js";
+import {
+    checkSocketRateLimitRedis,
+    clearSocketRateLimitsRedis,
+} from "../services/rateLimitRedis.service.js";
 
 /**
  * Validates that an incoming value is a plain JavaScript Object.
@@ -57,6 +62,10 @@ export function isValidSignalPayload(signalData, maxBytes = 65536) {
 const rateLimitMap = new Map();
 
 export function checkSocketRateLimit(key, maxRequests, windowMs) {
+    if (isRateLimitRedisEnabled()) {
+        return checkSocketRateLimitRedis(key, maxRequests, windowMs);
+    }
+
     const now = Date.now();
     let timestamps = rateLimitMap.get(key);
     if (!timestamps) {
@@ -81,6 +90,9 @@ export function checkSocketRateLimit(key, maxRequests, windowMs) {
  * Clean up all rate limit buckets associated with a specific socket ID.
  */
 export function clearSocketRateLimits(socketId) {
+    if (isRateLimitRedisEnabled()) {
+        clearSocketRateLimitsRedis(socketId);
+    }
     if (!socketId) return;
     const prefix = `${socketId}:`;
     for (const key of rateLimitMap.keys()) {

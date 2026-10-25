@@ -27,6 +27,8 @@ import {
   validatePresenceRedisConfig,
   isMatchmakingRedisEnabled,
   validateMatchmakingRedisConfig,
+  isRateLimitRedisEnabled,
+  validateRateLimitRedisConfig,
 } from "./config/redis.js";
 import { initRedisClient, closeRedisClient, getRedisClient, getRedisStatus } from "./services/redis.service.js";
 import {
@@ -45,6 +47,11 @@ import {
   closeMatchmakingRedisService,
   getMatchmakingRedisStatus,
 } from "./services/randomMatchmakingRedis.service.js";
+import {
+  initRateLimitRedisService,
+  closeRateLimitRedisService,
+  getRateLimitRedisStatus,
+} from "./services/rateLimitRedis.service.js";
 import { corsOptions } from "./config/cors.js";
 import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
 
@@ -125,7 +132,9 @@ const handleReadinessCheck = (req, res) => {
   const isPresenceReady = !presenceStatus.enabled || presenceStatus.ready;
   const matchmakingStatus = getMatchmakingRedisStatus();
   const isMatchmakingReady = !matchmakingStatus.enabled || matchmakingStatus.ready;
-  const isReady = isDbConnected && isRedisReady && isAdapterReady && isPresenceReady && isMatchmakingReady && !isShuttingDown;
+  const rateLimitStatus = getRateLimitRedisStatus();
+  const isRateLimitReady = !rateLimitStatus.enabled || rateLimitStatus.ready;
+  const isReady = isDbConnected && isRedisReady && isAdapterReady && isPresenceReady && isMatchmakingReady && isRateLimitReady && !isShuttingDown;
   const statusCode = isReady ? 200 : 503;
 
   const payload = {
@@ -150,6 +159,10 @@ const handleReadinessCheck = (req, res) => {
 
   if (matchmakingStatus.enabled) {
     payload.matchmaking = matchmakingStatus.ready ? "connected" : "disconnected";
+  }
+
+  if (rateLimitStatus.enabled) {
+    payload.rateLimit = rateLimitStatus.ready ? "connected" : "disconnected";
   }
 
   res.status(statusCode).json(payload);
@@ -382,6 +395,40 @@ const start = async ({ exitOnError = true } = {}) => {
     }
   }
 
+  // Initialize and verify Redis-backed distributed rate limiting if enabled
+  if (isRateLimitRedisEnabled()) {
+    try {
+      validateRateLimitRedisConfig();
+      await initRateLimitRedisService({ redisClient });
+      console.log("✅ Redis-backed distributed rate limiting initialized.");
+    } catch (rateLimitErr) {
+      console.error(`❌ Fatal Rate Limit Redis Startup Error: ${rateLimitErr.message}`);
+      try {
+        await closeRateLimitRedisService();
+      } catch (_) {}
+      try {
+        await closeMatchmakingRedisService();
+      } catch (_) {}
+      try {
+        await closePresenceService({ timeoutMs: 2000 });
+      } catch (_) {}
+      if (socketAdapterClients) {
+        try {
+          await closeSocketRedisAdapter({ timeoutMs: 2000 });
+        } catch (_) {}
+      }
+      if (redisClient) {
+        try {
+          await closeRedisClient({ timeoutMs: 2000 });
+        } catch (_) {}
+      }
+      if (exitOnError) {
+        process.exit(1);
+      }
+      throw rateLimitErr;
+    }
+  }
+
   if (!process.env.MONGO_URI || !process.env.MONGO_URI.trim()) {
     const errorMsg = "Fatal Startup Error: MONGO_URI environment variable is required to start the server.";
     console.error(`❌ ${errorMsg}`);
@@ -565,7 +612,17 @@ const gracefulShutdown = async (
     // 3. Await HTTP server drain completion
     await serverClosePromise;
 
-    // 4. Disconnect Matchmaking, Presence, Socket.IO Redis adapter, and Redis client cleanly if initialized
+    // 4. Disconnect Rate Limiter, Matchmaking, Presence, Socket.IO Redis adapter, and Redis client cleanly if initialized
+    try {
+      const rateLimitStatus = getRateLimitRedisStatus();
+      if (rateLimitStatus.enabled) {
+        await closeRateLimitRedisService();
+        console.log("Rate limit Redis service cleaned up cleanly.");
+      }
+    } catch (rateLimitCloseErr) {
+      console.error("Error closing Rate Limit Redis service:", rateLimitCloseErr.message);
+    }
+
     try {
       const matchmakingStatus = getMatchmakingRedisStatus();
       if (matchmakingStatus.enabled) {
@@ -676,12 +733,17 @@ export {
   validatePresenceRedisConfig,
   isMatchmakingRedisEnabled,
   validateMatchmakingRedisConfig,
+  isRateLimitRedisEnabled,
+  validateRateLimitRedisConfig,
   initPresenceService,
   closePresenceService,
   getPresenceStatus,
   initMatchmakingRedisService,
   closeMatchmakingRedisService,
   getMatchmakingRedisStatus,
+  initRateLimitRedisService,
+  closeRateLimitRedisService,
+  getRateLimitRedisStatus,
   _resetShutdownForTesting,
   _setIsShuttingDownForTesting,
 };

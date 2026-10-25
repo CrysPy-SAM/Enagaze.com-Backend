@@ -189,7 +189,7 @@ export const connectToSocket = (server) => {
                 return;
             }
 
-            if (!checkSocketRateLimit(`${socket.id}:chat:join`, 10, 2000)) {
+            if (!(await checkSocketRateLimit(`${socket.id}:chat:join`, 10, 2000))) {
                 const err = { message: "Join room rate limit exceeded. Please wait a moment." };
                 socket.emit("chat:error", err);
                 if (typeof ack === "function") ack({ success: false, ...err });
@@ -300,7 +300,7 @@ export const connectToSocket = (server) => {
                 return;
             }
 
-            if (!checkSocketRateLimit(`${socket.id}:chat:send`, 10, 2000)) {
+            if (!(await checkSocketRateLimit(`${socket.id}:chat:send`, 10, 2000))) {
                 const err = { message: "Message rate limit exceeded. Please slow down." };
                 socket.emit("chat:error", err);
                 if (typeof ack === "function") ack({ success: false, ...err });
@@ -519,7 +519,7 @@ export const connectToSocket = (server) => {
                 return;
             }
 
-            if (!checkSocketRateLimit(`${socket.id}:chat:read`, 15, 2000)) {
+            if (!(await checkSocketRateLimit(`${socket.id}:chat:read`, 15, 2000))) {
                 const err = { message: "Read receipt rate limit exceeded" };
                 socket.emit("chat:error", err);
                 if (typeof ack === "function") ack({ success: false, ...err });
@@ -632,7 +632,7 @@ export const connectToSocket = (server) => {
             }
 
             // Throttle typing indicator emissions: max 10 per 2 seconds
-            if (!checkSocketRateLimit(`${socket.id}:chat:typing`, 10, 2000)) {
+            if (!(await checkSocketRateLimit(`${socket.id}:chat:typing`, 10, 2000))) {
                 if (typeof ack === "function") ack({ success: false, rateLimited: true });
                 return;
             }

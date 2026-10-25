@@ -67,6 +67,21 @@ export function isMatchmakingRedisEnabled(env = process.env) {
 }
 
 /**
+ * Checks whether Redis-backed distributed rate limiting is explicitly enabled.
+ * Defaults to false if RATE_LIMIT_REDIS_ENABLED is absent, empty, or false.
+ *
+ * @param {Object} [env=process.env]
+ * @returns {boolean}
+ */
+export function isRateLimitRedisEnabled(env = process.env) {
+    if (!env || !env.RATE_LIMIT_REDIS_ENABLED) {
+        return false;
+    }
+    const val = String(env.RATE_LIMIT_REDIS_ENABLED).trim().toLowerCase();
+    return val === "true" || val === "1";
+}
+
+/**
  * Validates Redis configuration settings.
  * When REDIS_ENABLED=true, requires a valid redis:// or rediss:// connection URL.
  * Never includes raw URL, usernames, or passwords in error messages.
@@ -269,6 +284,40 @@ export function validateMatchmakingRedisConfig(env = process.env) {
         queueTtlMs,
         callTtlMs,
         reservationTtlMs,
+        redisConfig,
+    };
+}
+
+/**
+ * Validates Rate Limit Redis configuration settings.
+ * When RATE_LIMIT_REDIS_ENABLED=true, requires REDIS_ENABLED=true
+ * and a valid REDIS_URL via validateRedisConfig.
+ *
+ * @param {Object} [env=process.env]
+ * @returns {{ enabled: boolean, keyPrefix: string, redisConfig?: object }}
+ * @throws {Error} Sanitized configuration error
+ */
+export function validateRateLimitRedisConfig(env = process.env) {
+    if (!isRateLimitRedisEnabled(env)) {
+        return {
+            enabled: false,
+            keyPrefix: "engaze:ratelimit",
+        };
+    }
+
+    if (!isRedisEnabled(env)) {
+        throw new Error(
+            "Invalid Rate Limit Redis configuration: REDIS_ENABLED=true is required when RATE_LIMIT_REDIS_ENABLED=true."
+        );
+    }
+
+    const redisConfig = validateRedisConfig(env);
+    const customPrefix = env.RATE_LIMIT_REDIS_KEY_PREFIX ? String(env.RATE_LIMIT_REDIS_KEY_PREFIX).trim() : "";
+    const keyPrefix = customPrefix || "engaze:ratelimit";
+
+    return {
+        enabled: true,
+        keyPrefix,
         redisConfig,
     };
 }

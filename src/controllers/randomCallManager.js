@@ -275,7 +275,7 @@ export function registerRandomCallHandlers(io, socket) {
         }
 
         // Abuse throttle: max 5 queue join attempts per 2 seconds
-        if (!checkSocketRateLimit(`${socket.id}:join-queue`, 5, 2000)) {
+        if (!(await checkSocketRateLimit(`${socket.id}:join-queue`, 5, 2000))) {
             const err = { message: "Queue join rate limit exceeded. Please wait a moment." };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
@@ -349,7 +349,7 @@ export function registerRandomCallHandlers(io, socket) {
         }
 
         // Rate limit consent attempts: max 10 per 2 seconds
-        if (!checkSocketRateLimit(`${socket.id}:consent`, 10, 2000)) {
+        if (!(await checkSocketRateLimit(`${socket.id}:consent`, 10, 2000))) {
             const err = { message: "Consent rate limit exceeded. Please wait a moment." };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
@@ -486,7 +486,7 @@ export function registerRandomCallHandlers(io, socket) {
         }
 
         // Rate limit media-ready attempts: max 10 per 2 seconds
-        if (!checkSocketRateLimit(`${socket.id}:media-ready`, 10, 2000)) {
+        if (!(await checkSocketRateLimit(`${socket.id}:media-ready`, 10, 2000))) {
             const err = { message: "Media readiness rate limit exceeded. Please wait a moment." };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
@@ -715,7 +715,7 @@ export function registerRandomCallHandlers(io, socket) {
         }
 
         // Throttle high-frequency signaling: max 60 signals per 2 seconds per socket
-        if (!checkSocketRateLimit(`${socket.id}:signal`, 60, 2000)) {
+        if (!(await checkSocketRateLimit(`${socket.id}:signal`, 60, 2000))) {
             const err = { message: "Signaling rate limit exceeded. Please slow down." };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
@@ -1005,7 +1005,7 @@ export function registerRandomCallHandlers(io, socket) {
         }
 
         // Rate limit next skips: max 5 per 2 seconds
-        if (!checkSocketRateLimit(`${socket.id}:next`, 5, 2000)) {
+        if (!(await checkSocketRateLimit(`${socket.id}:next`, 5, 2000))) {
             const err = { message: "Next match rate limit exceeded. Please slow down." };
             socket.emit("random:error", err);
             if (typeof ack === "function") ack({ success: false, ...err });
