@@ -18,8 +18,20 @@ import webrtcRoutes from "./routes/webrtc.routes.js";
 import notificationRoutes from "./routes/notification.routes.js";
 import { validateJwtConfig } from "./config/jwt.js";
 import { getMongoConnectionOptions } from "./config/database.js";
-import { isRedisEnabled, validateRedisConfig, isSocketRedisAdapterEnabled, validateSocketRedisAdapterConfig } from "./config/redis.js";
+import {
+  isRedisEnabled,
+  validateRedisConfig,
+  isSocketRedisAdapterEnabled,
+  validateSocketRedisAdapterConfig,
+  isPresenceRedisEnabled,
+  validatePresenceRedisConfig,
+} from "./config/redis.js";
 import { initRedisClient, closeRedisClient, getRedisClient, getRedisStatus } from "./services/redis.service.js";
+import {
+  initPresenceService,
+  closePresenceService,
+  getPresenceStatus,
+} from "./services/presence.service.js";
 import {
   initSocketRedisAdapter,
   closeSocketRedisAdapter,
@@ -102,7 +114,9 @@ const handleReadinessCheck = (req, res) => {
   const isRedisReady = !redisStatus.enabled || redisStatus.ready;
   const adapterStatus = getSocketRedisAdapterStatus();
   const isAdapterReady = !adapterStatus.enabled || adapterStatus.ready;
-  const isReady = isDbConnected && isRedisReady && isAdapterReady && !isShuttingDown;
+  const presenceStatus = getPresenceStatus();
+  const isPresenceReady = !presenceStatus.enabled || presenceStatus.ready;
+  const isReady = isDbConnected && isRedisReady && isAdapterReady && isPresenceReady && !isShuttingDown;
   const statusCode = isReady ? 200 : 503;
 
   const payload = {
@@ -119,6 +133,10 @@ const handleReadinessCheck = (req, res) => {
 
   if (adapterStatus.enabled) {
     payload.socketAdapter = adapterStatus.ready ? "connected" : "disconnected";
+  }
+
+  if (presenceStatus.enabled) {
+    payload.presence = presenceStatus.ready ? "connected" : "disconnected";
   }
 
   res.status(statusCode).json(payload);
@@ -289,6 +307,34 @@ const start = async ({ exitOnError = true } = {}) => {
         process.exit(1);
       }
       throw adapterErr;
+    }
+  }
+
+  // Initialize and verify Redis-backed presence tracking if enabled
+  if (isPresenceRedisEnabled()) {
+    try {
+      validatePresenceRedisConfig();
+      await initPresenceService({ redisClient });
+      console.log("✅ Redis-backed presence tracking initialized.");
+    } catch (presenceErr) {
+      console.error(`❌ Fatal Presence Service Startup Error: ${presenceErr.message}`);
+      try {
+        await closePresenceService({ timeoutMs: 2000 });
+      } catch (_) {}
+      if (socketAdapterClients) {
+        try {
+          await closeSocketRedisAdapter({ timeoutMs: 2000 });
+        } catch (_) {}
+      }
+      if (redisClient) {
+        try {
+          await closeRedisClient({ timeoutMs: 2000 });
+        } catch (_) {}
+      }
+      if (exitOnError) {
+        process.exit(1);
+      }
+      throw presenceErr;
     }
   }
 
@@ -475,7 +521,18 @@ const gracefulShutdown = async (
     // 3. Await HTTP server drain completion
     await serverClosePromise;
 
-    // 4. Disconnect Socket.IO Redis adapter and Redis client cleanly if initialized
+    // 4. Disconnect Presence, Socket.IO Redis adapter, and Redis client cleanly if initialized
+    try {
+      const presenceStatus = getPresenceStatus();
+      if (presenceStatus.enabled) {
+        const presenceTimeout = Math.min(2000, Math.floor(timeoutMs / 4));
+        await closePresenceService({ timeoutMs: presenceTimeout });
+        console.log("Presence service resources cleaned up cleanly.");
+      }
+    } catch (presenceCloseErr) {
+      console.error("Error closing Presence service:", presenceCloseErr.message);
+    }
+
     try {
       const adapterStatus = getSocketRedisAdapterStatus();
       if (adapterStatus.enabled) {
@@ -561,6 +618,11 @@ export {
   closeSocketRedisAdapter,
   getSocketRedisAdapterClients,
   getSocketRedisAdapterStatus,
+  isPresenceRedisEnabled,
+  validatePresenceRedisConfig,
+  initPresenceService,
+  closePresenceService,
+  getPresenceStatus,
   _resetShutdownForTesting,
   _setIsShuttingDownForTesting,
 };

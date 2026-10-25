@@ -124,23 +124,25 @@ const getConversations = async (req, res) => {
         }
 
         // Format other participant and map pre-aggregated unread counts
-        const formatted = activeConvs.map((conv) => {
-            const otherParticipant = conv.participants.find(
-                (p) => p && p._id.toString() !== userId.toString()
-            );
-            const unreadCount = unreadMap.get(conv._id.toString()) || 0;
-            const lastMsgDto = conv.lastMessage ? toMessageDto(conv.lastMessage) : null;
-            const presence = otherParticipant ? getPresenceForViewer(otherParticipant, req.user, true) : null;
+        const formatted = await Promise.all(
+            activeConvs.map(async (conv) => {
+                const otherParticipant = conv.participants.find(
+                    (p) => p && p._id.toString() !== userId.toString()
+                );
+                const unreadCount = unreadMap.get(conv._id.toString()) || 0;
+                const lastMsgDto = conv.lastMessage ? toMessageDto(conv.lastMessage) : null;
+                const presence = otherParticipant ? await getPresenceForViewer(otherParticipant, req.user, true) : null;
 
-            return {
-                _id: conv._id,
-                match: conv.match?._id || conv.match,
-                otherParticipant: toPublicProfile(otherParticipant, presence),
-                lastMessage: lastMsgDto,
-                lastMessageAt: conv.lastMessageAt,
-                unreadCount,
-            };
-        });
+                return {
+                    _id: conv._id,
+                    match: conv.match?._id || conv.match,
+                    otherParticipant: toPublicProfile(otherParticipant, presence),
+                    lastMessage: lastMsgDto,
+                    lastMessageAt: conv.lastMessageAt,
+                    unreadCount,
+                };
+            })
+        );
 
         return res.status(httpStatus.OK).json({
             success: true,
@@ -248,7 +250,7 @@ const getOrCreateConversationByMatch = async (req, res) => {
             });
         }
 
-        const presence = otherParticipant ? getPresenceForViewer(otherParticipant, req.user, true) : null;
+        const presence = otherParticipant ? await getPresenceForViewer(otherParticipant, req.user, true) : null;
 
         return res.status(httpStatus.OK).json({
             success: true,

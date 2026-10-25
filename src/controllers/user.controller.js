@@ -712,7 +712,7 @@ const updatePrivacySettings = async (req, res) => {
                 for (const match of userMatches) {
                     const partner = match.users.find((u) => u && u._id.toString() !== user._id.toString());
                     if (partner) {
-                        const presence = getPresenceForViewer(user, partner, true);
+                        const presence = await getPresenceForViewer(user, partner, true);
                         io.to(`user:${partner._id.toString()}`).emit("presence:update", {
                             userId: user._id.toString(),
                             isOnline: presence.isOnline,

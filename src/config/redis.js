@@ -37,6 +37,21 @@ export function isSocketRedisAdapterEnabled(env = process.env) {
 }
 
 /**
+ * Checks whether Redis-backed online presence tracking is explicitly enabled.
+ * Defaults to false if PRESENCE_REDIS_ENABLED is absent, empty, or false.
+ *
+ * @param {Object} [env=process.env]
+ * @returns {boolean}
+ */
+export function isPresenceRedisEnabled(env = process.env) {
+    if (!env || !env.PRESENCE_REDIS_ENABLED) {
+        return false;
+    }
+    const val = String(env.PRESENCE_REDIS_ENABLED).trim().toLowerCase();
+    return val === "true" || val === "1";
+}
+
+/**
  * Validates Redis configuration settings.
  * When REDIS_ENABLED=true, requires a valid redis:// or rediss:// connection URL.
  * Never includes raw URL, usernames, or passwords in error messages.
@@ -115,6 +130,56 @@ export function validateSocketRedisAdapterConfig(env = process.env) {
     return {
         enabled: true,
         key,
+        redisConfig,
+    };
+}
+
+/**
+ * Validates Presence Redis configuration settings.
+ * When PRESENCE_REDIS_ENABLED=true, requires REDIS_ENABLED=true
+ * and a valid REDIS_URL via validateRedisConfig.
+ *
+ * @param {Object} [env=process.env]
+ * @returns {{ enabled: boolean, leaseTtlMs: number, renewalIntervalMs: number, keyPrefix: string, redisConfig?: object }}
+ * @throws {Error} Sanitized configuration error
+ */
+export function validatePresenceRedisConfig(env = process.env) {
+    if (!isPresenceRedisEnabled(env)) {
+        return {
+            enabled: false,
+            leaseTtlMs: 30000,
+            renewalIntervalMs: 10000,
+            keyPrefix: "engaze:presence",
+        };
+    }
+
+    if (!isRedisEnabled(env)) {
+        throw new Error(
+            "Invalid Presence Redis configuration: REDIS_ENABLED=true is required when PRESENCE_REDIS_ENABLED=true."
+        );
+    }
+
+    const redisConfig = validateRedisConfig(env);
+
+    let leaseTtlMs = 30000;
+    if (env.PRESENCE_LEASE_TTL_MS) {
+        const parsed = parseInt(env.PRESENCE_LEASE_TTL_MS, 10);
+        if (!isNaN(parsed) && parsed > 0) leaseTtlMs = parsed;
+    }
+
+    let renewalIntervalMs = 10000;
+    if (env.PRESENCE_RENEWAL_INTERVAL_MS) {
+        const parsed = parseInt(env.PRESENCE_RENEWAL_INTERVAL_MS, 10);
+        if (!isNaN(parsed) && parsed > 0) renewalIntervalMs = parsed;
+    }
+
+    const keyPrefix = env.PRESENCE_REDIS_KEY_PREFIX ? String(env.PRESENCE_REDIS_KEY_PREFIX).trim() : "engaze:presence";
+
+    return {
+        enabled: true,
+        leaseTtlMs,
+        renewalIntervalMs,
+        keyPrefix: keyPrefix || "engaze:presence",
         redisConfig,
     };
 }

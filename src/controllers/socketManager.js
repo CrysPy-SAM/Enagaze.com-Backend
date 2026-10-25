@@ -114,11 +114,11 @@ export const connectToSocket = (server) => {
 
     ioInstance = io;
 
-    io.on("connection", (socket) => {
+    io.on("connection", async (socket) => {
         // Automatically join authenticated user room for real-time delivery and match notifications
         if (socket.userId) {
             socket.join(`user:${socket.userId.toString()}`);
-            const wasOffline = userConnected(socket.userId, socket.id);
+            const wasOffline = await userConnected(socket.userId, socket.id);
             if (wasOffline) {
                 broadcastPresenceUpdate(io, socket.userId, true).catch((err) => {
                     console.error("Error broadcasting online presence:", err);
@@ -160,7 +160,7 @@ export const connectToSocket = (server) => {
                     status: "active",
                 });
 
-                const presence = getPresenceForViewer(targetUser, viewerUser, Boolean(isMatch));
+                const presence = await getPresenceForViewer(targetUser, viewerUser, Boolean(isMatch));
                 if (typeof ack === "function") {
                     ack({ success: true, userId: targetUserId, ...presence });
                 }
@@ -1069,13 +1069,13 @@ export const connectToSocket = (server) => {
             if (typeof ack === "function") ack({ success: true });
         });
 
-        socket.on("disconnect", () => {
+        socket.on("disconnect", async () => {
             // Clean up rate limits on socket disconnect
             clearSocketRateLimits(socket.id);
 
             // Handle presence tracking with disconnect grace period
             if (socket.userId) {
-                userDisconnected(socket.userId, socket.id, async (lastSeenAt) => {
+                await userDisconnected(socket.userId, socket.id, async (lastSeenAt) => {
                     try {
                         await User.findByIdAndUpdate(socket.userId, { lastSeenAt });
                         await broadcastPresenceUpdate(io, socket.userId, false, lastSeenAt);
