@@ -14,8 +14,33 @@ import { safeLean } from "../utils/queryHelper.js";
  * @param {string} text
  * @returns {string}
  */
-function escapeRegex(text) {
+export function escapeRegex(text) {
     return text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+}
+
+/**
+ * Deterministically compares two scored candidate search items.
+ * 1. Higher relevance score first (descending).
+ * 2. Alphabetical display name as primary tie-breaker (ascending).
+ * 3. User ID string as secondary deterministic tie-breaker (ascending).
+ *
+ * @param {{ user: Object, score: number }} a
+ * @param {{ user: Object, score: number }} b
+ * @returns {number}
+ */
+export function compareSearchItems(a, b) {
+    if (b.score !== a.score) {
+        return b.score - a.score;
+    }
+    const nameA = a.user?.name || "";
+    const nameB = b.user?.name || "";
+    const nameCmp = nameA.localeCompare(nameB);
+    if (nameCmp !== 0) {
+        return nameCmp;
+    }
+    const idA = a.user?._id ? a.user._id.toString() : "";
+    const idB = b.user?._id ? b.user._id.toString() : "";
+    return idA.localeCompare(idB);
 }
 
 /**
@@ -116,8 +141,21 @@ export const searchUsers = async (req, res) => {
             });
         }
 
-        // Limit query length to 50 characters to prevent ReDoS / excessive execution
-        const sanitizedTerm = rawQuery.slice(0, 50);
+        // Sanitize and limit query length to 50 characters to prevent ReDoS / excessive execution
+        const sanitizedTerm = rawQuery.replace(/[\0\x08\x09\x1a\n\r]/g, "").slice(0, 50).trim();
+        if (!sanitizedTerm) {
+            return res.status(httpStatus.OK).json({
+                success: true,
+                users: [],
+                pagination: {
+                    page,
+                    limit,
+                    total: 0,
+                    hasMore: false,
+                },
+            });
+        }
+
         const escapedTerm = escapeRegex(sanitizedTerm);
         const searchRegex = new RegExp(escapedTerm, "i");
 
@@ -126,7 +164,7 @@ export const searchUsers = async (req, res) => {
         const excludedIds = [currentUserId, ...blockedIds];
 
         // Query candidates: only complete profiles, excluding self and blocked accounts
-        const candidates = await User.find({
+        const candidateFilter = {
             _id: { $nin: excludedIds },
             isProfileComplete: true,
             $or: [
@@ -135,26 +173,82 @@ export const searchUsers = async (req, res) => {
                 { bio: { $regex: searchRegex } },
                 { interests: { $regex: searchRegex } },
             ],
-        })
-            .select("_id name username bio photos interests dob gender isProfileComplete")
-            .lean();
+        };
 
-        // Score candidates and sort by relevance descending
-        const scoredCandidates = candidates.map((user) => ({
-            user,
-            score: computeSearchRelevance(user, sanitizedTerm),
-        }));
-
-        scoredCandidates.sort((a, b) => {
-            if (b.score !== a.score) {
-                return b.score - a.score;
-            }
-            return (a.user.name || "").localeCompare(b.user.name || "");
-        });
-
-        const total = scoredCandidates.length;
         const startIndex = (page - 1) * limit;
-        const pageCandidates = scoredCandidates
+        const maxKeep = startIndex + limit;
+        let total = 0;
+        const topCandidates = [];
+
+        // Helper to process a candidate and maintain the bounded top-K collection in memory
+        const processCandidate = (user) => {
+            if (!user) return;
+            total++;
+            const score = computeSearchRelevance(user, sanitizedTerm);
+            const candidate = { user, score };
+
+            if (topCandidates.length < maxKeep) {
+                // Binary search insertion into sorted array
+                let low = 0;
+                let high = topCandidates.length;
+                while (low < high) {
+                    const mid = (low + high) >> 1;
+                    if (compareSearchItems(candidate, topCandidates[mid]) < 0) {
+                        high = mid;
+                    } else {
+                        low = mid + 1;
+                    }
+                }
+                topCandidates.splice(low, 0, candidate);
+            } else if (compareSearchItems(candidate, topCandidates[maxKeep - 1]) < 0) {
+                // Candidate ranks higher than the current worst element in top-K
+                let low = 0;
+                let high = maxKeep - 1;
+                while (low < high) {
+                    const mid = (low + high) >> 1;
+                    if (compareSearchItems(candidate, topCandidates[mid]) < 0) {
+                        high = mid;
+                    } else {
+                        low = mid + 1;
+                    }
+                }
+                topCandidates.splice(low, 0, candidate);
+                topCandidates.pop(); // Evict lowest-ranked candidate to preserve bounded memory
+            }
+        };
+
+        const query = User.find(candidateFilter)
+            .select("_id name username bio photos interests dob gender isProfileComplete");
+
+        // Use streaming cursor when available (MongoDB/Mongoose), fallback for query mocks
+        let cursor = null;
+        if (typeof query.cursor === "function") {
+            cursor = query.lean().cursor({ batchSize: 100 });
+        } else if (typeof query.lean === "function") {
+            const leanObj = query.lean();
+            if (leanObj && typeof leanObj.cursor === "function") {
+                cursor = leanObj.cursor({ batchSize: 100 });
+            }
+        }
+
+        if (cursor) {
+            try {
+                for await (const user of cursor) {
+                    processCandidate(user);
+                }
+            } finally {
+                if (typeof cursor.close === "function") {
+                    await cursor.close();
+                }
+            }
+        } else {
+            const candidates = await safeLean(query);
+            for (const user of (Array.isArray(candidates) ? candidates : [])) {
+                processCandidate(user);
+            }
+        }
+
+        const pageCandidates = topCandidates
             .slice(startIndex, startIndex + limit)
             .map((item) => item.user);
 

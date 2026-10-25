@@ -571,20 +571,13 @@ const getLikesYou = async (req, res) => {
             Block.getBlockedUserIds(currentUser._id),
         ]);
 
-        const swipedUserIds = new Set(mySwipes.map((s) => s.toUser.toString()));
+        const swipedUserIds = new Set((mySwipes || []).map((s) => s.toUser?.toString()).filter(Boolean));
         const matchedUserIds = new Set(
-            existingMatches.flatMap((m) =>
-                m.users.filter((u) => u && u.toString() !== currentUser._id.toString()).map((u) => u.toString())
+            (existingMatches || []).flatMap((m) =>
+                (m.users || []).filter((u) => u && u.toString() !== currentUser._id.toString()).map((u) => u.toString())
             )
         );
-        const blockedSet = new Set(blockedIds.map((id) => id.toString()));
-
-        const excludedIds = Array.from(new Set([
-            currentUser._id.toString(),
-            ...swipedUserIds,
-            ...matchedUserIds,
-            ...blockedSet,
-        ]));
+        const blockedSet = new Set((blockedIds || []).map((id) => id.toString()));
 
         // 4. Construct base query for incoming likes
         const swipeFilter = {
@@ -592,19 +585,16 @@ const getLikesYou = async (req, res) => {
             action: "like",
         };
 
-        // 5. Bounded database batch-fetch and candidate filtering
-        // Processes candidates in bounded batches from MongoDB without loading the entire collection into memory.
-        const BATCH_SIZE = Math.min(100, Math.max(limit * 2, 40));
-        const MAX_TOTAL_SCANNED = 1000;
-
+        // 5. Streaming database batch-fetch and candidate evaluation
+        // Evaluates incoming likes in bounded batches (BATCH_SIZE = 100) using the compound index { toUser: 1, action: 1, createdAt: -1, _id: -1 }.
+        // Candidate profiles are streamed and evaluated per batch so that full profile trees are never accumulated in memory.
+        const BATCH_SIZE = 100;
         let currentSwipeSkip = 0;
-        let validSkipped = 0;
-        let validProfiles = [];
-        let totalScanned = 0;
+        let totalEligible = 0;
+        const validProfiles = [];
         const seenCandidateIds = new Set();
-        let totalEligibleCount = 0;
 
-        while (totalScanned < MAX_TOTAL_SCANNED) {
+        while (true) {
             let query = Swipe.find(swipeFilter);
             if (typeof query.sort === "function") {
                 query = query.sort({ createdAt: -1, _id: -1 });
@@ -634,12 +624,11 @@ const getLikesYou = async (req, res) => {
                 break;
             }
 
-            totalScanned += batchSwipes.length;
             currentSwipeSkip += batchSwipes.length;
 
-            // Deduplicate and filter out already swiped, matched, or blocked users
+            // Extract unique candidate IDs in this batch
             const batchCandidateIds = [];
-            const candidateLikedAtMap = new Map();
+            const batchTimestampMap = new Map();
 
             for (const s of batchSwipes) {
                 if (!s || !s.fromUser) continue;
@@ -653,24 +642,24 @@ const getLikesYou = async (req, res) => {
                     !seenCandidateIds.has(sIdStr)
                 ) {
                     seenCandidateIds.add(sIdStr);
-                    candidateLikedAtMap.set(sIdStr, s.createdAt);
+                    batchTimestampMap.set(sIdStr, s.createdAt);
                     batchCandidateIds.push(s.fromUser);
                 }
             }
 
             if (batchCandidateIds.length > 0) {
-                const candidateUsers = await safeLean(
+                const userDocs = await safeLean(
                     User.find({
                         _id: { $in: batchCandidateIds },
                         isProfileComplete: true,
                     }).select("name dob gender bio photos interests isProfileComplete")
                 );
 
-                const userMap = new Map((candidateUsers || []).map((u) => [u._id.toString(), u]));
+                const userMap = new Map((userDocs || []).map((u) => [u._id.toString(), u]));
 
-                for (const senderId of batchCandidateIds) {
-                    const senderStr = senderId.toString();
-                    const userDoc = userMap.get(senderStr);
+                for (const candidateId of batchCandidateIds) {
+                    const idStr = candidateId.toString();
+                    const userDoc = userMap.get(idStr);
                     if (!userDoc) continue;
 
                     const eligibility = checkUserEligibility(userDoc);
@@ -679,36 +668,25 @@ const getLikesYou = async (req, res) => {
                     const publicProfile = toPublicProfile(userDoc);
                     if (!publicProfile) continue;
 
-                    totalEligibleCount++;
+                    totalEligible++;
 
-                    if (validSkipped < targetSkip) {
-                        validSkipped++;
-                    } else if (validProfiles.length < limit) {
+                    if (totalEligible > targetSkip && validProfiles.length < limit) {
                         validProfiles.push({
                             ...publicProfile,
-                            likedAt: candidateLikedAtMap.get(senderStr) || null,
+                            likedAt: batchTimestampMap.get(idStr) || null,
                         });
                     }
                 }
             }
 
-            // If we have collected enough profiles for this page and batch is complete
-            if (validProfiles.length >= limit && batchSwipes.length < BATCH_SIZE) {
-                break;
-            }
-
-            // Stop if the batch returned fewer items than BATCH_SIZE (database exhausted)
             if (batchSwipes.length < BATCH_SIZE) {
-                break;
-            }
-
-            // If we have filled the requested page, we can terminate early to avoid scanning more documents
-            if (validProfiles.length >= limit) {
                 break;
             }
         }
 
-        const total = totalEligibleCount;
+        const total = totalEligible;
+        const totalPages = Math.ceil(total / limit) || 1;
+        const hasMore = targetSkip + validProfiles.length < total;
 
         return res.status(httpStatus.OK).json({
             success: true,
@@ -717,7 +695,8 @@ const getLikesYou = async (req, res) => {
                 page,
                 limit,
                 total,
-                totalPages: Math.ceil(total / limit) || 1,
+                totalPages,
+                hasMore,
             },
         });
     } catch (e) {

@@ -18,6 +18,14 @@ import webrtcRoutes from "./routes/webrtc.routes.js";
 import notificationRoutes from "./routes/notification.routes.js";
 import { validateJwtConfig } from "./config/jwt.js";
 import { getMongoConnectionOptions } from "./config/database.js";
+import { isRedisEnabled, validateRedisConfig, isSocketRedisAdapterEnabled, validateSocketRedisAdapterConfig } from "./config/redis.js";
+import { initRedisClient, closeRedisClient, getRedisClient, getRedisStatus } from "./services/redis.service.js";
+import {
+  initSocketRedisAdapter,
+  closeSocketRedisAdapter,
+  getSocketRedisAdapterClients,
+  getSocketRedisAdapterStatus,
+} from "./services/socketRedisAdapter.service.js";
 import { corsOptions } from "./config/cors.js";
 import { globalApiLimiter } from "./middlewares/rateLimiter.middleware.js";
 
@@ -87,19 +95,33 @@ app.get("/api/v1/health/live", (req, res) => {
   });
 });
 
-// Readiness check handler: confirms application dependencies (MongoDB) are ready to serve traffic
+// Readiness check handler: confirms application dependencies (MongoDB, Redis, Socket.IO adapter if enabled) are ready to serve traffic
 const handleReadinessCheck = (req, res) => {
   const isDbConnected = mongoose.connection.readyState === 1;
-  const isReady = isDbConnected && !isShuttingDown;
+  const redisStatus = getRedisStatus();
+  const isRedisReady = !redisStatus.enabled || redisStatus.ready;
+  const adapterStatus = getSocketRedisAdapterStatus();
+  const isAdapterReady = !adapterStatus.enabled || adapterStatus.ready;
+  const isReady = isDbConnected && isRedisReady && isAdapterReady && !isShuttingDown;
   const statusCode = isReady ? 200 : 503;
 
-  res.status(statusCode).json({
+  const payload = {
     status: isReady ? "healthy" : "unhealthy",
     ready: isReady,
     database: isDbConnected ? "connected" : "disconnected",
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
-  });
+  };
+
+  if (redisStatus.enabled) {
+    payload.redis = redisStatus.ready ? "connected" : "disconnected";
+  }
+
+  if (adapterStatus.enabled) {
+    payload.socketAdapter = adapterStatus.ready ? "connected" : "disconnected";
+  }
+
+  res.status(statusCode).json(payload);
 };
 
 // Backward-compatible primary health endpoint, Kubernetes readyz probe, and explicit readiness endpoints
@@ -227,9 +249,62 @@ const start = async ({ exitOnError = true } = {}) => {
   // Validate JWT configuration before establishing database or starting network listeners
   validateJwtConfig({ exitOnError });
 
+  // Initialize and verify Redis connection if enabled
+  let redisClient = null;
+  if (isRedisEnabled()) {
+    try {
+      validateRedisConfig();
+      redisClient = await initRedisClient();
+      console.log("✅ Redis connection established.");
+    } catch (redisErr) {
+      console.error(`❌ Fatal Redis Startup Error: ${redisErr.message}`);
+      try {
+        await closeRedisClient({ timeoutMs: 2000 });
+      } catch (_) {}
+      if (exitOnError) {
+        process.exit(1);
+      }
+      throw redisErr;
+    }
+  }
+
+  // Initialize and verify Socket.IO Redis adapter if enabled
+  let socketAdapterClients = null;
+  if (isSocketRedisAdapterEnabled()) {
+    try {
+      validateSocketRedisAdapterConfig();
+      socketAdapterClients = await initSocketRedisAdapter(io);
+      console.log("✅ Socket.IO Redis adapter attached.");
+    } catch (adapterErr) {
+      console.error(`❌ Fatal Socket.IO Redis Adapter Startup Error: ${adapterErr.message}`);
+      try {
+        await closeSocketRedisAdapter({ timeoutMs: 2000 });
+      } catch (_) {}
+      if (redisClient) {
+        try {
+          await closeRedisClient({ timeoutMs: 2000 });
+        } catch (_) {}
+      }
+      if (exitOnError) {
+        process.exit(1);
+      }
+      throw adapterErr;
+    }
+  }
+
   if (!process.env.MONGO_URI || !process.env.MONGO_URI.trim()) {
     const errorMsg = "Fatal Startup Error: MONGO_URI environment variable is required to start the server.";
     console.error(`❌ ${errorMsg}`);
+    if (socketAdapterClients) {
+      try {
+        await closeSocketRedisAdapter({ timeoutMs: 2000 });
+      } catch (_) {}
+    }
+    if (redisClient) {
+      try {
+        await closeRedisClient({ timeoutMs: 2000 });
+      } catch (_) {}
+    }
     if (exitOnError) {
       process.exit(1);
     }
@@ -242,6 +317,16 @@ const start = async ({ exitOnError = true } = {}) => {
     mongoOptions = getMongoConnectionOptions();
   } catch (configErr) {
     console.error(`❌ Fatal Startup Configuration Error: ${configErr.message}`);
+    if (socketAdapterClients) {
+      try {
+        await closeSocketRedisAdapter({ timeoutMs: 2000 });
+      } catch (_) {}
+    }
+    if (redisClient) {
+      try {
+        await closeRedisClient({ timeoutMs: 2000 });
+      } catch (_) {}
+    }
     if (exitOnError) {
       process.exit(1);
     }
@@ -256,6 +341,16 @@ const start = async ({ exitOnError = true } = {}) => {
   } catch (dbErr) {
     const safeMsg = formatSafeDatabaseError(dbErr);
     console.error(`❌ Fatal MongoDB Startup Connection Error: ${safeMsg}`);
+    if (socketAdapterClients) {
+      try {
+        await closeSocketRedisAdapter({ timeoutMs: 2000 });
+      } catch (_) {}
+    }
+    if (redisClient) {
+      try {
+        await closeRedisClient({ timeoutMs: 2000 });
+      } catch (_) {}
+    }
     if (exitOnError) {
       process.exit(1);
     }
@@ -272,13 +367,23 @@ const start = async ({ exitOnError = true } = {}) => {
       });
     });
 
-    return { app, server, connectionDb };
+    return { app, server, connectionDb, redisClient, socketAdapterClients };
   } catch (listenErr) {
     const listenCode = (listenErr && listenErr.code) ? ` [${listenErr.code}]` : "";
     console.error(`❌ Fatal HTTP Server Listen Error:${listenCode} Failed to bind port ${app.get("port")}.`);
     if (mongoose.connection.readyState !== 0) {
       try {
         await mongoose.disconnect();
+      } catch (_) {}
+    }
+    if (socketAdapterClients) {
+      try {
+        await closeSocketRedisAdapter({ timeoutMs: 2000 });
+      } catch (_) {}
+    }
+    if (redisClient) {
+      try {
+        await closeRedisClient({ timeoutMs: 2000 });
       } catch (_) {}
     }
     if (exitOnError) {
@@ -370,7 +475,30 @@ const gracefulShutdown = async (
     // 3. Await HTTP server drain completion
     await serverClosePromise;
 
-    // 4. Disconnect Mongoose after network listeners and sockets are closed
+    // 4. Disconnect Socket.IO Redis adapter and Redis client cleanly if initialized
+    try {
+      const adapterStatus = getSocketRedisAdapterStatus();
+      if (adapterStatus.enabled) {
+        const adapterTimeout = Math.min(2000, Math.floor(timeoutMs / 4));
+        await closeSocketRedisAdapter({ timeoutMs: adapterTimeout });
+        console.log("Socket.IO Redis adapter pub/sub connections closed cleanly.");
+      }
+    } catch (adapterCloseErr) {
+      console.error("Error closing Socket.IO Redis adapter:", adapterCloseErr.message);
+    }
+
+    try {
+      const redisStatus = getRedisStatus();
+      if (redisStatus.enabled && getRedisClient()) {
+        const redisTimeout = Math.min(2000, Math.floor(timeoutMs / 3));
+        await closeRedisClient({ timeoutMs: redisTimeout });
+        console.log("Redis connection closed cleanly.");
+      }
+    } catch (redisCloseErr) {
+      console.error("Error closing Redis client:", redisCloseErr.message);
+    }
+
+    // 5. Disconnect Mongoose after network listeners and sockets are closed
     if (mongoose.connection.readyState !== 0) {
       await mongoose.disconnect();
       console.log("Mongoose connection closed cleanly.");
@@ -413,4 +541,26 @@ if (isMainModule) {
 const _resetShutdownForTesting = () => { isShuttingDown = false; };
 const _setIsShuttingDownForTesting = (val) => { isShuttingDown = Boolean(val); };
 
-export { app, server, start, gracefulShutdown, formatSafeDatabaseError, getMongoConnectionOptions, _resetShutdownForTesting, _setIsShuttingDownForTesting };
+export {
+  app,
+  server,
+  io,
+  start,
+  gracefulShutdown,
+  formatSafeDatabaseError,
+  getMongoConnectionOptions,
+  isRedisEnabled,
+  validateRedisConfig,
+  initRedisClient,
+  closeRedisClient,
+  getRedisClient,
+  getRedisStatus,
+  isSocketRedisAdapterEnabled,
+  validateSocketRedisAdapterConfig,
+  initSocketRedisAdapter,
+  closeSocketRedisAdapter,
+  getSocketRedisAdapterClients,
+  getSocketRedisAdapterStatus,
+  _resetShutdownForTesting,
+  _setIsShuttingDownForTesting,
+};

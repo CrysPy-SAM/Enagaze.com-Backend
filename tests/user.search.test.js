@@ -627,4 +627,315 @@ describe("Instagram-Inspired Search and People Discovery Suite", () => {
                 .expect(401);
         });
     });
+
+    describe("10. Phase 2F.2: Bounded Memory, Cursor Streaming & Deterministic Ranking Suite", () => {
+        it("handles large candidate sets (1,000+ records) and returns exact top-K relevance ranking and exact total", async () => {
+            const originalUserFind = User.find;
+            const LARGE_COUNT = 1000;
+            const syntheticUsers = [];
+
+            // Seed 1,000 synthetic candidates:
+            // - 10 exact username matches: "test_dev" (score 100)
+            // - 20 username prefix matches: "test_dev_prefix_..." (score 70)
+            // - 30 display name prefix matches: "Test Developer ..." (score 50)
+            // - 940 bio keyword matches: bio contains "test_dev" (score 10)
+            for (let i = 1; i <= LARGE_COUNT; i++) {
+                let username;
+                let name;
+                let bio = "Casual user";
+
+                if (i <= 10) {
+                    username = "test_dev";
+                    name = `Exact Dev ${String(i).padStart(3, "0")}`;
+                } else if (i <= 30) {
+                    username = `test_dev_prefix_${String(i).padStart(3, "0")}`;
+                    name = `Prefix User ${String(i).padStart(3, "0")}`;
+                } else if (i <= 60) {
+                    username = `user_${String(i).padStart(4, "0")}`;
+                    name = `Test_Dev User ${String(i).padStart(3, "0")}`;
+                } else {
+                    username = `unrelated_${String(i).padStart(4, "0")}`;
+                    name = `Regular User ${String(i).padStart(3, "0")}`;
+                    bio = `Experienced test_dev engineer and programmer`;
+                }
+
+                syntheticUsers.push({
+                    _id: new mongoose.Types.ObjectId(`65df00000000000000${String(i).padStart(6, "0")}`),
+                    name,
+                    username,
+                    dob: new Date("1995-01-01"),
+                    gender: "male",
+                    bio,
+                    photos: [`https://example.com/photo_${i}.jpg`],
+                    interests: ["coding"],
+                    isProfileComplete: true,
+                });
+            }
+
+            try {
+                User.find = () => ({
+                    select: () => ({
+                        lean: () => Promise.resolve(syntheticUsers),
+                    }),
+                });
+
+                // Request page 1 with limit 20
+                const res1 = await request(app)
+                    .get("/api/v1/users/search?q=test_dev&page=1&limit=20")
+                    .set("Authorization", `Bearer ${tokenA}`)
+                    .expect(200);
+
+                assert.equal(res1.body.success, true);
+                assert.equal(res1.body.users.length, 20);
+                assert.equal(res1.body.pagination.total, 1000, "Exact total must be 1,000 matching users");
+                assert.equal(res1.body.pagination.page, 1);
+                assert.equal(res1.body.pagination.limit, 20);
+                assert.equal(res1.body.pagination.hasMore, true);
+
+                // Top 10 must be the exact username matches (score 100)
+                for (let i = 0; i < 10; i++) {
+                    assert.equal(res1.body.users[i].username, "test_dev");
+                }
+                // Next 10 (indices 10..19) must be prefix matches (score 70)
+                for (let i = 10; i < 20; i++) {
+                    assert.ok(res1.body.users[i].username.startsWith("test_dev_prefix_"));
+                }
+
+                // Request page 2 with limit 20
+                const res2 = await request(app)
+                    .get("/api/v1/users/search?q=test_dev&page=2&limit=20")
+                    .set("Authorization", `Bearer ${tokenA}`)
+                    .expect(200);
+
+                assert.equal(res2.body.users.length, 20);
+                assert.equal(res2.body.pagination.page, 2);
+                assert.equal(res2.body.pagination.total, 1000);
+                assert.equal(res2.body.pagination.hasMore, true);
+
+                // Page 2 should have the remaining 10 prefix matches (indices 0..9)
+                for (let i = 0; i < 10; i++) {
+                    assert.ok(res2.body.users[i].username.startsWith("test_dev_prefix_"));
+                }
+                // And the first 10 display name prefix matches (indices 10..19)
+                for (let i = 10; i < 20; i++) {
+                    assert.ok(res2.body.users[i].name.startsWith("Test_Dev User"));
+                }
+
+                // Verify zero overlap between page 1 and page 2
+                const page1Ids = new Set(res1.body.users.map((u) => u._id));
+                for (const u of res2.body.users) {
+                    assert.ok(!page1Ids.has(u._id), `User ${u._id} must not appear on both page 1 and page 2`);
+                }
+            } finally {
+                User.find = originalUserFind;
+            }
+        });
+
+        it("preserves deterministic tie-breaking using user ID when relevance scores and display names are identical", async () => {
+            const originalUserFind = User.find;
+            const tiedUsers = [];
+
+            for (let i = 1; i <= 30; i++) {
+                tiedUsers.push({
+                    _id: new mongoose.Types.ObjectId(`65df00000000000000${String(i).padStart(6, "0")}`),
+                    name: "Identical Name",
+                    username: `identical_user_${String(i).padStart(3, "0")}`,
+                    dob: new Date("1995-01-01"),
+                    gender: "male",
+                    bio: "Identical Bio",
+                    photos: [],
+                    interests: ["music"],
+                    isProfileComplete: true,
+                });
+            }
+
+            try {
+                User.find = () => ({
+                    select: () => ({
+                        lean: () => Promise.resolve(tiedUsers),
+                    }),
+                });
+
+                const res1 = await request(app)
+                    .get("/api/v1/users/search?q=identical&page=1&limit=20")
+                    .set("Authorization", `Bearer ${tokenA}`)
+                    .expect(200);
+
+                const res2 = await request(app)
+                    .get("/api/v1/users/search?q=identical&page=2&limit=20")
+                    .set("Authorization", `Bearer ${tokenA}`)
+                    .expect(200);
+
+                assert.equal(res1.body.users.length, 20);
+                assert.equal(res2.body.users.length, 10);
+                assert.equal(res2.body.pagination.hasMore, false);
+
+                // Zero duplicate IDs across consecutive pages
+                const p1Ids = new Set(res1.body.users.map((u) => u._id));
+                for (const u of res2.body.users) {
+                    assert.ok(!p1Ids.has(u._id), "Deterministic tie-breaking must prevent overlaps across pages");
+                }
+            } finally {
+                User.find = originalUserFind;
+            }
+        });
+
+        it("safely streams candidates using MongoDB cursor and ensures cursor.close() is called on completion", async () => {
+            const originalUserFind = User.find;
+            let cursorClosed = false;
+
+            const cursorUsers = [
+                {
+                    _id: new mongoose.Types.ObjectId("65df00000000000000000001"),
+                    name: "Streamed User 1",
+                    username: "stream_one",
+                    dob: new Date("1995-01-01"),
+                    gender: "female",
+                    bio: "streaming tester",
+                    photos: [],
+                    interests: [],
+                    isProfileComplete: true,
+                },
+                {
+                    _id: new mongoose.Types.ObjectId("65df00000000000000000002"),
+                    name: "Streamed User 2",
+                    username: "stream_two",
+                    dob: new Date("1996-01-01"),
+                    gender: "male",
+                    bio: "streaming tester",
+                    photos: [],
+                    interests: [],
+                    isProfileComplete: true,
+                },
+            ];
+
+            try {
+                User.find = () => ({
+                    select: () => ({
+                        lean: () => ({
+                            cursor: () => ({
+                                async *[Symbol.asyncIterator]() {
+                                    for (const u of cursorUsers) {
+                                        yield u;
+                                    }
+                                },
+                                close: async () => {
+                                    cursorClosed = true;
+                                },
+                            }),
+                        }),
+                    }),
+                });
+
+                const res = await request(app)
+                    .get("/api/v1/users/search?q=stream&page=1&limit=20")
+                    .set("Authorization", `Bearer ${tokenA}`)
+                    .expect(200);
+
+                assert.equal(res.body.success, true);
+                assert.equal(res.body.users.length, 2);
+                assert.equal(res.body.pagination.total, 2);
+                assert.equal(cursorClosed, true, "cursor.close() must be invoked on stream completion");
+            } finally {
+                User.find = originalUserFind;
+            }
+        });
+
+        it("ensures cursor.close() is called in finally block even when processing throws a database error", async () => {
+            const originalUserFind = User.find;
+            let cursorClosed = false;
+
+            try {
+                User.find = () => ({
+                    select: () => ({
+                        lean: () => ({
+                            cursor: () => ({
+                                async *[Symbol.asyncIterator]() {
+                                    yield { _id: new mongoose.Types.ObjectId(), name: "First" };
+                                    throw new Error("Simulated MongoDB stream read error");
+                                },
+                                close: async () => {
+                                    cursorClosed = true;
+                                },
+                            }),
+                        }),
+                    }),
+                });
+
+                const res = await request(app)
+                    .get("/api/v1/users/search?q=errortest")
+                    .set("Authorization", `Bearer ${tokenA}`)
+                    .expect(500);
+
+                assert.equal(res.body.success, false);
+                assert.equal(res.body.message, "Failed to search users. Please try again.");
+                assert.equal(cursorClosed, true, "cursor.close() must be called in finally block during errors");
+            } finally {
+                User.find = originalUserFind;
+            }
+        });
+
+        it("sanitizes control characters and null bytes safely without crashing", async () => {
+            const res = await request(app)
+                .get("/api/v1/users/search?q=%00%08%00")
+                .set("Authorization", `Bearer ${tokenA}`)
+                .expect(200);
+
+            assert.equal(res.body.success, true);
+            assert.equal(res.body.users.length, 0);
+            assert.equal(res.body.pagination.total, 0);
+        });
+
+        it("measures synthetic benchmark on 1,000 candidate records and logs runtime and memory metrics", async () => {
+            const originalUserFind = User.find;
+            const BENCHMARK_COUNT = 1000;
+            const benchmarkUsers = [];
+
+            for (let i = 1; i <= BENCHMARK_COUNT; i++) {
+                benchmarkUsers.push({
+                    _id: new mongoose.Types.ObjectId(`65df00000000000000${String(i).padStart(6, "0")}`),
+                    name: `Benchmarker ${i}`,
+                    username: `bench_user_${i}`,
+                    dob: new Date("1995-01-01"),
+                    gender: "male",
+                    bio: `Bio description with benchmark_term keyword for user ${i}`,
+                    photos: [`https://example.com/p_${i}.jpg`],
+                    interests: ["benchmarking", "testing"],
+                    isProfileComplete: true,
+                });
+            }
+
+            try {
+                User.find = () => ({
+                    select: () => ({
+                        lean: () => Promise.resolve(benchmarkUsers),
+                    }),
+                });
+
+                if (global.gc) {
+                    global.gc();
+                }
+                const heapBefore = process.memoryUsage().heapUsed;
+                const startTime = performance.now();
+
+                const res = await request(app)
+                    .get("/api/v1/users/search?q=benchmark_term&page=1&limit=20")
+                    .set("Authorization", `Bearer ${tokenA}`)
+                    .expect(200);
+
+                const endTime = performance.now();
+                const heapAfter = process.memoryUsage().heapUsed;
+                const durationMs = Math.round(endTime - startTime);
+                const heapDeltaKb = Math.round((heapAfter - heapBefore) / 1024);
+
+                assert.equal(res.body.success, true);
+                assert.equal(res.body.users.length, 20);
+                assert.equal(res.body.pagination.total, 1000);
+
+                console.log(`[Phase2F2-Benchmark] datasetSize=${BENCHMARK_COUNT} returnedPage=20 runtimeMs=${durationMs} heapDeltaKb=${heapDeltaKb}`);
+            } finally {
+                User.find = originalUserFind;
+            }
+        });
+    });
 });
