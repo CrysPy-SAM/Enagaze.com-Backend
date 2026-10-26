@@ -30,6 +30,7 @@ import {
     closeQueueService,
     getQueueServiceStatus,
     enqueueMediaCleanup,
+    generateMediaCleanupJobId,
     _testingQueueService,
 } from "../src/services/queue.service.js";
 import { processMediaCleanupJob } from "../src/workers/mediaCleanup.worker.js";
@@ -264,7 +265,7 @@ describe("Phase 4A: BullMQ Background Worker Infrastructure Suite", () => {
             assert.deepEqual(res, { enqueued: false });
         });
 
-        it("Requirement 16: enqueueMediaCleanup generates deterministic jobId and uses default retention", async () => {
+        it("Requirement 16: enqueueMediaCleanup generates deterministic colon-free jobId and uses default retention", async () => {
             process.env.BULLMQ_ENABLED = "true";
             process.env.REDIS_ENABLED = "true";
             process.env.REDIS_URL = "redis://127.0.0.1:6379";
@@ -281,13 +282,16 @@ describe("Phase 4A: BullMQ Background Worker Infrastructure Suite", () => {
             _testingQueueService.setMockQueue(QUEUE_NAMES.MEDIA_CLEANUP, mockQueue);
 
             const testKey = "profile-photos/user123/avatar_1.webp";
+            const expectedJobId = generateMediaCleanupJobId(testKey, "user123");
             const res = await enqueueMediaCleanup({
                 key: testKey,
                 userId: "user123",
             });
 
             assert.equal(res.enqueued, true);
-            assert.equal(res.jobId, `media-cleanup:${encodeURIComponent(testKey)}`);
+            assert.equal(res.jobId, expectedJobId);
+            assert.ok(!res.jobId.includes(":"), "Job ID must not contain colon character");
+            assert.ok(res.jobId.startsWith("media-cleanup-"));
             assert.equal(capturedJob.name, "cleanup-object");
             assert.equal(capturedJob.data.key, testKey);
             assert.equal(capturedJob.data.userId, "user123");
@@ -295,6 +299,35 @@ describe("Phase 4A: BullMQ Background Worker Infrastructure Suite", () => {
             assert.deepEqual(capturedJob.opts.backoff, DEFAULT_JOB_OPTIONS.backoff);
             assert.deepEqual(capturedJob.opts.removeOnComplete, DEFAULT_JOB_OPTIONS.removeOnComplete);
             assert.deepEqual(capturedJob.opts.removeOnFail, DEFAULT_JOB_OPTIONS.removeOnFail);
+        });
+
+        it("Requirement 16b: generateMediaCleanupJobId never contains a colon separator", () => {
+            const keys = [
+                "profile-photos/user:123/pic.jpg",
+                "profile-photos/u1/photo:name:with:colons.webp",
+                "key-without-colons.png",
+            ];
+            for (const k of keys) {
+                const id = generateMediaCleanupJobId(k, "user:123");
+                assert.ok(!id.includes(":"), `Job ID '${id}' must not contain colons`);
+                assert.match(id, /^media-cleanup-[0-9a-f]{64}$/);
+            }
+        });
+
+        it("Requirement 16c: Identical cleanup operations produce identical deterministic job IDs", () => {
+            const id1 = generateMediaCleanupJobId("profile-photos/u1/pic.jpg", "u1");
+            const id2 = generateMediaCleanupJobId("profile-photos/u1/pic.jpg", "u1");
+            assert.equal(id1, id2);
+        });
+
+        it("Requirement 16d: Distinct user or key combinations produce distinct job IDs without collision", () => {
+            const id1 = generateMediaCleanupJobId("profile-photos/u1/pic1.jpg", "u1");
+            const id2 = generateMediaCleanupJobId("profile-photos/u1/pic2.jpg", "u1");
+            const id3 = generateMediaCleanupJobId("profile-photos/u2/pic1.jpg", "u2");
+
+            assert.notEqual(id1, id2);
+            assert.notEqual(id1, id3);
+            assert.notEqual(id2, id3);
         });
 
         it("Requirement 17: enqueueMediaCleanup rejects with error if key is missing or invalid", async () => {
@@ -499,6 +532,37 @@ describe("Phase 4A: BullMQ Background Worker Infrastructure Suite", () => {
             assert.equal(enqueuedKeys[0], "profile-photos/user1/pic2.jpg");
             // Inline delete was NOT called for pic2
             assert.equal(inlineDeleted.length, 1);
+        });
+
+        it("Requirement 27b: dispatchMediaCleanup falls back to inline deletion when queue enqueue throws error", async () => {
+            process.env.BULLMQ_ENABLED = "true";
+            process.env.REDIS_ENABLED = "true";
+            process.env.REDIS_URL = "redis://127.0.0.1:6379";
+
+            let fallbackDeleted = [];
+            const mockAdapter = {
+                deleteObject: async (k) => fallbackDeleted.push(k),
+            };
+
+            // Force enqueue to fail (e.g. simulated network partition)
+            _testingQueueService.setMockQueue(QUEUE_NAMES.MEDIA_CLEANUP, {
+                add: async () => {
+                    throw new Error("Redis ECONNREFUSED");
+                },
+                close: async () => {},
+            });
+
+            await assert.doesNotReject(async () => {
+                await dispatchMediaCleanup({
+                    key: "profile-photos/user1/pic3.jpg",
+                    userId: "user1",
+                    adapter: mockAdapter,
+                });
+            });
+
+            // Inline delete was invoked as reliable fallback
+            assert.equal(fallbackDeleted.length, 1);
+            assert.equal(fallbackDeleted[0], "profile-photos/user1/pic3.jpg");
         });
 
         it("Requirement 28: Liveness probe (/health) remains 200 OK independently of BullMQ state", async () => {

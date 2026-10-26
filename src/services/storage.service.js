@@ -618,7 +618,10 @@ export async function dispatchMediaCleanup({ key, userId, adapter }) {
     }
     // Fallback or disabled path: delete inline
     try {
-        await adapter.deleteObject(key);
+        const effectiveAdapter = adapter || getStorageAdapter();
+        if (effectiveAdapter && typeof effectiveAdapter.deleteObject === "function") {
+            await effectiveAdapter.deleteObject(key);
+        }
     } catch (cleanupErr) {
         console.warn("Non-fatal storage object cleanup error:", cleanupErr?.message);
     }

@@ -9,6 +9,7 @@
  * 5. Provides safe, reliable enqueuing for background tasks (e.g. media cleanup).
  */
 
+import crypto from "node:crypto";
 import { Queue } from "bullmq";
 import {
     isBullMQEnabled,
@@ -154,11 +155,32 @@ export const getQueue = (queueName) => {
 // =============================================================================
 
 /**
+ * Generates a deterministic, colon-free custom job ID for media cleanup.
+ * BullMQ custom job IDs must not contain colons (':').
+ *
+ * Uses SHA-256 over normalized userId and key to guarantee uniqueness
+ * across distinct user/object pairs without leaking raw paths or keys.
+ *
+ * @param {string} key - S3 object key
+ * @param {string} [userId] - Owning user ID
+ * @returns {string} Safe custom job ID (e.g. "media-cleanup-a1b2c3d4...")
+ */
+export const generateMediaCleanupJobId = (key, userId = "") => {
+    const normalizedUser = (userId || "").toString().trim();
+    const normalizedKey = (key || "").toString().trim();
+    const hash = crypto
+        .createHash("sha256")
+        .update(`${normalizedUser}|${normalizedKey}`)
+        .digest("hex");
+    return `media-cleanup-${hash}`;
+};
+
+/**
  * Enqueues a non-critical media cleanup task to remove an orphaned or replaced
  * photo from storage (e.g. AWS S3).
  *
- * Uses deterministic job IDs (`media-cleanup:${encodeURIComponent(key)}`) to
- * prevent duplicate cleanup jobs for the same storage key.
+ * Uses deterministic, colon-free job IDs derived from SHA-256 hash of userId + key
+ * to prevent duplicate cleanup jobs without violating BullMQ key syntax rules.
  *
  * @param {Object} params
  * @param {string} params.key - Storage object key (e.g. "profile-photos/<userId>/<file>")
@@ -177,7 +199,7 @@ export const enqueueMediaCleanup = async ({ key, userId }, jobOptions = {}) => {
 
     try {
         const queue = getQueue(QUEUE_NAMES.MEDIA_CLEANUP);
-        const jobId = `media-cleanup:${encodeURIComponent(key)}`;
+        const jobId = generateMediaCleanupJobId(key, userId);
 
         const minimalPayload = {
             key,
