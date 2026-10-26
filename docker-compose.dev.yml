@@ -1,0 +1,104 @@
+# Engaze.com — Dedicated Local Development Compose Setup (Phase 5A)
+#
+# Usage:
+#   Start services:  docker compose -f docker-compose.dev.yml up -d --build
+#   Check logs:      docker compose -f docker-compose.dev.yml logs -f
+#   Check health:    docker compose -f docker-compose.dev.yml ps
+#   Stop services:   docker compose -f docker-compose.dev.yml down
+#
+# Safety & Invariants:
+#   - Scoped project name 'engaze-dev' prevents naming collisions with other host projects.
+#   - Ports bound strictly to loopback (127.0.0.1) only.
+#   - API and Worker share the exact same multi-stage container image.
+#   - Dedicated Redis service on isolated internal bridge network.
+#   - Real MongoDB Atlas configuration is preserved via explicit environment variables.
+
+name: engaze-dev
+
+services:
+  # ---------------------------------------------------------------------------
+  # Dedicated Local Redis / Valkey Service
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: engaze-dev-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      # Bound strictly to loopback. Default host port 6382 avoids host collisions.
+      - "127.0.0.1:${DEV_REDIS_PORT:-6382}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 2s
+    networks:
+      - engaze-net
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Engaze Express API & Socket.IO Signaling Server
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: engaze-dev-api
+    ports:
+      # Bound strictly to loopback. Default host port 8000.
+      - "127.0.0.1:${PORT:-8000}:8000"
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 8000
+      JWT_SECRET: ${JWT_SECRET:-engaze_local_dev_only_jwt_secret_never_use_in_production}
+      MONGO_URI: ${MONGO_URI}
+      REDIS_ENABLED: "true"
+      REDIS_URL: "redis://redis:6379"
+      BULLMQ_ENABLED: "true"
+      BULLMQ_KEY_PREFIX: "engaze:dev:bullmq"
+      CLIENT_URL: ${CLIENT_URL:-http://localhost:3000}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 8000) + '/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - engaze-net
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # BullMQ Standalone Background Worker
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: engaze-dev-worker
+    command: ["npm", "run", "worker"]
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      REDIS_ENABLED: "true"
+      REDIS_URL: "redis://redis:6379"
+      BULLMQ_ENABLED: "true"
+      BULLMQ_KEY_PREFIX: "engaze:dev:bullmq"
+      BULLMQ_CONCURRENCY: ${BULLMQ_CONCURRENCY:-5}
+      MONGO_URI: ${MONGO_URI}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - engaze-net
+    restart: "no"
+
+# -----------------------------------------------------------------------------
+# Isolated Development Network
+# -----------------------------------------------------------------------------
+networks:
+  engaze-net:
+    name: engaze-dev-net
+    driver: bridge
+

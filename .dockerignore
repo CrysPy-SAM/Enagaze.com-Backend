@@ -1,0 +1,39 @@
+# Engaze.com — Docker Ignore Rules
+
+# Version Control
+.git
+.github
+
+# Environment & Secret files
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Dependencies (installed via npm ci inside Docker stage)
+node_modules
+npm-debug.log*
+
+# Runtime & Test Logs
+*.log
+test_output*.log
+
+# Tests, Documentation & Backups
+tests
+docs
+backups
+scripts/verifyDemoProfiles.js
+
+# OS & Editor Metadata
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+
+# Build & Compose Artifacts
+Dockerfile*
+docker-compose*.yml
+README.md
+DOCKER.md
+*.md
+
