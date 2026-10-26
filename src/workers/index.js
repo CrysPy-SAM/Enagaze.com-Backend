@@ -59,6 +59,13 @@ export const startWorkerProcess = async ({
     const workerClient = redisClient || createWorkerRedisClient(config.redisConfig);
     activeWorkerClient = workerClient;
 
+    if (typeof workerClient.on === "function") {
+        workerClient.on("error", (err) => {
+            const safeMsg = formatSafeRedisError(err);
+            console.error(`[BullMQ:WorkerClient] Redis connection error: ${safeMsg}`);
+        });
+    }
+
     try {
         const worker = new Worker(
             QUEUE_NAMES.MEDIA_CLEANUP,

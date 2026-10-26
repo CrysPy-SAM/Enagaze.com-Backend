@@ -47,6 +47,7 @@ export const getProducerConnectionConfig = (redisConfig) => {
     return {
         url: config.url,
         maxRetriesPerRequest: 3, // Bounded for fast failure in API request path
+        commandTimeout: 5000,    // Fail fast if a command hangs
         enableReadyCheck: false,
         lazyConnect: true,
         connectTimeout: 5000,

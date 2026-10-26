@@ -54,6 +54,13 @@ export const initQueueService = async ({ redisClient } = {}) => {
     const effectiveClient = clientOverride || redisClient || createProducerRedisClient(config.redisConfig);
     producerClient = effectiveClient;
 
+    if (typeof producerClient.on === "function") {
+        producerClient.on("error", (err) => {
+            const safeMsg = formatSafeRedisError(err);
+            console.error(`[BullMQ:ProducerClient] Redis connection error: ${safeMsg}`);
+        });
+    }
+
     const prefix = config.keyPrefix || "engaze:bullmq";
 
     try {
@@ -65,6 +72,12 @@ export const initQueueService = async ({ redisClient } = {}) => {
                     prefix,
                     defaultJobOptions: DEFAULT_JOB_OPTIONS,
                 });
+                if (typeof queue.on === "function") {
+                    queue.on("error", (err) => {
+                        const safeMsg = formatSafeRedisError(err);
+                        console.error(`[BullMQ:Queue:${queueName}] Queue error: ${safeMsg}`);
+                    });
+                }
                 queues.set(queueName, queue);
             }
         }

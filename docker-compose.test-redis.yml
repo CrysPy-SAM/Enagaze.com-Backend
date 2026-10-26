@@ -1,0 +1,27 @@
+# Engaze.com — Local Integration Testing Redis/Valkey Service
+#
+# Usage:
+#   Start service:  docker compose -f docker-compose.test-redis.yml up -d
+#   Run test:       npm run test:redis-integration
+#                   (or: RUN_REDIS_INTEGRATION_TESTS=1 node --test tests/bullmq.real.redis.integration.test.js)
+#   Stop service:   docker compose -f docker-compose.test-redis.yml down
+#
+# Security:
+#   - Explicitly bound to loopback (127.0.0.1) only.
+#   - Isolated test environment; no production credentials or feature flags.
+
+services:
+  test-redis:
+    image: redis:7-alpine
+    container_name: engaze-test-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 2s
+    restart: "no"
+

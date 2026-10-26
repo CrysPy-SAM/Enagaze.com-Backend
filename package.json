@@ -11,6 +11,7 @@
     "seed": "node scripts/seedProfiles.js",
     "test": "node --test \"tests/**/*.test.js\"",
     "worker": "node src/workers/index.js",
+    "test:redis-integration": "node --test tests/bullmq.real.redis.integration.test.js",
     "migrate:indexes": "node scripts/migrateIndexes.js"
   },
   "author": "apnacollege",
