@@ -15,6 +15,8 @@ import {
     sha256Hex,
 } from "./s3Signer.service.js";
 import { getJwtSecret } from "../config/jwt.js";
+import { isBullMQEnabled } from "../config/redis.js";
+import { enqueueMediaCleanup } from "./queue.service.js";
 
 const UPLOAD_TOKEN_TTL_SECONDS = 300; // 5 minutes
 
@@ -596,6 +598,33 @@ export async function requestPhotoUploadAuthorization(user, payload) {
 }
 
 /**
+ * Safely dispatches media cleanup for an orphaned or replaced photo.
+ * When BullMQ is enabled, dispatches to the background worker queue with retries.
+ * When BullMQ is disabled or queue fails, executes inline adapter deletion.
+ *
+ * @param {Object} params
+ * @param {string} params.key
+ * @param {string} params.userId
+ * @param {Object} params.adapter
+ */
+export async function dispatchMediaCleanup({ key, userId, adapter }) {
+    if (isBullMQEnabled()) {
+        try {
+            await enqueueMediaCleanup({ key, userId });
+            return;
+        } catch (enqueueErr) {
+            console.warn("BullMQ enqueue failed; falling back to inline deletion:", enqueueErr?.message);
+        }
+    }
+    // Fallback or disabled path: delete inline
+    try {
+        await adapter.deleteObject(key);
+    } catch (cleanupErr) {
+        console.warn("Non-fatal storage object cleanup error:", cleanupErr?.message);
+    }
+}
+
+/**
  * Confirm uploaded photo and atomically update user profile.
  *
  * @param {string} userId
@@ -743,11 +772,7 @@ export async function confirmPhotoUpload(userId, payload) {
         if (keyMatch) {
             const oldKey = decodeURIComponent(keyMatch[1]);
             if (oldKey.startsWith(`profile-photos/${userId}/`)) {
-                try {
-                    await adapter.deleteObject(oldKey);
-                } catch (cleanupErr) {
-                    console.warn("Non-fatal cleanup error for replaced photo:", cleanupErr?.message);
-                }
+                await dispatchMediaCleanup({ key: oldKey, userId, adapter });
             }
         }
     }
@@ -789,7 +814,7 @@ export async function deleteProfilePhoto(userId, photoIndex) {
                 // Ensure key belongs to current user to prevent deleting another user's photos
                 if (key.startsWith(`profile-photos/${userId}/`)) {
                     const adapter = getStorageAdapter();
-                    await adapter.deleteObject(key);
+                    await dispatchMediaCleanup({ key, userId, adapter });
                 }
             }
         }

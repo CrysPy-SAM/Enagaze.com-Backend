@@ -82,6 +82,21 @@ export function isRateLimitRedisEnabled(env = process.env) {
 }
 
 /**
+ * Checks whether BullMQ background worker infrastructure is explicitly enabled.
+ * Defaults to false if BULLMQ_ENABLED is absent, empty, or false.
+ *
+ * @param {Object} [env=process.env]
+ * @returns {boolean}
+ */
+export function isBullMQEnabled(env = process.env) {
+    if (!env || !env.BULLMQ_ENABLED) {
+        return false;
+    }
+    const val = String(env.BULLMQ_ENABLED).trim().toLowerCase();
+    return val === "true" || val === "1";
+}
+
+/**
  * Validates Redis configuration settings.
  * When REDIS_ENABLED=true, requires a valid redis:// or rediss:// connection URL.
  * Never includes raw URL, usernames, or passwords in error messages.
@@ -318,6 +333,50 @@ export function validateRateLimitRedisConfig(env = process.env) {
     return {
         enabled: true,
         keyPrefix,
+        redisConfig,
+    };
+}
+
+/**
+ * Validates BullMQ configuration settings.
+ * When BULLMQ_ENABLED=true, requires REDIS_ENABLED=true
+ * and a valid REDIS_URL via validateRedisConfig.
+ *
+ * @param {Object} [env=process.env]
+ * @returns {{ enabled: boolean, keyPrefix: string, concurrency: number, redisConfig?: object }}
+ * @throws {Error} Sanitized configuration error
+ */
+export function validateBullMQConfig(env = process.env) {
+    if (!isBullMQEnabled(env)) {
+        return {
+            enabled: false,
+            keyPrefix: "engaze:bullmq",
+            concurrency: 5,
+        };
+    }
+
+    if (!isRedisEnabled(env)) {
+        throw new Error(
+            "Invalid BullMQ configuration: REDIS_ENABLED=true is required when BULLMQ_ENABLED=true."
+        );
+    }
+
+    const redisConfig = validateRedisConfig(env);
+    const customPrefix = env.BULLMQ_KEY_PREFIX ? String(env.BULLMQ_KEY_PREFIX).trim() : "";
+    const keyPrefix = customPrefix || "engaze:bullmq";
+
+    let concurrency = 5;
+    if (env.BULLMQ_CONCURRENCY) {
+        const parsed = parseInt(String(env.BULLMQ_CONCURRENCY).trim(), 10);
+        if (!isNaN(parsed) && parsed > 0 && parsed <= 50) {
+            concurrency = parsed;
+        }
+    }
+
+    return {
+        enabled: true,
+        keyPrefix,
+        concurrency,
         redisConfig,
     };
 }
