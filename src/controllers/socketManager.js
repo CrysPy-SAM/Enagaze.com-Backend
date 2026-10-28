@@ -91,9 +91,6 @@ export const connectToSocket = (server) => {
                 token = parts[1];
             }
         }
-        if (!token && socket.handshake.query?.token) {
-            token = socket.handshake.query.token;
-        }
 
         if (!token) {
             return next(new Error("Authentication error: Token required"));

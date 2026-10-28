@@ -53,8 +53,6 @@ const login = async (req, res) => {
         }
 
         const token = generateToken(user);
-        user.token = token;
-        await user.save();
 
         return res.status(httpStatus.OK).json({
             success: true,
@@ -164,7 +162,6 @@ const register = async (req, res) => {
         newUser.isProfileComplete = evaluateProfileCompleteness(newUser).isComplete;
 
         const token = generateToken(newUser);
-        newUser.token = token;
         await newUser.save();
 
         return res.status(httpStatus.CREATED).json({
@@ -526,11 +523,10 @@ const googleLogin = async (req, res) => {
 
         if (user) {
             const token = generateToken(user);
-            user.token = token;
             if ((!user.photos || user.photos.length === 0) && picture) {
                 user.photos = [picture];
+                await user.save();
             }
-            await user.save();
 
             return res.status(httpStatus.OK).json({
                 success: true,
@@ -575,7 +571,6 @@ const googleLogin = async (req, res) => {
         });
 
         const token = generateToken(newUser);
-        newUser.token = token;
         await newUser.save();
 
         return res.status(httpStatus.CREATED).json({

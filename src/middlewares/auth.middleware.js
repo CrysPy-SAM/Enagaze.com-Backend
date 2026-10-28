@@ -15,15 +15,9 @@ const safeCompare = (provided, expected) => {
 export const protect = async (req, res, next) => {
     let token = null;
 
-    // Check Authorization header for Bearer token
+    // Restrict REST token transport strictly to Authorization: Bearer <token> header
     if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
         token = req.headers.authorization.split(" ")[1];
-    } else if (req.query && req.query.token) {
-        // Fallback for query param (backward compatibility)
-        token = req.query.token;
-    } else if (req.body && req.body.token) {
-        // Fallback for body param (backward compatibility)
-        token = req.body.token;
     }
 
     if (!token) {

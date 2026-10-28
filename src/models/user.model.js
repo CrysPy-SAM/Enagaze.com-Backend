@@ -45,9 +45,6 @@ const userSchema = new Schema(
             ],
             minlength: [6, "Password must be at least 6 characters"]
         },
-        token: { 
-            type: String 
-        },
         dob: {
             type: Date,
             validate: {
@@ -128,6 +125,7 @@ const userSchema = new Schema(
             virtuals: true,
             transform: function(doc, ret) {
                 delete ret.password;
+                delete ret.token;
                 delete ret.__v;
                 return ret;
             }
@@ -136,6 +134,7 @@ const userSchema = new Schema(
             virtuals: true,
             transform: function(doc, ret) {
                 delete ret.password;
+                delete ret.token;
                 delete ret.__v;
                 return ret;
             }
