@@ -1097,6 +1097,48 @@ export function endActiveCallBetweenUsers(userIdA, userIdB, io) {
     return null;
 }
 
+/**
+ * Safely terminate a user's active random call and remove them from all matchmaking queues
+ * (called upon ban, suspension, or session revocation).
+ *
+ * @param {string|mongoose.Types.ObjectId} userId
+ * @param {object} io - Socket.IO server instance
+ */
+export async function terminateUserRandomCallsAndQueues(userId, io) {
+    if (!userId) return;
+    const userStr = userId.toString();
+
+    // 1. Remove from in-memory matchmaking queue
+    removeFromQueue(null, userStr);
+
+    // 2. Remove from Redis matchmaking queue if enabled
+    if (isMatchmakingRedisEnabled()) {
+        try {
+            await dequeueUserRedis(userStr);
+        } catch (err) {
+            console.warn("Failed to dequeue user from Redis during revocation:", err?.message);
+        }
+    }
+
+    // 3. Terminate active call in memory if user is participating
+    const callId = userToCall.get(userStr);
+    if (callId) {
+        endActiveCall(callId, null, "moderation_action", io);
+    }
+
+    // 4. Terminate active call in Redis if enabled
+    if (isMatchmakingRedisEnabled()) {
+        try {
+            const redisCallId = await getCallIdForUserRedis(userStr);
+            if (redisCallId) {
+                await endCallSessionRedis(redisCallId, "moderation_action");
+            }
+        } catch (err) {
+            console.warn("Failed to terminate Redis call during revocation:", err?.message);
+        }
+    }
+}
+
 // For unit testing inspection
 export const _testing = {
     getQueue: () => [...matchmakingQueue],

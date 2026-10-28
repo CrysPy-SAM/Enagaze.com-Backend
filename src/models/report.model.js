@@ -14,6 +14,8 @@ export const REPORT_CONTEXTS = ["profile", "chat", "call"];
 
 export const REPORT_STATUSES = ["pending", "investigating", "resolved", "dismissed"];
 
+export const REPORT_ACTIONS = ["none", "warn", "suspend", "ban", "dismiss"];
+
 const reportSchema = new Schema(
     {
         reporter: {
@@ -79,6 +81,34 @@ const reportSchema = new Schema(
             default: null,
         },
         reviewedAt: {
+            type: Date,
+            default: null,
+        },
+        action: {
+            type: String,
+            enum: REPORT_ACTIONS,
+            default: "none",
+        },
+        actionReason: {
+            type: String,
+            trim: true,
+            maxlength: [1000, "Action reason cannot exceed 1000 characters"],
+            default: "",
+        },
+        suspensionDurationHours: {
+            type: Number,
+            default: null,
+        },
+        suspensionExpiresAt: {
+            type: Date,
+            default: null,
+        },
+        actionTakenBy: {
+            type: Schema.Types.ObjectId,
+            ref: "User",
+            default: null,
+        },
+        actionTakenAt: {
             type: Date,
             default: null,
         },

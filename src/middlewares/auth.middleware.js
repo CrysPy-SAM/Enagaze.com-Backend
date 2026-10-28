@@ -1,7 +1,7 @@
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import httpStatus from "http-status";
-import { User } from "../models/user.model.js";
+import { User, evaluateAccountStatus } from "../models/user.model.js";
 import { getJwtSecret } from "../config/jwt.js";
 
 const safeCompare = (provided, expected) => {
@@ -36,6 +36,31 @@ export const protect = async (req, res, next) => {
                 success: false,
                 message: "User account no longer exists."
             });
+        }
+
+        // Enforce account moderation status (banned / suspended)
+        const accountStatus = evaluateAccountStatus(user);
+        if (!accountStatus.allowed) {
+            const isBanned = accountStatus.status === "banned";
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                message: isBanned
+                    ? "Your account has been permanently banned."
+                    : `Your account is temporarily suspended until ${user.suspensionExpiresAt ? new Date(user.suspensionExpiresAt).toISOString() : "further notice"}. Reason: ${user.suspensionReason || "Policy violation"}`,
+                code: isBanned ? "ACCOUNT_BANNED" : "ACCOUNT_SUSPENDED",
+                reason: accountStatus.reason,
+                expiresAt: accountStatus.expiresAt,
+            });
+        }
+
+        // Auto-persist reinstatement if temporary suspension had expired
+        if (accountStatus.wasExpired) {
+            user.status = "active";
+            user.suspensionExpiresAt = null;
+            user.suspensionReason = null;
+            if (typeof user.save === "function") {
+                user.save().catch((saveErr) => console.warn("Failed to auto-reinstate expired user:", saveErr?.message));
+            }
         }
 
         req.user = user;

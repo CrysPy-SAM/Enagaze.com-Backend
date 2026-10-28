@@ -6,7 +6,7 @@ import httpStatus from "http-status";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { OAuth2Client } from "google-auth-library";
-import { User } from "../models/user.model.js";
+import { User, evaluateAccountStatus } from "../models/user.model.js";
 import { getJwtSecret, JWT_EXPIRES_IN } from "../config/jwt.js";
 import { calculateExactAge, evaluateProfileCompleteness, checkUserEligibility } from "../services/eligibility.service.js";
 import { validatePublicPhotoUrl } from "../services/imageValidation.service.js";
@@ -50,6 +50,28 @@ const login = async (req, res) => {
                 success: false,
                 message: "Invalid username or password"
             });
+        }
+
+        // Enforce account moderation status on login
+        const accountStatus = evaluateAccountStatus(user);
+        if (!accountStatus.allowed) {
+            const isBanned = accountStatus.status === "banned";
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                message: isBanned
+                    ? "Your account has been permanently banned."
+                    : `Your account is temporarily suspended until ${user.suspensionExpiresAt ? new Date(user.suspensionExpiresAt).toISOString() : "further notice"}. Reason: ${user.suspensionReason || "Policy violation"}`,
+                code: isBanned ? "ACCOUNT_BANNED" : "ACCOUNT_SUSPENDED",
+                reason: accountStatus.reason,
+                expiresAt: accountStatus.expiresAt,
+            });
+        }
+
+        if (accountStatus.wasExpired) {
+            user.status = "active";
+            user.suspensionExpiresAt = null;
+            user.suspensionReason = null;
+            await user.save();
         }
 
         const token = generateToken(user);
@@ -522,6 +544,28 @@ const googleLogin = async (req, res) => {
         let user = await User.findOne({ googleId });
 
         if (user) {
+            // Enforce account moderation status on Google login
+            const accountStatus = evaluateAccountStatus(user);
+            if (!accountStatus.allowed) {
+                const isBanned = accountStatus.status === "banned";
+                return res.status(httpStatus.FORBIDDEN).json({
+                    success: false,
+                    message: isBanned
+                        ? "Your account has been permanently banned."
+                        : `Your account is temporarily suspended until ${user.suspensionExpiresAt ? new Date(user.suspensionExpiresAt).toISOString() : "further notice"}. Reason: ${user.suspensionReason || "Policy violation"}`,
+                    code: isBanned ? "ACCOUNT_BANNED" : "ACCOUNT_SUSPENDED",
+                    reason: accountStatus.reason,
+                    expiresAt: accountStatus.expiresAt,
+                });
+            }
+
+            if (accountStatus.wasExpired) {
+                user.status = "active";
+                user.suspensionExpiresAt = null;
+                user.suspensionReason = null;
+                await user.save();
+            }
+
             const token = generateToken(user);
             if ((!user.photos || user.photos.length === 0) && picture) {
                 user.photos = [picture];

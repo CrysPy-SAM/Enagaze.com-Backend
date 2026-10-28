@@ -2,12 +2,12 @@ import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import crypto from "crypto";
-import { User } from "../models/user.model.js";
+import { User, evaluateAccountStatus } from "../models/user.model.js";
 import { Conversation } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
 import { Match } from "../models/match.model.js";
 import { Block } from "../models/block.model.js";
-import { registerRandomCallHandlers } from "./randomCallManager.js";
+import { registerRandomCallHandlers, terminateUserRandomCallsAndQueues } from "./randomCallManager.js";
 import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
 import { toMessageDto, toPublicProfile } from "../serializers/profile.serializer.js";
@@ -41,6 +41,94 @@ export const _resetInMemoryDirectCalls = () => {
     }
     activeDirectCalls.clear();
     userToDirectCall.clear();
+};
+
+/**
+ * Cleanly terminates any active direct 1-on-1 call for a specific user
+ * (e.g. upon ban, suspension, or manual termination).
+ *
+ * @param {string|mongoose.Types.ObjectId} userId
+ * @param {string} [reason="moderation_action"]
+ * @returns {object|null} Terminated call object
+ */
+export const terminateUserActiveDirectCalls = (userId, reason = "moderation_action") => {
+    if (!userId) return null;
+    const userIdStr = userId.toString();
+    const callId = userToDirectCall.get(userIdStr);
+    if (!callId) return null;
+
+    const call = activeDirectCalls.get(callId);
+    if (!call) {
+        userToDirectCall.delete(userIdStr);
+        return null;
+    }
+
+    if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
+
+    const partnerId = call.callerId === userIdStr ? call.calleeId : call.callerId;
+    if (ioInstance && partnerId) {
+        ioInstance.to(`user:${partnerId}`).emit("direct_call:ended", {
+            callId,
+            reason,
+        });
+    }
+
+    userToDirectCall.delete(call.callerId);
+    userToDirectCall.delete(call.calleeId);
+    activeDirectCalls.delete(callId);
+    return call;
+};
+
+/**
+ * Revokes all active sessions, calls, queues, and connected sockets for a moderated user.
+ *
+ * @param {string|mongoose.Types.ObjectId} userId
+ * @param {string} [status="banned"]
+ * @param {string} [reason="Policy violation"]
+ */
+export const revokeUserSessions = async (userId, status = "banned", reason = "Policy violation") => {
+    if (!userId) return;
+    const userIdStr = userId.toString();
+
+    // 1. Terminate random matchmaking calls & remove from queues
+    try {
+        await terminateUserRandomCallsAndQueues(userIdStr, ioInstance);
+    } catch (err) {
+        console.warn("Failed to terminate random calls during session revocation:", err?.message);
+    }
+
+    // 2. Terminate any active direct 1-on-1 call
+    try {
+        terminateUserActiveDirectCalls(userIdStr, "moderation_action");
+    } catch (err) {
+        console.warn("Failed to terminate direct call during session revocation:", err?.message);
+    }
+
+    // 3. Forcefully disconnect all active sockets for this user
+    if (ioInstance) {
+        try {
+            const sockets = await ioInstance.in(`user:${userIdStr}`).fetchSockets();
+            for (const sock of sockets) {
+                sock.emit("account:moderated", {
+                    status,
+                    reason,
+                });
+                sock.disconnect(true);
+            }
+        } catch (err) {
+            console.warn("Error disconnecting sockets during revocation:", err?.message);
+        }
+    }
+
+    // 4. Mark offline in presence service
+    try {
+        await userDisconnected(userIdStr, null);
+        if (ioInstance) {
+            await broadcastPresenceUpdate(ioInstance, userIdStr, false);
+        }
+    } catch (err) {
+        console.warn("Error updating presence during revocation:", err?.message);
+    }
 };
 
 
@@ -83,7 +171,7 @@ export const connectToSocket = (server) => {
     });
 
     // Handshake middleware for JWT authentication
-    io.use((socket, next) => {
+    io.use(async (socket, next) => {
         let token = socket.handshake.auth?.token;
         if (!token && socket.handshake.headers?.authorization) {
             const parts = socket.handshake.headers.authorization.split(" ");
@@ -101,10 +189,40 @@ export const connectToSocket = (server) => {
             if (!decoded || !decoded.id) {
                 return next(new Error("Authentication error: Invalid token payload"));
             }
+
+            // Enforce account moderation status if real database is connected or User.findById is stubbed
+            const isRealDbConnected = Boolean(mongoose.connection?.readyState === 1 && mongoose.connection?.db);
+            const isModelStubbed = Boolean(User.findById && User.findById !== mongoose.Model.findById);
+
+            if (isRealDbConnected || isModelStubbed) {
+                const userQuery = User.findById(decoded.id);
+                const user = typeof userQuery?.select === "function"
+                    ? await userQuery.select("status suspensionExpiresAt suspensionReason bannedAt banReason")
+                    : await userQuery;
+
+                if (user) {
+                    const accountStatus = evaluateAccountStatus(user);
+                    if (!accountStatus.allowed) {
+                        return next(new Error(`Authentication error: Account ${accountStatus.status}`));
+                    }
+                    if (accountStatus.wasExpired) {
+                        user.status = "active";
+                        user.suspensionExpiresAt = null;
+                        user.suspensionReason = null;
+                        if (typeof user.save === "function") {
+                            user.save().catch((saveErr) => console.warn("Failed to auto-reinstate socket user:", saveErr?.message));
+                        }
+                    }
+                }
+            }
+
             socket.userId = decoded.id.toString();
             socket.username = decoded.username || null;
             next();
         } catch (err) {
+            if (err.message && err.message.startsWith("Authentication error:")) {
+                return next(err);
+            }
             return next(new Error("Authentication error: Invalid or expired token"));
         }
     });

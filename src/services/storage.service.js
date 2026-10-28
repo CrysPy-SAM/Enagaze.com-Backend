@@ -424,6 +424,46 @@ export class S3StorageAdapter {
         }
     }
 
+    /**
+     * Retrieve binary object stream from S3 for server-side verification and processing.
+     *
+     * @param {string} key
+     * @returns {Promise<{ buffer: Buffer, mimeType: string, size: number }|null>}
+     */
+    async getObject(key) {
+        try {
+            const signed = signS3Request({
+                config: this.config,
+                method: "GET",
+                key,
+            });
+            const res = await this.fetchFn(signed.url, {
+                method: "GET",
+                headers: signed.headers,
+            });
+
+            if (res.status === 200) {
+                const arrayBuffer = await res.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+                const rawContentType = res.headers?.get
+                    ? res.headers.get("content-type")
+                    : res.headers?.["content-type"];
+                const mimeType = rawContentType
+                    ? rawContentType.split(";")[0].trim().toLowerCase()
+                    : "image/jpeg";
+                return {
+                    buffer,
+                    mimeType,
+                    size: buffer.length,
+                };
+            }
+            return null;
+        } catch (err) {
+            console.warn("Storage getObject error:", err?.message);
+            return null;
+        }
+    }
+
     async objectExists(key) {
         try {
             const signed = signS3Request({
@@ -693,6 +733,49 @@ export async function confirmPhotoUpload(userId, payload) {
                 error.statusCode = 400;
                 throw error;
             }
+        }
+    }
+
+    // 3. Server-side binary byte inspection & EXIF metadata stripping
+    if (typeof adapter.getObject === "function") {
+        try {
+            const storedObj = await adapter.getObject(key);
+            if (storedObj && storedObj.buffer && storedObj.buffer.length > 0) {
+                const validation = validateImageBuffer(storedObj.buffer, {
+                    maxSizeBytes: tokenClaims.maxSizeBytes || MAX_PHOTO_BYTES,
+                    expectedMime: tokenClaims.expectedMime,
+                });
+
+                if (!validation.valid) {
+                    try {
+                        await adapter.deleteObject(key);
+                    } catch (cleanupErr) {
+                        console.warn("Non-fatal cleanup error for invalid image buffer:", cleanupErr?.message);
+                    }
+                    const error = new Error(`Uploaded file is not a valid image: ${validation.error}`);
+                    error.statusCode = 400;
+                    throw error;
+                }
+
+                // Strip EXIF / GPS metadata from buffer
+                const sanitizedBuffer = stripMetadata(storedObj.buffer, validation.mimeType);
+                if (sanitizedBuffer && !sanitizedBuffer.equals(storedObj.buffer) && typeof adapter.putObject === "function") {
+                    const putOk = await adapter.putObject(key, sanitizedBuffer, validation.mimeType);
+                    if (!putOk) {
+                        try {
+                            await adapter.deleteObject(key);
+                        } catch (cleanupErr) {
+                            console.warn("Non-fatal cleanup error after putObject failure:", cleanupErr?.message);
+                        }
+                        const error = new Error("Failed to sanitize and store profile image.");
+                        error.statusCode = 500;
+                        throw error;
+                    }
+                }
+            }
+        } catch (objErr) {
+            if (objErr.statusCode) throw objErr;
+            console.warn("Non-fatal warning during object byte inspection:", objErr?.message);
         }
     }
 

@@ -118,6 +118,30 @@ const userSchema = new Schema(
                 default: "everyone",
             },
         },
+        status: {
+            type: String,
+            enum: ["active", "suspended", "banned"],
+            default: "active",
+            index: true,
+        },
+        suspensionExpiresAt: {
+            type: Date,
+            default: null,
+        },
+        suspensionReason: {
+            type: String,
+            maxlength: [500, "Suspension reason cannot exceed 500 characters"],
+            default: null,
+        },
+        bannedAt: {
+            type: Date,
+            default: null,
+        },
+        banReason: {
+            type: String,
+            maxlength: [500, "Ban reason cannot exceed 500 characters"],
+            default: null,
+        },
     },
     {
         timestamps: true,
@@ -159,5 +183,48 @@ userSchema.index({ isProfileComplete: 1, dob: 1, _id: -1 });
 userSchema.index({ isProfileComplete: 1, gender: 1, dob: 1, _id: -1 });
 
 const User = mongoose.model("User", userSchema);
+
+/**
+ * Evaluates account status and handles automatic expiration of temporary suspensions.
+ *
+ * @param {object} user - User document or user object
+ * @param {Date} [referenceDate=new Date()] - Reference timestamp for expiration check
+ * @returns {{ allowed: boolean, status: string, reason?: string, expiresAt?: Date, wasExpired?: boolean }}
+ */
+export function evaluateAccountStatus(user, referenceDate = new Date()) {
+    if (!user) {
+        return { allowed: false, status: "unknown", reason: "User not found" };
+    }
+
+    if (user.status === "banned") {
+        return {
+            allowed: false,
+            status: "banned",
+            reason: user.banReason || "Your account has been permanently banned.",
+            bannedAt: user.bannedAt || null,
+        };
+    }
+
+    if (user.status === "suspended") {
+        if (user.suspensionExpiresAt && new Date(user.suspensionExpiresAt).getTime() <= referenceDate.getTime()) {
+            return {
+                allowed: true,
+                status: "active",
+                wasExpired: true,
+            };
+        }
+        return {
+            allowed: false,
+            status: "suspended",
+            reason: user.suspensionReason || "Your account has been temporarily suspended.",
+            expiresAt: user.suspensionExpiresAt || null,
+        };
+    }
+
+    return {
+        allowed: true,
+        status: user.status || "active",
+    };
+}
 
 export { User };
