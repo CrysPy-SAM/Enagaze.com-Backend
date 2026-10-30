@@ -732,12 +732,12 @@ export const connectToSocket = (server) => {
                 const allConvIds = [convObjId, conversationId.toString()];
                 const updateRes = await Message.updateMany(
                     {
-                        conversation: conversationId,
-                        sender: { $ne: socket.userId, $nin: allUserIds },
-                        readBy: { $ne: socket.userId, $nin: allUserIds },
+                        conversation: convObjId,
+                        sender: { $ne: userObjId, $nin: allUserIds },
+                        readBy: { $ne: userObjId, $nin: allUserIds },
                     },
                     {
-                        $addToSet: { readBy: socket.userId },
+                        $addToSet: { readBy: userObjId },
                     }
                 );
 
