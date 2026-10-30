@@ -526,7 +526,9 @@ const start = async ({ exitOnError = true } = {}) => {
   try {
     connectionDb = await mongoose.connect(process.env.MONGO_URI, mongoOptions);
     console.log(`✅ MONGO Connected DB Host: ${connectionDb.connection.host}`);
-    backfillLegacyUsers().catch((err) => console.warn("Legacy user backfill notice:", err.message));
+    if (process.env.NODE_ENV !== "test" && mongoose.connection.readyState === 1) {
+      backfillLegacyUsers().catch((err) => console.warn("Legacy user backfill notice:", err.message));
+    }
   } catch (dbErr) {
     const safeMsg = formatSafeDatabaseError(dbErr);
     console.error(`❌ Fatal MongoDB Startup Connection Error: ${safeMsg}`);
