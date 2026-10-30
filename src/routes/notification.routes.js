@@ -5,6 +5,7 @@ import {
     getUnreadCountHandler,
     markAsReadHandler,
     markAllAsReadHandler,
+    markTypeAsReadHandler,
 } from "../controllers/notification.controller.js";
 
 const router = Router();
@@ -17,6 +18,9 @@ router.get("/unread-count", protect, getUnreadCountHandler);
 
 // PATCH /api/v1/notifications/read-all - Mark all read (must precede /:id/read)
 router.patch("/read-all", protect, markAllAsReadHandler);
+
+// PATCH /api/v1/notifications/read-type/:type - Mark all of specific type as read (must precede /:id/read)
+router.patch("/read-type/:type", protect, markTypeAsReadHandler);
 
 // PATCH /api/v1/notifications/:id/read - Mark single notification as read
 router.patch("/:id/read", protect, markAsReadHandler);
