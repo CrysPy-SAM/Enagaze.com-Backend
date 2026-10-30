@@ -158,6 +158,138 @@ const getConversations = async (req, res) => {
 };
 
 // ==========================================
+
+// ==========================================
+// 1b. GET TOTAL UNREAD MESSAGE COUNT FOR CURRENT USER
+// ==========================================
+const calculateUserUnreadCount = async (userId) => {
+    if (!userId) {
+        return { totalUnreadCount: 0, unreadConversationsCount: 0, conversationsUnread: {} };
+    }
+
+    try {
+        const [blockedUserIds, conversations] = await Promise.all([
+            Block.getBlockedUserIds(userId),
+            safeLean(
+                Conversation.find({ participants: userId })
+                    .select('_id match participants')
+                    .populate({ path: 'match', select: 'status' })
+            ),
+        ]);
+        const blockedSet = new Set(blockedUserIds.map((id) => id.toString()));
+
+        const activeConvIds = conversations
+            .filter((conv) => {
+                if (!conv.match || conv.match.status !== 'active') return false;
+                const otherParticipant = (conv.participants || []).find(
+                    (p) => p && (p._id || p).toString() !== userId.toString()
+                );
+                if (!otherParticipant) return false;
+                const otherId = (otherParticipant._id || otherParticipant).toString();
+                if (blockedSet.has(otherId)) return false;
+                return true;
+            })
+            .map((c) => c._id);
+
+        if (activeConvIds.length === 0) {
+            return { totalUnreadCount: 0, unreadConversationsCount: 0, conversationsUnread: {} };
+        }
+
+        let conversationsUnread = {};
+        let totalUnreadCount = 0;
+
+        if (typeof Message.aggregate === 'function') {
+            try {
+                const unreadAgg = await Message.aggregate([
+                    {
+                        $match: {
+                            conversation: { $in: activeConvIds },
+                            sender: { $ne: userId },
+                            readBy: { $ne: userId },
+                        },
+                    },
+                    {
+                        $group: {
+                            _id: '$conversation',
+                            count: { $sum: 1 },
+                        },
+                    },
+                ]);
+                unreadAgg.forEach((u) => {
+                    const count = u.count || 0;
+                    conversationsUnread[u._id.toString()] = count;
+                    totalUnreadCount += count;
+                });
+            } catch (_) {
+                const counts = await Promise.all(
+                    activeConvIds.map((cId) =>
+                        Message.countDocuments({
+                            conversation: cId,
+                            sender: { $ne: userId },
+                            readBy: { $ne: userId },
+                        })
+                    )
+                );
+                activeConvIds.forEach((cId, idx) => {
+                    const count = counts[idx] || 0;
+                    if (count > 0) {
+                        conversationsUnread[cId.toString()] = count;
+                        totalUnreadCount += count;
+                    }
+                });
+            }
+        } else {
+            const counts = await Promise.all(
+                activeConvIds.map((cId) =>
+                    Message.countDocuments({
+                        conversation: cId,
+                        sender: { $ne: userId },
+                        readBy: { $ne: userId },
+                    })
+                )
+            );
+            activeConvIds.forEach((cId, idx) => {
+                const count = counts[idx] || 0;
+                if (count > 0) {
+                    conversationsUnread[cId.toString()] = count;
+                    totalUnreadCount += count;
+                }
+            });
+        }
+
+        const unreadConversationsCount = Object.keys(conversationsUnread).length;
+
+        return {
+            totalUnreadCount,
+            unreadConversationsCount,
+            conversationsUnread,
+        };
+    } catch (err) {
+        console.error('calculateUserUnreadCount error:', err);
+        return { totalUnreadCount: 0, unreadConversationsCount: 0, conversationsUnread: {} };
+    }
+};
+
+const getUnreadMessageCount = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const result = await calculateUserUnreadCount(userId);
+        return res.status(httpStatus.OK).json({
+            success: true,
+            unreadCount: result.totalUnreadCount,
+            unreadConversationsCount: result.unreadConversationsCount,
+            conversationsUnread: result.conversationsUnread,
+        });
+    } catch (e) {
+        console.error('Get unread message count error:', e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: 'Failed to calculate unread message count',
+        });
+    }
+};
+
+// ==========================================
 // 2. GET OR CREATE CONVERSATION BY MATCH ID
 // ==========================================
 const getOrCreateConversationByMatch = async (req, res) => {
@@ -560,6 +692,17 @@ const markConversationAsRead = async (req, res) => {
                 conversationId,
                 readerId: req.user._id,
             });
+
+            // Real-time unread count notification specifically to the reader
+            calculateUserUnreadCount(req.user._id)
+                .then((counts) => {
+                    io.to(`user:${req.user._id.toString()}`).emit('chat:unread-count', {
+                        unreadCount: counts.totalUnreadCount,
+                        unreadConversationsCount: counts.unreadConversationsCount,
+                        conversationsUnread: counts.conversationsUnread,
+                    });
+                })
+                .catch(() => {});
         }
 
         return res.status(httpStatus.OK).json({
@@ -771,6 +914,8 @@ const sendMessageRest = async (req, res) => {
 
 export {
     getConversations,
+    getUnreadMessageCount,
+    calculateUserUnreadCount,
     getOrCreateConversationByMatch,
     getMessages,
     markConversationAsRead,
