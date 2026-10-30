@@ -27,7 +27,7 @@ describe("Username Management & 14-Day Cooldown Policy Test Suite", () => {
         // Connect to in-memory/test MongoDB or existing mongoose connection
         if (mongoose.connection.readyState === 0) {
             const mongoUri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/engaze_test";
-            await mongoose.connect(mongoUri);
+            await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 5000 });
         }
     });
 
@@ -101,20 +101,23 @@ describe("Username Management & 14-Day Cooldown Policy Test Suite", () => {
     });
 
     after(async () => {
-        await User.deleteMany({
-            $or: [
-                { username: { $in: [
-                    "test_alice", "test_bob", "test_charlie", "temp_g1", "alice_new",
-                    "taken_user", "satyam", "satyam_test", "Satyam_Test", "cooldown_user", "legacy_user", "larry_new", "Legacy_Larry"
-                ] } },
-                { normalizedUsername: { $in: [
-                    "test_alice", "test_bob", "test_charlie", "temp_g1", "alice_new",
-                    "taken_user", "satyam", "satyam_test", "cooldown_user", "legacy_user", "larry_new", "legacy_larry"
-                ] } },
-            ]
-        });
-        await User.deleteMany({ googleId: { $in: ["g_test_123", "g_test_456"] } });
-        await User.deleteMany({ email: { $in: ["gnew@example.com", "gexist@example.com"] } });
+        if (mongoose.connection.readyState !== 0) {
+            await User.deleteMany({
+                $or: [
+                    { username: { $in: [
+                        "test_alice", "test_bob", "test_charlie", "temp_g1", "alice_new",
+                        "taken_user", "satyam", "satyam_test", "Satyam_Test", "cooldown_user", "legacy_user", "larry_new", "Legacy_Larry"
+                    ] } },
+                    { normalizedUsername: { $in: [
+                        "test_alice", "test_bob", "test_charlie", "temp_g1", "alice_new",
+                        "taken_user", "satyam", "satyam_test", "cooldown_user", "legacy_user", "larry_new", "legacy_larry"
+                    ] } },
+                ]
+            });
+            await User.deleteMany({ googleId: { $in: ["g_test_123", "g_test_456"] } });
+            await User.deleteMany({ email: { $in: ["gnew@example.com", "gexist@example.com"] } });
+            await mongoose.disconnect();
+        }
     });
 
     // =========================================================================
