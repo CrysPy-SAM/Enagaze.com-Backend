@@ -14,10 +14,28 @@ const userSchema = new Schema(
             required: [true, "Username is required"], 
             unique: true,
             trim: true,
-            lowercase: true,
             minlength: [3, "Username must be at least 3 characters"],
             maxlength: [30, "Username cannot exceed 30 characters"],
             match: [/^[a-zA-Z0-9_.-]+$/, "Username can only contain alphanumeric characters, dots, underscores, and dashes"]
+        },
+        normalizedUsername: {
+            type: String,
+            trim: true,
+            lowercase: true,
+        },
+        usernameSetupCompleted: {
+            type: Boolean,
+            default: true,
+            index: true,
+        },
+        usernameSetupCompletedAt: {
+            type: Date,
+            default: null,
+        },
+        usernameLastChangedAt: {
+            type: Date,
+            default: null,
+            index: true,
         },
         email: {
             type: String,
@@ -173,8 +191,20 @@ userSchema.virtual("age").get(function() {
     return calculated !== null ? calculated : undefined;
 });
 
+// Pre-save middleware to synchronize normalizedUsername and defaults
+userSchema.pre("save", function(next) {
+    if (this.username) {
+        this.normalizedUsername = this.username.trim().toLowerCase();
+    }
+    if (this.usernameSetupCompleted === undefined || this.usernameSetupCompleted === null) {
+        this.usernameSetupCompleted = true;
+    }
+    next();
+});
+
 // Indexes for People Discovery and Instagram-style search performance
 userSchema.index({ name: 1 });
+userSchema.index({ normalizedUsername: 1 }, { unique: true, sparse: true });
 userSchema.index({ isProfileComplete: 1, username: 1 });
 userSchema.index({ isProfileComplete: 1, name: 1 });
 
