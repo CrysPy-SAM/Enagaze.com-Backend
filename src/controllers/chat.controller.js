@@ -85,61 +85,34 @@ const getConversations = async (req, res) => {
             return true;
         });
 
-        // Batch-aggregate unread message counts across all active conversations in a single query
-        const validConvObjIds = activeConvs.map((c) =>
-            mongoose.Types.ObjectId.isValid(c._id) ? new mongoose.Types.ObjectId(c._id.toString()) : c._id
-        );
+        // Batch-calculate unread message counts across all active conversations
+        const allUserIds = [userObjId, userObjId.toString()];
         let unreadMap = new Map();
-        if (validConvObjIds.length > 0) {
-            if (typeof Message.aggregate === "function") {
-                try {
-                    const unreadAgg = await Message.aggregate([
-                        {
-                            $match: {
-                                conversation: { $in: validConvObjIds },
-                                sender: { $ne: userObjId },
-                                readBy: { $ne: userObjId },
-                                deletedFor: { $ne: userObjId },
-                                isDeletedForEveryone: { $ne: true },
-                            },
-                        },
-                        {
-                            $group: {
-                                _id: "$conversation",
-                                count: { $sum: 1 },
-                            },
-                        },
-                    ]);
-                    unreadMap = new Map(unreadAgg.map((u) => [u._id.toString(), u.count]));
-                } catch (_) {
-                    // Safe fallback for testing or mock environments
-                    const counts = await Promise.all(
-                        validConvObjIds.map((cId) =>
-                            Message.countDocuments({
-                                conversation: cId,
-                                sender: { $ne: userObjId },
-                                readBy: { $ne: userObjId },
-                                deletedFor: { $ne: userObjId },
-                                isDeletedForEveryone: { $ne: true },
-                            })
-                        )
-                    );
-                    validConvObjIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
-                }
-            } else {
-                const counts = await Promise.all(
-                    validConvObjIds.map((cId) =>
-                        Message.countDocuments({
-                            conversation: cId,
-                            sender: { $ne: userObjId },
-                            readBy: { $ne: userObjId },
-                            deletedFor: { $ne: userObjId },
-                            isDeletedForEveryone: { $ne: true },
-                        })
-                    )
-                );
-                validConvObjIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
-            }
+        if (activeConvs.length > 0) {
+            const counts = await Promise.all(
+                activeConvs.map(async (conv) => {
+                    const cId = conv._id;
+                    const cIdStr = cId.toString();
+                    const clearedEntry = Array.isArray(conv.clearedAt)
+                        ? conv.clearedAt.find((c) => (c.user?._id || c.user)?.toString() === userObjId.toString())
+                        : null;
+                    const clearedAt = clearedEntry?.at ? new Date(clearedEntry.at) : null;
+                    const query = {
+                        conversation: cId,
+                        sender: { $ne: userObjId, $nin: allUserIds },
+                        readBy: { $ne: userObjId, $nin: allUserIds },
+                        deletedFor: { $ne: userObjId, $nin: allUserIds },
+                        isDeletedForEveryone: { $ne: true },
+                    };
+                    if (clearedAt) {
+                        query.createdAt = { $gt: clearedAt };
+                    }
+                    return Message.countDocuments(query);
+                })
+            );
+            activeConvs.forEach((conv, idx) => {
+                unreadMap.set(conv._id.toString(), counts[idx] || 0);
+            });
         }
 
         // Format other participant and map pre-aggregated unread counts
@@ -246,71 +219,37 @@ const calculateUserUnreadCount = async (userId) => {
 
         let conversationsUnread = {};
         let totalUnreadCount = 0;
+        const allUserIds = [userObjId, userObjId.toString()];
 
-        if (typeof Message.aggregate === "function") {
-            try {
-                const unreadAgg = await Message.aggregate([
-                    {
-                        $match: {
-                            conversation: { $in: activeConvIds },
-                            sender: { $ne: userObjId },
-                            readBy: { $ne: userObjId },
-                            deletedFor: { $ne: userObjId },
-                            isDeletedForEveryone: { $ne: true },
-                        },
-                    },
-                    {
-                        $group: {
-                            _id: "$conversation",
-                            count: { $sum: 1 },
-                        },
-                    },
-                ]);
-                unreadAgg.forEach((u) => {
-                    const count = u.count || 0;
-                    conversationsUnread[u._id.toString()] = count;
-                    totalUnreadCount += count;
-                });
-            } catch (_) {
-                const counts = await Promise.all(
-                    activeConvIds.map((cId) =>
-                        Message.countDocuments({
-                            conversation: cId,
-                            sender: { $ne: userObjId },
-                            readBy: { $ne: userObjId },
-                            deletedFor: { $ne: userObjId },
-                            isDeletedForEveryone: { $ne: true },
-                        })
-                    )
-                );
-                activeConvIds.forEach((cId, idx) => {
-                    const count = counts[idx] || 0;
-                    if (count > 0) {
-                        conversationsUnread[cId.toString()] = count;
-                        totalUnreadCount += count;
-                    }
-                });
-            }
-        } else {
-            const counts = await Promise.all(
-                activeConvIds.map((cId) =>
-                    Message.countDocuments({
+        const counts = await Promise.all(
+            activeConvs.map(async (conv) => {
+                const cId = conv._id;
+                const cIdStr = cId.toString();
+                const clearedEntry = Array.isArray(conv.clearedAt)
+                    ? conv.clearedAt.find((c) => (c.user?._id || c.user)?.toString() === userObjId.toString())
+                    : null;
+                const clearedAt = clearedEntry?.at ? new Date(clearedEntry.at) : null;
+                const query = {
                         conversation: cId,
-                        sender: { $ne: userObjId },
-                        readBy: { $ne: userObjId },
-                        deletedFor: { $ne: userObjId },
+                        sender: { $ne: userObjId, $nin: allUserIds },
+                        readBy: { $ne: userObjId, $nin: allUserIds },
+                        deletedFor: { $ne: userObjId, $nin: allUserIds },
                         isDeletedForEveryone: { $ne: true },
-                    })
-                )
-            );
-            activeConvIds.forEach((cId, idx) => {
-                const count = counts[idx] || 0;
-                if (count > 0) {
-                    conversationsUnread[cId.toString()] = count;
-                    totalUnreadCount += count;
+                    };
+                if (clearedAt) {
+                    query.createdAt = { $gt: clearedAt };
                 }
-            });
-        }
+                return Message.countDocuments(query);
+            })
+        );
+
+        activeConvs.forEach((conv, idx) => {
+            const count = counts[idx] || 0;
+            if (count > 0) {
+                conversationsUnread[conv._id.toString()] = count;
+                totalUnreadCount += count;
+            }
+        });
 
         const unreadConversationsCount = Object.keys(conversationsUnread).length;
 
@@ -744,11 +683,13 @@ const markConversationAsRead = async (req, res) => {
             }
         }
 
+        const allUserIds = [userObjId, userObjId.toString()];
+        const allConvIds = [convObjId, conversationId.toString()];
         const updateResult = await Message.updateMany(
             {
                 conversation: convObjId,
-                sender: { $ne: userObjId },
-                readBy: { $ne: userObjId },
+                sender: { $ne: userObjId, $nin: allUserIds },
+                readBy: { $ne: userObjId, $nin: allUserIds },
             },
             {
                 $addToSet: { readBy: userObjId },

@@ -221,8 +221,9 @@ export const recordCallEnded = async ({ callId, endReason = "ended", endedByUser
  */
 export const getUnseenMissedCallsCount = async (userId) => {
     try {
-        if (!userId || !mongoose.isValidObjectId(userId)) return 0;
-        const userObjId = new mongoose.Types.ObjectId(userId);
+        if (!userId) return 0;
+        const userObjId = mongoose.isValidObjectId(userId) ? new mongoose.Types.ObjectId(userId) : userId;
+        const allUserIds = [userObjId, userId.toString()];
         return await Call.countDocuments({
             receiver: userObjId,
             status: "missed",
@@ -366,14 +367,16 @@ export const markMissedCallsAsSeen = async (req, res) => {
     try {
         const userId = req.user._id;
 
+        const userObjId = mongoose.isValidObjectId(userId) ? new mongoose.Types.ObjectId(userId) : userId;
+        const allUserIds = [userObjId, userId.toString()];
         const result = await Call.updateMany(
             {
-                receiver: userId,
-                status: "missed",
-                seenBy: { $ne: userId },
+                receiver: userObjId,
+            status: "missed",
+            seenBy: { $ne: userObjId },
             },
             {
-                $addToSet: { seenBy: userId },
+                $addToSet: { seenBy: userObjId },
             }
         );
 

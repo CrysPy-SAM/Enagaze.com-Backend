@@ -728,11 +728,13 @@ export const connectToSocket = (server) => {
                     ? new mongoose.Types.ObjectId(conversationId.toString())
                     : conversationId;
 
+                const allUserIds = [userObjId, socket.userId.toString()];
+                const allConvIds = [convObjId, conversationId.toString()];
                 const updateRes = await Message.updateMany(
                     {
                         conversation: conversationId,
-                        sender: { $ne: socket.userId },
-                        readBy: { $ne: socket.userId },
+                        sender: { $ne: socket.userId, $nin: allUserIds },
+                        readBy: { $ne: socket.userId, $nin: allUserIds },
                     },
                     {
                         $addToSet: { readBy: socket.userId },
