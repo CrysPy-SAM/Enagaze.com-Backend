@@ -18,3 +18,4 @@ router.route("/missed-count").get(getMissedCallCount);
 router.route("/mark-seen").post(markMissedCallsAsSeen);
 
 export default router;
+
