@@ -69,10 +69,6 @@ export const USERNAME_INDEXES = [
         supportedQuery: "User.findOne({ normalizedUsername }) in src/controllers/user.controller.js",
     },
 ];
-        description: "Compound equality and reverse-chronological sort index supporting unread notification feed queries",
-        supportedQuery: "Notification.find({ recipient, read: false }).sort({ createdAt: -1 }) in src/services/notification.service.js",
-    },
-];
 
 /**
  * Executes or previews additive index migrations.
