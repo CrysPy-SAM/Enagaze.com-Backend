@@ -79,6 +79,45 @@ export const protect = async (req, res, next) => {
     }
 };
 
+/**
+ * Middleware ensuring user has completed mandatory username setup.
+ * Restricts first-time Google sign-in users from accessing discovery, chat, matches, calls, etc.
+ */
+export const requireUsernameCompleted = (req, res, next) => {
+    if (req.user && req.user.usernameSetupCompleted === false) {
+        return res.status(httpStatus.FORBIDDEN).json({
+            success: false,
+            code: "USERNAME_SETUP_REQUIRED",
+            message: "Please choose your username before accessing this feature.",
+        });
+    }
+    next();
+};
+
+/**
+ * Optional authentication middleware:
+ * Populates req.user if a valid Bearer token is provided, without rejecting anonymous requests.
+ */
+export const optionalAuth = async (req, res, next) => {
+    let token = null;
+    if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
+        token = req.headers.authorization.split(" ")[1];
+    }
+    if (!token) {
+        return next();
+    }
+    try {
+        const decoded = jwt.verify(token, getJwtSecret());
+        const user = await User.findById(decoded.id).select("-password");
+        if (user) {
+            req.user = user;
+        }
+    } catch (_) {
+        // Silently continue for optional auth on token error
+    }
+    next();
+};
+
 export const requireModerator = async (req, res, next) => {
     // 1. Dedicated operational secret header for automation/scripts: x-moderator-secret
     const secret = req.headers["x-moderator-secret"];

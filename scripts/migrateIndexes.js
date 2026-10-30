@@ -45,6 +45,30 @@ export const APPROVED_INDEXES = [
             name: "recipient_1_read_1_createdAt_-1",
             background: true,
         },
+        description: "Compound index covering unread notifications and paginated feed retrieval",
+        supportedQuery: "Notification.find({ recipient, read }).sort({ createdAt: -1 }) in src/controllers/notification.controller.js",
+    },
+];
+
+/**
+ * Username System Indexes (Phase 2D.2)
+ * Managed cleanly alongside backfillUsernames.js
+ */
+export const USERNAME_INDEXES = [
+    {
+        collection: "users",
+        modelName: "User",
+        spec: { normalizedUsername: 1 },
+        options: {
+            name: "normalizedUsername_1_unique",
+            unique: true,
+            sparse: true,
+            background: true,
+        },
+        description: "Unique index on normalized (lowercase) username for case-insensitive uniqueness and fast lookups",
+        supportedQuery: "User.findOne({ normalizedUsername }) in src/controllers/user.controller.js",
+    },
+];
         description: "Compound equality and reverse-chronological sort index supporting unread notification feed queries",
         supportedQuery: "Notification.find({ recipient, read: false }).sort({ createdAt: -1 }) in src/services/notification.service.js",
     },
@@ -156,6 +180,36 @@ export async function runIndexMigration({
                     status: "ALREADY_EXISTS",
                 });
                 continue;
+            }
+
+            // Pre-flight check: ensure no duplicate values exist before attempting unique index build
+            if (idx.options.unique) {
+                const keyField = Object.keys(idx.spec)[0];
+                if (typeof collection.aggregate === "function") {
+                    try {
+                        const duplicates = await collection.aggregate([
+                            { $match: { [keyField]: { $ne: null, $exists: true } } },
+                            { $group: { _id: `$${keyField}`, count: { $sum: 1 } } },
+                            { $match: { count: { $gt: 1 } } },
+                            { $limit: 5 }
+                        ]).toArray();
+
+                        if (duplicates && duplicates.length > 0) {
+                            const sample = duplicates.map((d) => `"${d._id}" (${d.count}x)`).join(", ");
+                            const msg = `Cannot create unique index '${idx.options.name}': found duplicate values for field '${keyField}': [${sample}].`;
+                            logger.error(`  ❌ ${msg}`);
+                            results.push({
+                                collection: idx.collection,
+                                indexName: idx.options.name,
+                                status: "DUPLICATES_DETECTED",
+                                error: msg,
+                            });
+                            continue;
+                        }
+                    } catch (aggErr) {
+                        logger.warn(`  ⚠️ Pre-flight aggregation skipped (${aggErr.message}).`);
+                    }
+                }
             }
 
             // Create index additively
