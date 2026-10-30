@@ -10,6 +10,7 @@ import { User, evaluateAccountStatus } from "../models/user.model.js";
 import { getJwtSecret, JWT_EXPIRES_IN } from "../config/jwt.js";
 import { calculateExactAge, evaluateProfileCompleteness, checkUserEligibility } from "../services/eligibility.service.js";
 import { validatePublicPhotoUrl } from "../services/imageValidation.service.js";
+import { validateUsername, normalizeUsername, generateUsernameSuggestions } from "../utils/usernameValidator.js";
 
 // Helper: Generate JWT token
 const generateToken = (user) => {
@@ -35,7 +36,9 @@ const login = async (req, res) => {
 
     try {
         const normalizedUsername = username.toLowerCase().trim();
-        const user = await User.findOne({ username: normalizedUsername });
+        const user = await User.findOne({
+            $or: [{ normalizedUsername }, { username: normalizedUsername }]
+        });
 
         if (!user) {
             return res.status(httpStatus.UNAUTHORIZED).json({
@@ -104,27 +107,19 @@ const register = async (req, res) => {
     }
 
     const trimmedName = name.trim();
-    const normalizedUsername = username.toLowerCase().trim();
+    const usernameValidation = validateUsername(username);
+    if (!usernameValidation.valid) {
+        return res.status(httpStatus.BAD_REQUEST).json({
+            success: false,
+            message: usernameValidation.error
+        });
+    }
+    const normalizedUsername = usernameValidation.normalized;
 
     if (trimmedName.length < 2 || trimmedName.length > 100) {
         return res.status(httpStatus.BAD_REQUEST).json({
             success: false,
             message: "Name must be between 2 and 100 characters"
-        });
-    }
-
-    if (normalizedUsername.length < 3 || normalizedUsername.length > 30) {
-        return res.status(httpStatus.BAD_REQUEST).json({
-            success: false,
-            message: "Username must be between 3 and 30 characters"
-        });
-    }
-
-    const usernameRegex = /^[a-zA-Z0-9_.-]+$/;
-    if (!usernameRegex.test(normalizedUsername)) {
-        return res.status(httpStatus.BAD_REQUEST).json({
-            success: false,
-            message: "Username can only contain alphanumeric characters, underscores, dots, and hyphens"
         });
     }
 
@@ -162,7 +157,9 @@ const register = async (req, res) => {
     }
 
     try {
-        const existingUser = await User.findOne({ username: normalizedUsername });
+        const existingUser = await User.findOne({
+            $or: [{ normalizedUsername }, { username: normalizedUsername }]
+        });
         if (existingUser) {
             return res.status(httpStatus.CONFLICT).json({
                 success: false,
@@ -174,9 +171,12 @@ const register = async (req, res) => {
 
         const newUser = new User({
             name: trimmedName,
-            username: normalizedUsername,
+            username: usernameValidation.trimmed,
+            normalizedUsername,
             password: hashedPassword,
             dob: parsedDob,
+            usernameSetupCompleted: true,
+            usernameLastChangedAt: null,
             isProfileComplete: false
         });
 
@@ -572,10 +572,13 @@ const googleLogin = async (req, res) => {
                 await user.save();
             }
 
+            const requiresUsernameSetup = user.usernameSetupCompleted === false;
+
             return res.status(httpStatus.OK).json({
                 success: true,
                 message: "Google authentication successful",
                 token,
+                requiresUsernameSetup,
                 user: user.toJSON(),
             });
         }
@@ -600,18 +603,22 @@ const googleLogin = async (req, res) => {
             }
         }
 
-        // 3. New Google User Signup: Create user record
-        const baseCandidate = email ? email.split("@")[0] : name;
-        const username = await generateUniqueUsername(baseCandidate);
+        // 3. New Google User Signup: Create user record with usernameSetupCompleted: false
+        // Generate a temporary unique handle until the user selects their preferred permanent username
+        const tempHandle = `user_${googleId.slice(-6)}_${Math.random().toString(36).substring(2, 6)}`;
+        const normalizedTemp = tempHandle.toLowerCase();
 
         const newUser = new User({
             name: name.slice(0, 100),
-            username,
+            username: tempHandle,
+            normalizedUsername: normalizedTemp,
             email: email || undefined,
             googleId,
             authProvider: "google",
             photos: picture ? [picture] : [],
             isProfileComplete: false,
+            usernameSetupCompleted: false,
+            usernameLastChangedAt: null,
         });
 
         const token = generateToken(newUser);
@@ -619,8 +626,10 @@ const googleLogin = async (req, res) => {
 
         return res.status(httpStatus.CREATED).json({
             success: true,
-            message: "Google account created successfully",
+            message: "Google account created successfully. Please choose your username.",
             token,
+            isNewUser: true,
+            requiresUsernameSetup: true,
             user: newUser.toJSON(),
         });
     } catch (err) {
@@ -778,6 +787,330 @@ const updatePrivacySettings = async (req, res) => {
     }
 };
 
+// ==========================================
+// 7. CHECK USERNAME AVAILABILITY
+// ==========================================
+const checkUsernameAvailability = async (req, res) => {
+    try {
+        const rawUsername = req.query.username;
+        if (!rawUsername) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                available: false,
+                message: "Username parameter is required.",
+            });
+        }
+
+        const validation = validateUsername(rawUsername);
+        if (!validation.valid) {
+            return res.status(httpStatus.OK).json({
+                success: true,
+                available: false,
+                message: validation.error,
+            });
+        }
+
+        // If user is authenticated and checking their own username
+        if (req.user && req.user.normalizedUsername === validation.normalized) {
+            return res.status(httpStatus.OK).json({
+                success: true,
+                available: true,
+                isCurrent: true,
+                message: "This is your current username.",
+            });
+        }
+
+        const existing = await User.findOne({ normalizedUsername: validation.normalized }).select("_id").lean();
+        if (existing) {
+            const suggestions = await generateUsernameSuggestions(validation.trimmed, async (candidateNormalized) => {
+                const found = await User.findOne({ normalizedUsername: candidateNormalized }).select("_id").lean();
+                return !found;
+            });
+
+            return res.status(httpStatus.OK).json({
+                success: true,
+                available: false,
+                message: "Username is already taken.",
+                suggestions,
+            });
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            available: true,
+            message: "Username is available!",
+        });
+    } catch (err) {
+        console.error("Check username availability error:", err);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to check username availability.",
+        });
+    }
+};
+
+// ==========================================
+// 8. SETUP INITIAL USERNAME (FIRST-TIME USERS)
+// ==========================================
+const setupInitialUsername = async (req, res) => {
+    try {
+        const { username } = req.body;
+        if (!username) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "Username is required.",
+            });
+        }
+
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "User account not found.",
+            });
+        }
+
+        // If already completed initial setup, reject redundant setup calls
+        if (user.usernameSetupCompleted) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "Initial username setup has already been completed.",
+                user: user.toJSON(),
+            });
+        }
+
+        const validation = validateUsername(username);
+        if (!validation.valid) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: validation.error,
+            });
+        }
+
+        const existing = await User.findOne({
+            normalizedUsername: validation.normalized,
+            _id: { $ne: user._id },
+        }).select("_id").lean();
+
+        if (existing) {
+            const suggestions = await generateUsernameSuggestions(validation.trimmed, async (candidateNormalized) => {
+                const found = await User.findOne({ normalizedUsername: candidateNormalized }).select("_id").lean();
+                return !found;
+            });
+
+            return res.status(httpStatus.CONFLICT).json({
+                success: false,
+                message: "Username is already taken.",
+                suggestions,
+            });
+        }
+
+        user.username = validation.trimmed;
+        user.normalizedUsername = validation.normalized;
+        user.usernameSetupCompleted = true;
+        user.usernameSetupCompletedAt = new Date();
+        user.usernameLastChangedAt = null; // First subsequent change remains unlocked!
+        await user.save();
+
+        const token = generateToken(user);
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            message: "Username configured successfully!",
+            token,
+            user: user.toJSON(),
+        });
+    } catch (err) {
+        console.error("Setup initial username error:", err);
+        if (err.code === 11000) {
+            return res.status(httpStatus.CONFLICT).json({
+                success: false,
+                message: "Username is already taken. Please choose another.",
+            });
+        }
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to set up username. Please try again.",
+        });
+    }
+};
+
+// ==========================================
+// 9. GET USERNAME CHANGE ELIGIBILITY
+// ==========================================
+const getUsernameEligibility = async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id).select("username normalizedUsername usernameLastChangedAt usernameSetupCompleted");
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "User not found.",
+            });
+        }
+
+        const serverTime = new Date();
+        const COOLDOWN_DAYS = 14;
+        const COOLDOWN_MS = COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+
+        let canChange = true;
+        let nextEligibleAt = null;
+        let cooldownDaysRemaining = 0;
+        let cooldownHoursRemaining = 0;
+
+        if (user.usernameLastChangedAt) {
+            const lastChanged = new Date(user.usernameLastChangedAt).getTime();
+            const elapsedMs = serverTime.getTime() - lastChanged;
+            if (elapsedMs < COOLDOWN_MS) {
+                canChange = false;
+                nextEligibleAt = new Date(lastChanged + COOLDOWN_MS);
+                const remainingMs = nextEligibleAt.getTime() - serverTime.getTime();
+                cooldownDaysRemaining = Math.max(0, Math.floor(remainingMs / (24 * 60 * 60 * 1000)));
+                cooldownHoursRemaining = Math.max(0, Math.ceil((remainingMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)));
+            }
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            username: user.username,
+            canChange,
+            usernameLastChangedAt: user.usernameLastChangedAt || null,
+            nextEligibleAt,
+            cooldownDaysRemaining,
+            cooldownHoursRemaining,
+            serverTime,
+        });
+    } catch (err) {
+        console.error("Get username eligibility error:", err);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to retrieve username eligibility.",
+        });
+    }
+};
+
+// ==========================================
+// 10. UPDATE EXISTING USERNAME (14-DAY COOLDOWN)
+// ==========================================
+const updateUsername = async (req, res) => {
+    try {
+        const { username } = req.body;
+        if (!username) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "New username is required.",
+            });
+        }
+
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "User not found.",
+            });
+        }
+
+        const validation = validateUsername(username);
+        if (!validation.valid) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: validation.error,
+            });
+        }
+
+        // Must differ from current username
+        if (user.normalizedUsername === validation.normalized) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: "New username must be different from your current username.",
+            });
+        }
+
+        // Check if taken by another user
+        const existing = await User.findOne({
+            normalizedUsername: validation.normalized,
+            _id: { $ne: user._id },
+        }).select("_id").lean();
+
+        if (existing) {
+            const suggestions = await generateUsernameSuggestions(validation.trimmed, async (candidateNormalized) => {
+                const found = await User.findOne({ normalizedUsername: candidateNormalized }).select("_id").lean();
+                return !found;
+            });
+
+            return res.status(httpStatus.CONFLICT).json({
+                success: false,
+                message: "Username is already taken.",
+                suggestions,
+            });
+        }
+
+        const serverTime = new Date();
+        const COOLDOWN_DAYS = 14;
+        const COOLDOWN_MS = COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+        const fourteenDaysAgo = new Date(serverTime.getTime() - COOLDOWN_MS);
+
+        // Atomic check-and-update enforcing 14-day cooldown
+        const updatedUser = await User.findOneAndUpdate(
+            {
+                _id: user._id,
+                $or: [
+                    { usernameLastChangedAt: null },
+                    { usernameLastChangedAt: { $exists: false } },
+                    { usernameLastChangedAt: { $lte: fourteenDaysAgo } },
+                ],
+            },
+            {
+                $set: {
+                    username: validation.trimmed,
+                    normalizedUsername: validation.normalized,
+                    usernameLastChangedAt: serverTime,
+                    usernameSetupCompleted: true,
+                },
+            },
+            { new: true, runValidators: true }
+        );
+
+        if (!updatedUser) {
+            const lastChanged = new Date(user.usernameLastChangedAt).getTime();
+            const nextEligibleAt = new Date(lastChanged + COOLDOWN_MS);
+            const remainingMs = Math.max(0, nextEligibleAt.getTime() - serverTime.getTime());
+            const remainingDays = Math.max(1, Math.ceil(remainingMs / (24 * 60 * 60 * 1000)));
+
+            return res.status(httpStatus.TOO_MANY_REQUESTS).json({
+                success: false,
+                code: "USERNAME_COOLDOWN_ACTIVE",
+                message: `You can only change your username once every 14 days. You can change it again in ${remainingDays} day(s).`,
+                nextEligibleAt,
+                remainingDays,
+                serverTime,
+            });
+        }
+
+        const token = generateToken(updatedUser);
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            message: "Username updated successfully!",
+            username: updatedUser.username,
+            nextEligibleAt: new Date(serverTime.getTime() + COOLDOWN_MS),
+            token,
+            user: updatedUser.toJSON(),
+        });
+    } catch (err) {
+        console.error("Update username error:", err);
+        if (err.code === 11000) {
+            return res.status(httpStatus.CONFLICT).json({
+                success: false,
+                message: "Username is already taken. Please choose another.",
+            });
+        }
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to update username. Please try again.",
+        });
+    }
+};
+
 export {
     login,
     register,
@@ -786,4 +1119,8 @@ export {
     googleLogin,
     getPrivacySettings,
     updatePrivacySettings,
+    checkUsernameAvailability,
+    setupInitialUsername,
+    getUsernameEligibility,
+    updateUsername,
 };
