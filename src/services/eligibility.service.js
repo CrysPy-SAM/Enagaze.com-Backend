@@ -199,6 +199,16 @@ export function checkUserEligibility(user, referenceDate = new Date(), options =
         };
     }
 
+    if (user.usernameSetupCompleted === false) {
+        return {
+            isEligible: false,
+            age: null,
+            code: "USERNAME_SETUP_REQUIRED",
+            reason: "Please choose your username before accessing this feature.",
+            missingFields: ["username"],
+        };
+    }
+
     const evaluation = evaluateProfileCompleteness(user, referenceDate);
     if (!evaluation.isComplete) {
         return {
