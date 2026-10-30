@@ -14,6 +14,12 @@ import { toMessageDto, toPublicProfile } from "../serializers/profile.serializer
 import { checkUserEligibility } from "../services/eligibility.service.js";
 import { calculateUserUnreadCount } from "./chat.controller.js";
 import {
+    recordCallInitiated,
+    recordCallAccepted,
+    recordCallEnded,
+    getUnseenMissedCallsCount,
+} from "./call.controller.js";
+import {
     userConnected,
     userDisconnected,
     isUserOnline,
@@ -65,6 +71,10 @@ export const terminateUserActiveDirectCalls = (userId, reason = "moderation_acti
     }
 
     if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
+
+    recordCallEnded({ callId, endReason: reason, io: ioInstance }).catch((err) =>
+        console.warn("Error finalizing call on termination:", err?.message)
+    );
 
     const partnerId = call.callerId === userIdStr ? call.calleeId : call.callerId;
     if (ioInstance && partnerId) {
@@ -949,6 +959,7 @@ export const connectToSocket = (server) => {
                         activeDirectCalls.delete(prevCallId);
                         userToDirectCall.delete(prevCall.callerId);
                         userToDirectCall.delete(prevCall.calleeId);
+                        recordCallEnded({ callId: prevCallId, endReason: "cancelled", io }).catch(() => {});
                     }
                 }
 
@@ -956,14 +967,32 @@ export const connectToSocket = (server) => {
                 const roomName = `direct-call:${callId}`;
                 socket.join(roomName);
 
+                // Determine whether callee is actually online and connected to be alerted
+                const calleeSockets = await io.in(`user:${calleeId}`).fetchSockets();
+                const receiverAlerted = calleeSockets.length > 0;
+                const callType = data?.callType === "audio" ? "audio" : "video";
+
+                // Persist call initiation in MongoDB
+                await recordCallInitiated({
+                    callId,
+                    callerId: socket.userId,
+                    calleeId,
+                    conversationId,
+                    callType,
+                    receiverAlerted,
+                });
+
                 // Set 35s ringing timeout
-                const timeoutHandle = setTimeout(() => {
+                const timeoutHandle = setTimeout(async () => {
                     const call = activeDirectCalls.get(callId);
                     if (call && call.status === "ringing") {
                         call.status = "ended";
                         activeDirectCalls.delete(callId);
                         userToDirectCall.delete(call.callerId);
                         userToDirectCall.delete(call.calleeId);
+
+                        await recordCallEnded({ callId, endReason: "timeout", io });
+
                         io.to(`user:${call.callerId}`).emit("call:no-answer", { callId, reason: "timeout" });
                         io.to(`user:${call.calleeId}`).emit("call:ended", { callId, reason: "timeout" });
                     }
@@ -977,6 +1006,8 @@ export const connectToSocket = (server) => {
                     callerSocketId: socket.id,
                     calleeSocketId: null,
                     conversationId: conversationId || null,
+                    callType,
+                    receiverAlerted,
                     createdAt: Date.now(),
                     timeoutHandle,
                 };
@@ -990,6 +1021,7 @@ export const connectToSocket = (server) => {
                     callId,
                     caller: toPublicProfile(callerUser),
                     conversationId: conversationId || null,
+                    callType,
                 });
 
                 if (typeof ack === "function") {
@@ -1032,6 +1064,9 @@ export const connectToSocket = (server) => {
             if (call.timeoutHandle) clearTimeout(call.timeoutHandle);
             call.status = "connected";
             call.calleeSocketId = socket.id;
+
+            // Persist acceptance in MongoDB
+            await recordCallAccepted({ callId });
 
             const roomName = `direct-call:${callId}`;
             socket.join(roomName);
@@ -1168,7 +1203,7 @@ export const connectToSocket = (server) => {
             }
         });
 
-        socket.on("call:end", (data, ack) => {
+        socket.on("call:end", async (data, ack) => {
             const { callId, targetUserId } = data || {};
             const activeId = callId || (socket.userId ? userToDirectCall.get(socket.userId) : null);
             if (activeId) {
@@ -1178,6 +1213,14 @@ export const connectToSocket = (server) => {
                     activeDirectCalls.delete(activeId);
                     userToDirectCall.delete(call.callerId);
                     userToDirectCall.delete(call.calleeId);
+
+                    await recordCallEnded({
+                        callId: activeId,
+                        endReason: "ended_by_partner",
+                        endedByUserId: socket.userId,
+                        io,
+                    });
+
                     const partnerId = targetUserId || (socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId);
                     io.to(`user:${partnerId.toString()}`).emit("call:ended", { callId: activeId, reason: "ended_by_partner" });
                 }
@@ -1188,7 +1231,7 @@ export const connectToSocket = (server) => {
             if (typeof ack === "function") ack({ success: true });
         });
 
-        socket.on("call:decline", (data, ack) => {
+        socket.on("call:decline", async (data, ack) => {
             const { callId, targetUserId } = data || {};
             const activeId = callId || (socket.userId ? userToDirectCall.get(socket.userId) : null);
             if (activeId) {
@@ -1198,6 +1241,14 @@ export const connectToSocket = (server) => {
                     activeDirectCalls.delete(activeId);
                     userToDirectCall.delete(call.callerId);
                     userToDirectCall.delete(call.calleeId);
+
+                    await recordCallEnded({
+                        callId: activeId,
+                        endReason: "declined",
+                        endedByUserId: socket.userId,
+                        io,
+                    });
+
                     const partnerId = targetUserId || (socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId);
                     io.to(`user:${partnerId.toString()}`).emit("call:declined", { callId: activeId, reason: "declined_by_partner" });
                 }
@@ -1233,6 +1284,13 @@ export const connectToSocket = (server) => {
                     activeDirectCalls.delete(directCallId);
                     userToDirectCall.delete(call.callerId);
                     userToDirectCall.delete(call.calleeId);
+
+                    await recordCallEnded({
+                        callId: directCallId,
+                        endReason: "partner_disconnected",
+                        endedByUserId: socket.userId,
+                        io,
+                    });
 
                     const otherUserId = socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId;
                     io.to(`user:${otherUserId}`).emit("call:ended", { callId: directCallId, reason: "partner_disconnected" });

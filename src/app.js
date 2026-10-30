@@ -16,6 +16,7 @@ import safetyRoutes from "./routes/safety.routes.js";
 import moderationRoutes from "./routes/moderation.routes.js";
 import webrtcRoutes from "./routes/webrtc.routes.js";
 import notificationRoutes from "./routes/notification.routes.js";
+import callRoutes from "./routes/call.routes.js";
 import { backfillLegacyUsers } from "../scripts/backfillUsernames.js";
 import { validateJwtConfig } from "./config/jwt.js";
 import { getMongoConnectionOptions } from "./config/database.js";
@@ -220,6 +221,7 @@ app.use("/api/v1/safety", safetyRoutes);
 app.use("/api/v1/moderation", moderationRoutes);
 app.use("/api/v1/webrtc", webrtcRoutes);
 app.use("/api/v1/notifications", notificationRoutes);
+app.use("/api/v1/calls", callRoutes);
 
 const KNOWN_SAFE_DB_ERRORS = new Set([
   "MongoParseError",

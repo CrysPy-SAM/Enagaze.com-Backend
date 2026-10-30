@@ -15,10 +15,14 @@ const notificationSchema = new mongoose.Schema(
         },
         type: {
             type: String,
-            enum: ["like", "match", "message", "match_request", "match_accepted"],
+            enum: ["like", "match", "message", "match_request", "match_accepted", "missed_call"],
             required: true,
         },
         data: {
+            callId: {
+                type: String,
+                default: null,
+            },
             matchId: {
                 type: mongoose.Schema.Types.ObjectId,
                 ref: "Match",
@@ -65,3 +69,4 @@ notificationSchema.index(
 );
 
 export const Notification = mongoose.model("Notification", notificationSchema);
+export default Notification;
