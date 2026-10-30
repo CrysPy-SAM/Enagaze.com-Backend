@@ -36,9 +36,16 @@ const login = async (req, res) => {
 
     try {
         const normalizedUsername = username.toLowerCase().trim();
-        const user = await User.findOne({
-            $or: [{ normalizedUsername }, { username: normalizedUsername }]
-        });
+        const trimmedUsername = username.trim();
+
+        // Find user by normalized handle first (O(1) via unique index), fallback to direct username
+        let user = await User.findOne({ normalizedUsername });
+        if (!user) {
+            user = await User.findOne({ username: trimmedUsername });
+        }
+        if (!user && trimmedUsername !== normalizedUsername) {
+            user = await User.findOne({ username: normalizedUsername });
+        }
 
         if (!user) {
             return res.status(httpStatus.UNAUTHORIZED).json({
