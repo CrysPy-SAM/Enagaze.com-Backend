@@ -331,6 +331,56 @@ export const getUnreadNotificationCount = async (userId) => {
 };
 
 /**
+ * Returns category-specific and total unread notification counts for a user.
+ *
+ * @param {string|mongoose.Types.ObjectId} userId
+ * @returns {Promise<{ total: number, likes: number, requests: number }>}
+ */
+export const getUnreadNotificationCounts = async (userId) => {
+    const blockedUserIds = await Block.getBlockedUserIds(userId);
+    const isDbConnected = mongoose.connection.readyState === 1;
+
+    if (isDbConnected) {
+        const [total, likes, requests] = await Promise.all([
+            Notification.countDocuments({
+                recipient: userId,
+                read: false,
+                sender: { $nin: blockedUserIds },
+            }),
+            Notification.countDocuments({
+                recipient: userId,
+                read: false,
+                type: "like",
+                sender: { $nin: blockedUserIds },
+            }),
+            Notification.countDocuments({
+                recipient: userId,
+                read: false,
+                type: "match_request",
+                sender: { $nin: blockedUserIds },
+            }),
+        ]);
+
+        return { total, likes, requests };
+    }
+
+    const blockedSet = new Set(blockedUserIds.map((b) => b.toString()));
+    const userIdStr = userId.toString();
+    const unread = inMemoryFallbackNotifications.filter(
+        (n) =>
+            n.recipient.toString() === userIdStr &&
+            !n.read &&
+            !blockedSet.has(n.sender.toString())
+    );
+
+    return {
+        total: unread.length,
+        likes: unread.filter((n) => n.type === "like").length,
+        requests: unread.filter((n) => n.type === "match_request").length,
+    };
+};
+
+/**
  * Marks a specific notification as read.
  *
  * @param {string|mongoose.Types.ObjectId} notificationId
@@ -430,6 +480,37 @@ export const markAllNotificationsAsRead = async (userId) => {
     let count = 0;
     for (const n of inMemoryFallbackNotifications) {
         if (n.recipient.toString() === userIdStr && !n.read) {
+            n.read = true;
+            n.updatedAt = new Date();
+            count++;
+        }
+    }
+    return count;
+};
+
+/**
+ * Marks all notifications of a specific type as read for a user.
+ *
+ * @param {string|mongoose.Types.ObjectId} userId
+ * @param {string} type
+ * @returns {Promise<number>} Number of notifications modified
+ */
+export const markNotificationsAsReadByType = async (userId, type) => {
+    if (!userId || !type) return 0;
+    const isDbConnected = mongoose.connection.readyState === 1;
+
+    if (isDbConnected) {
+        const result = await Notification.updateMany(
+            { recipient: userId, type, read: false },
+            { $set: { read: true } }
+        );
+        return result.modifiedCount || 0;
+    }
+
+    const userIdStr = userId.toString();
+    let count = 0;
+    for (const n of inMemoryFallbackNotifications) {
+        if (n.recipient.toString() === userIdStr && n.type === type && !n.read) {
             n.read = true;
             n.updatedAt = new Date();
             count++;
