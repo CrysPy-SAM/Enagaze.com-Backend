@@ -76,10 +76,12 @@ const getConversations = async (req, res) => {
                 return false;
             }
             const otherParticipant = conv.participants.find(
-                (p) => p && p._id.toString() !== userObjId.toString()
+                (p) => p && (p._id || p).toString() !== userObjId.toString()
             );
             if (!otherParticipant) return false;
-            if (blockedSet.has(otherParticipant._id.toString())) return false;
+            if (otherParticipant.status === "deleted" || otherParticipant.status === "suspended") return false;
+            const otherId = (otherParticipant._id || otherParticipant).toString();
+            if (blockedSet.has(otherId)) return false;
             return true;
         });
 
@@ -214,7 +216,10 @@ const calculateUserUnreadCount = async (userId) => {
                     hiddenFor: { $ne: userObjId },
                 })
                     .select("_id match participants clearedAt")
-                    .populate({ path: "match", select: "status" })
+                    .populate([
+                        { path: "match", select: "status" },
+                        { path: "participants", select: "_id status" },
+                    ])
             ),
         ]);
         const blockedSet = new Set(blockedUserIds.map((id) => id.toString()));
@@ -225,6 +230,7 @@ const calculateUserUnreadCount = async (userId) => {
                 (p) => p && (p._id || p).toString() !== userObjId.toString()
             );
             if (!otherParticipant) return false;
+            if (otherParticipant.status === "deleted" || otherParticipant.status === "suspended") return false;
             const otherId = (otherParticipant._id || otherParticipant).toString();
             if (blockedSet.has(otherId)) return false;
             return true;
