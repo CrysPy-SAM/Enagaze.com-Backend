@@ -531,7 +531,7 @@ const getMessages = async (req, res) => {
         const clearedTime = clearedEntry?.at ? new Date(clearedEntry.at) : null;
 
         const baseFilter = {
-            conversation: convObjId,
+            conversation: conversationId,
             deletedFor: { $ne: userObjId },
         };
         if (clearedTime) {

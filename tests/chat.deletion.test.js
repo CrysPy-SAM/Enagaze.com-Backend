@@ -564,4 +564,46 @@ describe("WhatsApp-Inspired Chat & Message Deletion Test Suite", () => {
         await getConversations(getConvsB, resConvsB);
         assert.equal(resConvsB.data.conversations.length, 1);
     });
+    it("7. getMessages preserves exact conversation string ID and compound pagination cursor invariants", async () => {
+        const conv = inMemoryConversations[0];
+        const pivotId = new mongoose.Types.ObjectId("65cbc0000000000000000001");
+        const pivotDate = new Date("2026-02-01T10:00:00Z");
+
+        let capturedFindQuery = null;
+        const originalFind = Message.find;
+        const originalFindById = Message.findById;
+
+        Message.findById = (id) => ({
+            select: () => Promise.resolve({ _id: pivotId, createdAt: pivotDate }),
+        });
+
+        Message.find = (q) => {
+            capturedFindQuery = q;
+            return {
+                sort: () => ({
+                    limit: () => ({
+                        populate: () => Promise.resolve([]),
+                    }),
+                }),
+            };
+        };
+
+        const req = {
+            user: mockUserA,
+            params: { conversationId: conv._id.toString() },
+            query: { before: pivotId.toString(), limit: "10" },
+        };
+        const res = createMockRes();
+        await getMessages(req, res);
+
+        assert.equal(res.statusCode, 200);
+        assert.ok(capturedFindQuery);
+        assert.strictEqual(capturedFindQuery.conversation, conv._id.toString());
+        assert.ok(capturedFindQuery.$or);
+        assert.deepStrictEqual(capturedFindQuery.$or[0], { createdAt: { $lt: pivotDate } });
+        assert.deepStrictEqual(capturedFindQuery.$or[1], { createdAt: pivotDate, _id: { $lt: pivotId } });
+
+        Message.find = originalFind;
+        Message.findById = originalFindById;
+    });
 });
