@@ -12,6 +12,7 @@ import { getJwtSecret } from "../config/jwt.js";
 import { corsOptions } from "../config/cors.js";
 import { toMessageDto, toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
+import { calculateUserUnreadCount } from "./chat.controller.js";
 import {
     userConnected,
     userDisconnected,
@@ -592,6 +593,19 @@ export const connectToSocket = (server) => {
                 }
                 broadcast.emit("chat:new-message", messageDto);
 
+                // Push real-time unread count notification to recipient user room
+                if (otherParticipantId) {
+                    calculateUserUnreadCount(otherParticipantId)
+                        .then((counts) => {
+                            io.to(`user:${otherParticipantId.toString()}`).emit("chat:unread-count", {
+                                unreadCount: counts.totalUnreadCount,
+                                unreadConversationsCount: counts.unreadConversationsCount,
+                                conversationsUnread: counts.conversationsUnread,
+                            });
+                        })
+                        .catch(() => {});
+                }
+
                 if (typeof ack === "function") {
                     ack({ success: true, message: messageDto, serverLatencyMs: totalDurationMs });
                 }
@@ -718,6 +732,16 @@ export const connectToSocket = (server) => {
                     conversationId,
                     readerId: socket.userId,
                 });
+                // Push real-time unread count to reader user room
+                calculateUserUnreadCount(socket.userId)
+                    .then((counts) => {
+                        io.to(`user:${socket.userId.toString()}`).emit("chat:unread-count", {
+                            unreadCount: counts.totalUnreadCount,
+                            unreadConversationsCount: counts.unreadConversationsCount,
+                            conversationsUnread: counts.conversationsUnread,
+                        });
+                    })
+                    .catch(() => {});
 
                 if (typeof ack === "function") {
                     ack({ success: true, conversationId, readerId: socket.userId, modifiedCount: updateRes.modifiedCount });
