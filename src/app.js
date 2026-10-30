@@ -16,6 +16,7 @@ import safetyRoutes from "./routes/safety.routes.js";
 import moderationRoutes from "./routes/moderation.routes.js";
 import webrtcRoutes from "./routes/webrtc.routes.js";
 import notificationRoutes from "./routes/notification.routes.js";
+import { backfillLegacyUsers } from "../scripts/backfillUsernames.js";
 import { validateJwtConfig } from "./config/jwt.js";
 import { getMongoConnectionOptions } from "./config/database.js";
 import {
@@ -525,6 +526,7 @@ const start = async ({ exitOnError = true } = {}) => {
   try {
     connectionDb = await mongoose.connect(process.env.MONGO_URI, mongoOptions);
     console.log(`✅ MONGO Connected DB Host: ${connectionDb.connection.host}`);
+    backfillLegacyUsers().catch((err) => console.warn("Legacy user backfill notice:", err.message));
   } catch (dbErr) {
     const safeMsg = formatSafeDatabaseError(dbErr);
     console.error(`❌ Fatal MongoDB Startup Connection Error: ${safeMsg}`);
