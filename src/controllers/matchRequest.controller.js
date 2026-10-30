@@ -9,6 +9,7 @@ import { findOrCreateCanonicalMatchAndConversation } from "../services/matching.
 import {
     createNotification,
     supersedeMatchRequestNotifications,
+    getUnreadNotificationCounts,
 } from "../services/notification.service.js";
 import { toPublicProfile } from "../serializers/profile.serializer.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
@@ -281,6 +282,14 @@ export const sendMatchRequest = async (req, res) => {
                     createdAt: newRequest.createdAt,
                 },
             });
+            try {
+                const counts = await getUnreadNotificationCounts(targetUserId);
+                io.to(`user:${targetUserId.toString()}`).emit("notification:counts", {
+                    unreadCount: counts.total,
+                    unreadLikesCount: counts.likes,
+                    unreadRequestsCount: counts.requests,
+                });
+            } catch (_) {}
         }
 
         return res.status(httpStatus.CREATED).json({
@@ -596,6 +605,31 @@ export const acceptMatchRequest = async (req, res) => {
                     createdAt: match.createdAt,
                 },
             });
+
+            // Match request accepted events to remove pending cards from requests feeds
+            io.to(`user:${senderId}`).emit("match_request:accepted", {
+                requestId: matchRequest._id,
+            });
+            io.to(`user:${req.user._id.toString()}`).emit("match_request:accepted", {
+                requestId: matchRequest._id,
+            });
+
+            try {
+                const [countsSender, countsRecipient] = await Promise.all([
+                    getUnreadNotificationCounts(senderId),
+                    getUnreadNotificationCounts(req.user._id),
+                ]);
+                io.to(`user:${senderId}`).emit("notification:counts", {
+                    unreadCount: countsSender.total,
+                    unreadLikesCount: countsSender.likes,
+                    unreadRequestsCount: countsSender.requests,
+                });
+                io.to(`user:${req.user._id.toString()}`).emit("notification:counts", {
+                    unreadCount: countsRecipient.total,
+                    unreadLikesCount: countsRecipient.likes,
+                    unreadRequestsCount: countsRecipient.requests,
+                });
+            } catch (_) {}
         }
 
         return res.status(httpStatus.OK).json({
@@ -677,6 +711,24 @@ export const declineMatchRequest = async (req, res) => {
 
         // 5. Supersede pending match_request notifications
         await supersedeMatchRequestNotifications(req.user._id, matchRequest.sender);
+
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            io.to(`user:${req.user._id.toString()}`).emit("match_request:declined", {
+                requestId,
+            });
+            io.to(`user:${matchRequest.sender.toString()}`).emit("match_request:declined", {
+                requestId,
+            });
+            try {
+                const counts = await getUnreadNotificationCounts(req.user._id);
+                io.to(`user:${req.user._id.toString()}`).emit("notification:counts", {
+                    unreadCount: counts.total,
+                    unreadLikesCount: counts.likes,
+                    unreadRequestsCount: counts.requests,
+                });
+            } catch (_) {}
+        }
 
         // Keep chat and video calling strictly locked; no Match record created
         return res.status(httpStatus.OK).json({
