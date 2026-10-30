@@ -12,6 +12,7 @@ import { findOrCreateCanonicalMatchAndConversation } from "../services/matching.
 import {
     createNotification,
     supersedeLikeNotifications,
+    getUnreadNotificationCounts,
 } from "../services/notification.service.js";
 import { safeLean } from "../utils/queryHelper.js";
 
@@ -388,6 +389,26 @@ const swipe = async (req, res) => {
                                 createdAt: match.createdAt,
                             },
                         });
+
+                        // Emit like:matched so both users remove each other from pending Likes You
+                        io.to(`user:${targetUserId.toString()}`).emit("like:matched", {
+                            matchedUserId: req.user._id.toString(),
+                            match: {
+                                _id: match._id,
+                                matchedUser: currentUserPublic,
+                                conversationId: conversation?._id,
+                                createdAt: match.createdAt,
+                            },
+                        });
+                        io.to(`user:${req.user._id.toString()}`).emit("like:matched", {
+                            matchedUserId: targetUserId.toString(),
+                            match: {
+                                _id: match._id,
+                                matchedUser: targetUserPublic,
+                                conversationId: conversation?._id,
+                                createdAt: match.createdAt,
+                            },
+                        });
                     }
 
                     // Persist match notifications for both users and supersede any prior likes
@@ -408,6 +429,25 @@ const swipe = async (req, res) => {
                         }),
                         supersedeLikeNotifications(req.user._id, targetUserId),
                     ]);
+
+                    if (io) {
+                        try {
+                            const [countsTarget, countsCurrent] = await Promise.all([
+                                getUnreadNotificationCounts(targetUserId),
+                                getUnreadNotificationCounts(req.user._id),
+                            ]);
+                            io.to(`user:${targetUserId.toString()}`).emit("notification:counts", {
+                                unreadCount: countsTarget.total,
+                                unreadLikesCount: countsTarget.likes,
+                                unreadRequestsCount: countsTarget.requests,
+                            });
+                            io.to(`user:${req.user._id.toString()}`).emit("notification:counts", {
+                                unreadCount: countsCurrent.total,
+                                unreadLikesCount: countsCurrent.likes,
+                                unreadRequestsCount: countsCurrent.requests,
+                            });
+                        } catch (_) {}
+                    }
                 }
 
                 return res.status(httpStatus.CREATED).json({
@@ -427,12 +467,30 @@ const swipe = async (req, res) => {
         // Unilateral like notification (when action is 'like' without mutual match yet)
         if (action === "like") {
             const io = req.app?.get("io") || getIO();
-            await createNotification({
+            const notif = await createNotification({
                 recipient: targetUserId,
                 sender: req.user._id,
                 type: "like",
                 io,
             });
+
+            if (io) {
+                const senderPublic = toPublicProfile(req.user);
+                io.to(`user:${targetUserId.toString()}`).emit("like:new", {
+                    profile: {
+                        ...senderPublic,
+                        likedAt: notif?.createdAt || new Date(),
+                    },
+                });
+                try {
+                    const counts = await getUnreadNotificationCounts(targetUserId);
+                    io.to(`user:${targetUserId.toString()}`).emit("notification:counts", {
+                        unreadCount: counts.total,
+                        unreadLikesCount: counts.likes,
+                        unreadRequestsCount: counts.requests,
+                    });
+                } catch (_) {}
+            }
         }
 
         // Either action was 'pass' or one-sided 'like' without a mutual like yet
