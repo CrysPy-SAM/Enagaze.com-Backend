@@ -6,7 +6,11 @@ import {
     updateMyProfile,
     googleLogin,
     getPrivacySettings,
-    updatePrivacySettings
+    updatePrivacySettings,
+    checkUsernameAvailability,
+    setupInitialUsername,
+    getUsernameEligibility,
+    updateUsername,
 } from "../controllers/user.controller.js";
 import {
     searchUsers,
@@ -19,7 +23,7 @@ import {
     uploadPayload,
     serveMedia
 } from "../controllers/photoUpload.controller.js";
-import { protect } from "../middlewares/auth.middleware.js";
+import { protect, requireUsernameCompleted, optionalAuth } from "../middlewares/auth.middleware.js";
 import {
     loginIpLimiter,
     loginAccountLimiter,
@@ -27,6 +31,7 @@ import {
     googleLoginLimiter,
     photoUploadLimiter,
     userSearchLimiter,
+    usernameCheckLimiter,
 } from "../middlewares/rateLimiter.middleware.js";
 
 const router = Router();
@@ -36,9 +41,15 @@ router.route("/login").post(loginIpLimiter, loginAccountLimiter, login);
 router.route("/register").post(registerLimiter, register);
 router.route("/google-login").post(googleLoginLimiter, googleLogin);
 
+// Username verification & management endpoints
+router.route("/check-username").get(usernameCheckLimiter, optionalAuth, checkUsernameAvailability);
+router.route("/setup-username").post(protect, setupInitialUsername);
+router.route("/username-eligibility").get(protect, getUsernameEligibility);
+router.route("/username").put(protect, updateUsername);
+
 // People Discovery & Instagram-style Search endpoints
 router.route("/search")
-    .get(protect, userSearchLimiter, searchUsers);
+    .get(protect, requireUsernameCompleted, userSearchLimiter, searchUsers);
 
 router.route("/profile/public/:userId")
     .get(protect, getPublicUserProfile);
