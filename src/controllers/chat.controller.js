@@ -16,11 +16,14 @@ import { safeLean } from "../utils/queryHelper.js";
 const getConversations = async (req, res) => {
     try {
         const userId = req.user._id;
+        const userObjId = mongoose.Types.ObjectId.isValid(userId)
+            ? new mongoose.Types.ObjectId(userId.toString())
+            : userId;
 
         // Run block list and mutual active matches lookups concurrently
         const [blockedUserIds, userMatches] = await Promise.all([
-            Block.getBlockedUserIds(userId),
-            safeLean(Match.find({ users: userId, status: "active" }).select("_id users createdAt")),
+            Block.getBlockedUserIds(userObjId),
+            safeLean(Match.find({ users: userObjId, status: "active" }).select("_id users createdAt")),
         ]);
         const blockedSet = new Set(blockedUserIds.map((id) => id.toString()));
 
@@ -46,7 +49,10 @@ const getConversations = async (req, res) => {
         }
 
         const conversations = await safeLean(
-            Conversation.find({ participants: userId })
+            Conversation.find({
+                participants: userObjId,
+                hiddenFor: { $ne: userObjId },
+            })
                 .sort({ lastMessageAt: -1 })
                 .populate({
                     path: "match",
@@ -58,7 +64,7 @@ const getConversations = async (req, res) => {
                 })
                 .populate({
                     path: "lastMessage",
-                    select: "content sender createdAt readBy",
+                    select: "content sender createdAt readBy deletedFor isDeletedForEveryone deletedAt",
                     populate: { path: "sender", select: "name photos" },
                 })
         );
@@ -66,8 +72,11 @@ const getConversations = async (req, res) => {
         // Filter active, unblocked conversations
         const activeConvs = conversations.filter((conv) => {
             if (!conv.match || conv.match.status !== "active") return false;
+            if (conv.hiddenFor && conv.hiddenFor.some((id) => (id?._id || id)?.toString() === userObjId.toString())) {
+                return false;
+            }
             const otherParticipant = conv.participants.find(
-                (p) => p && p._id.toString() !== userId.toString()
+                (p) => p && p._id.toString() !== userObjId.toString()
             );
             if (!otherParticipant) return false;
             if (blockedSet.has(otherParticipant._id.toString())) return false;
@@ -75,17 +84,21 @@ const getConversations = async (req, res) => {
         });
 
         // Batch-aggregate unread message counts across all active conversations in a single query
-        const validConvIds = activeConvs.map((c) => c._id);
+        const validConvObjIds = activeConvs.map((c) =>
+            mongoose.Types.ObjectId.isValid(c._id) ? new mongoose.Types.ObjectId(c._id.toString()) : c._id
+        );
         let unreadMap = new Map();
-        if (validConvIds.length > 0) {
+        if (validConvObjIds.length > 0) {
             if (typeof Message.aggregate === "function") {
                 try {
                     const unreadAgg = await Message.aggregate([
                         {
                             $match: {
-                                conversation: { $in: validConvIds },
-                                sender: { $ne: userId },
-                                readBy: { $ne: userId },
+                                conversation: { $in: validConvObjIds },
+                                sender: { $ne: userObjId },
+                                readBy: { $ne: userObjId },
+                                deletedFor: { $ne: userObjId },
+                                isDeletedForEveryone: { $ne: true },
                             },
                         },
                         {
@@ -99,27 +112,31 @@ const getConversations = async (req, res) => {
                 } catch (_) {
                     // Safe fallback for testing or mock environments
                     const counts = await Promise.all(
-                        validConvIds.map((cId) =>
+                        validConvObjIds.map((cId) =>
                             Message.countDocuments({
                                 conversation: cId,
-                                sender: { $ne: userId },
-                                readBy: { $ne: userId },
+                                sender: { $ne: userObjId },
+                                readBy: { $ne: userObjId },
+                                deletedFor: { $ne: userObjId },
+                                isDeletedForEveryone: { $ne: true },
                             })
                         )
                     );
-                    validConvIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
+                    validConvObjIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
                 }
             } else {
                 const counts = await Promise.all(
-                    validConvIds.map((cId) =>
+                    validConvObjIds.map((cId) =>
                         Message.countDocuments({
                             conversation: cId,
-                            sender: { $ne: userId },
-                            readBy: { $ne: userId },
+                            sender: { $ne: userObjId },
+                            readBy: { $ne: userObjId },
+                            deletedFor: { $ne: userObjId },
+                            isDeletedForEveryone: { $ne: true },
                         })
                     )
                 );
-                validConvIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
+                validConvObjIds.forEach((cId, idx) => unreadMap.set(cId.toString(), counts[idx]));
             }
         }
 
@@ -127,10 +144,28 @@ const getConversations = async (req, res) => {
         const formatted = await Promise.all(
             activeConvs.map(async (conv) => {
                 const otherParticipant = conv.participants.find(
-                    (p) => p && p._id.toString() !== userId.toString()
+                    (p) => p && p._id.toString() !== userObjId.toString()
                 );
                 const unreadCount = unreadMap.get(conv._id.toString()) || 0;
-                const lastMsgDto = conv.lastMessage ? toMessageDto(conv.lastMessage) : null;
+
+                let lastMsgDto = null;
+                if (conv.lastMessage) {
+                    const isDeletedForMe = Boolean(
+                        conv.lastMessage.deletedFor &&
+                        conv.lastMessage.deletedFor.some((id) => (id?._id || id)?.toString() === userObjId.toString())
+                    );
+                    const clearedEntry = conv.clearedAt && conv.clearedAt.find(
+                        (c) => (c.user?._id || c.user)?.toString() === userObjId.toString()
+                    );
+                    const isCleared = clearedEntry && clearedEntry.at &&
+                        conv.lastMessage.createdAt &&
+                        new Date(conv.lastMessage.createdAt) <= new Date(clearedEntry.at);
+
+                    if (!isDeletedForMe && !isCleared) {
+                        lastMsgDto = toMessageDto(conv.lastMessage, userObjId);
+                    }
+                }
+
                 const presence = otherParticipant ? await getPresenceForViewer(otherParticipant, req.user, true) : null;
 
                 return {
@@ -158,7 +193,6 @@ const getConversations = async (req, res) => {
 };
 
 // ==========================================
-
 // ==========================================
 // 1b. GET TOTAL UNREAD MESSAGE COUNT FOR CURRENT USER
 // ==========================================
@@ -168,28 +202,37 @@ const calculateUserUnreadCount = async (userId) => {
     }
 
     try {
+        const userObjId = mongoose.Types.ObjectId.isValid(userId)
+            ? new mongoose.Types.ObjectId(userId.toString())
+            : userId;
+
         const [blockedUserIds, conversations] = await Promise.all([
-            Block.getBlockedUserIds(userId),
+            Block.getBlockedUserIds(userObjId),
             safeLean(
-                Conversation.find({ participants: userId })
-                    .select('_id match participants')
-                    .populate({ path: 'match', select: 'status' })
+                Conversation.find({
+                    participants: userObjId,
+                    hiddenFor: { $ne: userObjId },
+                })
+                    .select("_id match participants clearedAt")
+                    .populate({ path: "match", select: "status" })
             ),
         ]);
         const blockedSet = new Set(blockedUserIds.map((id) => id.toString()));
 
-        const activeConvIds = conversations
-            .filter((conv) => {
-                if (!conv.match || conv.match.status !== 'active') return false;
-                const otherParticipant = (conv.participants || []).find(
-                    (p) => p && (p._id || p).toString() !== userId.toString()
-                );
-                if (!otherParticipant) return false;
-                const otherId = (otherParticipant._id || otherParticipant).toString();
-                if (blockedSet.has(otherId)) return false;
-                return true;
-            })
-            .map((c) => c._id);
+        const activeConvs = conversations.filter((conv) => {
+            if (!conv.match || conv.match.status !== "active") return false;
+            const otherParticipant = (conv.participants || []).find(
+                (p) => p && (p._id || p).toString() !== userObjId.toString()
+            );
+            if (!otherParticipant) return false;
+            const otherId = (otherParticipant._id || otherParticipant).toString();
+            if (blockedSet.has(otherId)) return false;
+            return true;
+        });
+
+        const activeConvIds = activeConvs.map((c) =>
+            mongoose.Types.ObjectId.isValid(c._id) ? new mongoose.Types.ObjectId(c._id.toString()) : c._id
+        );
 
         if (activeConvIds.length === 0) {
             return { totalUnreadCount: 0, unreadConversationsCount: 0, conversationsUnread: {} };
@@ -198,19 +241,21 @@ const calculateUserUnreadCount = async (userId) => {
         let conversationsUnread = {};
         let totalUnreadCount = 0;
 
-        if (typeof Message.aggregate === 'function') {
+        if (typeof Message.aggregate === "function") {
             try {
                 const unreadAgg = await Message.aggregate([
                     {
                         $match: {
                             conversation: { $in: activeConvIds },
-                            sender: { $ne: userId },
-                            readBy: { $ne: userId },
+                            sender: { $ne: userObjId },
+                            readBy: { $ne: userObjId },
+                            deletedFor: { $ne: userObjId },
+                            isDeletedForEveryone: { $ne: true },
                         },
                     },
                     {
                         $group: {
-                            _id: '$conversation',
+                            _id: "$conversation",
                             count: { $sum: 1 },
                         },
                     },
@@ -225,8 +270,10 @@ const calculateUserUnreadCount = async (userId) => {
                     activeConvIds.map((cId) =>
                         Message.countDocuments({
                             conversation: cId,
-                            sender: { $ne: userId },
-                            readBy: { $ne: userId },
+                            sender: { $ne: userObjId },
+                            readBy: { $ne: userObjId },
+                            deletedFor: { $ne: userObjId },
+                            isDeletedForEveryone: { $ne: true },
                         })
                     )
                 );
@@ -243,8 +290,10 @@ const calculateUserUnreadCount = async (userId) => {
                 activeConvIds.map((cId) =>
                     Message.countDocuments({
                         conversation: cId,
-                        sender: { $ne: userId },
-                        readBy: { $ne: userId },
+                        sender: { $ne: userObjId },
+                        readBy: { $ne: userObjId },
+                        deletedFor: { $ne: userObjId },
+                        isDeletedForEveryone: { $ne: true },
                     })
                 )
             );
@@ -265,7 +314,7 @@ const calculateUserUnreadCount = async (userId) => {
             conversationsUnread,
         };
     } catch (err) {
-        console.error('calculateUserUnreadCount error:', err);
+        console.error("calculateUserUnreadCount error:", err);
         return { totalUnreadCount: 0, unreadConversationsCount: 0, conversationsUnread: {} };
     }
 };
@@ -417,7 +466,14 @@ const getMessages = async (req, res) => {
     }
 
     try {
-        const conversation = await Conversation.findById(conversationId);
+        const userObjId = mongoose.Types.ObjectId.isValid(req.user._id)
+            ? new mongoose.Types.ObjectId(req.user._id.toString())
+            : req.user._id;
+        const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+            ? new mongoose.Types.ObjectId(conversationId.toString())
+            : conversationId;
+
+        const conversation = await Conversation.findById(convObjId);
         if (!conversation) {
             return res.status(httpStatus.NOT_FOUND).json({
                 success: false,
@@ -427,7 +483,7 @@ const getMessages = async (req, res) => {
 
         // Security: verify authenticated user is a participant
         const isParticipant = conversation.participants.some(
-            (p) => p.toString() === req.user._id.toString()
+            (p) => (p?._id || p).toString() === userObjId.toString()
         );
         if (!isParticipant) {
             return res.status(httpStatus.FORBIDDEN).json({
@@ -437,10 +493,10 @@ const getMessages = async (req, res) => {
         }
 
         const otherParticipantId = conversation.participants.find(
-            (p) => p.toString() !== req.user._id.toString()
+            (p) => p.toString() !== userObjId.toString()
         );
         if (otherParticipantId) {
-            const isBlocked = await Block.isBlockedBidirectional(req.user._id, otherParticipantId);
+            const isBlocked = await Block.isBlockedBidirectional(userObjId, otherParticipantId);
             if (isBlocked) {
                 return res.status(httpStatus.FORBIDDEN).json({
                     success: false,
@@ -468,6 +524,20 @@ const getMessages = async (req, res) => {
             }
         }
 
+        // Determine if user has cleared messages
+        const clearedEntry = conversation.clearedAt?.find(
+            (c) => (c.user?._id || c.user)?.toString() === userObjId.toString()
+        );
+        const clearedTime = clearedEntry?.at ? new Date(clearedEntry.at) : null;
+
+        const baseFilter = {
+            conversation: convObjId,
+            deletedFor: { $ne: userObjId },
+        };
+        if (clearedTime) {
+            baseFilter.createdAt = { $gt: clearedTime };
+        }
+
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 30));
 
         // Cursor-based missed message recovery: fetch messages created after a given message ID
@@ -480,11 +550,8 @@ const getMessages = async (req, res) => {
             }
 
             const afterMessage = await Message.findById(req.query.after).select("_id createdAt");
-            const afterFilter = {
-                conversation: conversationId,
-            };
+            const afterFilter = { ...baseFilter };
             if (afterMessage) {
-                // Compound cursor: strictly greater timestamp OR same timestamp with greater _id tie-breaker
                 afterFilter.$or = [
                     { createdAt: { $gt: afterMessage.createdAt } },
                     { createdAt: afterMessage.createdAt, _id: { $gt: afterMessage._id } },
@@ -506,7 +573,7 @@ const getMessages = async (req, res) => {
             return res.status(httpStatus.OK).json({
                 success: true,
                 conversationId,
-                messages: missedMessages.map(toMessageDto),
+                messages: missedMessages.map((m) => toMessageDto(m, userObjId)),
                 after: req.query.after,
                 count: missedMessages.length,
             });
@@ -522,11 +589,8 @@ const getMessages = async (req, res) => {
             }
 
             const beforeMessage = await Message.findById(req.query.before).select("_id createdAt");
-            const beforeFilter = {
-                conversation: conversationId,
-            };
+            const beforeFilter = { ...baseFilter };
             if (beforeMessage) {
-                // Compound cursor: strictly earlier timestamp OR same timestamp with smaller _id tie-breaker
                 beforeFilter.$or = [
                     { createdAt: { $lt: beforeMessage.createdAt } },
                     { createdAt: beforeMessage.createdAt, _id: { $lt: beforeMessage._id } },
@@ -553,7 +617,7 @@ const getMessages = async (req, res) => {
             return res.status(httpStatus.OK).json({
                 success: true,
                 conversationId,
-                messages: olderMessagesChronological.map(toMessageDto),
+                messages: olderMessagesChronological.map((m) => toMessageDto(m, userObjId)),
                 before: req.query.before,
                 nextBeforeCursor,
                 hasMore: Boolean(nextBeforeCursor),
@@ -564,8 +628,7 @@ const getMessages = async (req, res) => {
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const skip = (page - 1) * limit;
 
-        // Execute count and page slice concurrently with lean query where supported
-        let pageQuery = Message.find({ conversation: conversationId })
+        let pageQuery = Message.find(baseFilter)
             .sort({ createdAt: -1, _id: -1 })
             .skip(skip)
             .limit(limit)
@@ -576,7 +639,7 @@ const getMessages = async (req, res) => {
         if (typeof pageQuery.lean === "function") pageQuery = pageQuery.lean();
 
         const [total, messagesDesc] = await Promise.all([
-            Message.countDocuments({ conversation: conversationId }),
+            Message.countDocuments(baseFilter),
             pageQuery,
         ]);
 
@@ -592,7 +655,7 @@ const getMessages = async (req, res) => {
             totalPages: Math.ceil(total / limit) || 1,
             nextBeforeCursor,
             hasMore: total > skip + messagesChronological.length,
-            messages: messagesChronological.map(toMessageDto),
+            messages: messagesChronological.map((m) => toMessageDto(m, userObjId)),
         });
     } catch (e) {
         console.error("Get messages error:", e);
@@ -603,6 +666,7 @@ const getMessages = async (req, res) => {
     }
 };
 
+// ==========================================
 // ==========================================
 // 4. MARK CONVERSATION AS READ
 // ==========================================
@@ -617,7 +681,14 @@ const markConversationAsRead = async (req, res) => {
     }
 
     try {
-        const conversation = await Conversation.findById(conversationId);
+        const userObjId = mongoose.Types.ObjectId.isValid(req.user._id)
+            ? new mongoose.Types.ObjectId(req.user._id.toString())
+            : req.user._id;
+        const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+            ? new mongoose.Types.ObjectId(conversationId.toString())
+            : conversationId;
+
+        const conversation = await Conversation.findById(convObjId);
         if (!conversation) {
             return res.status(httpStatus.NOT_FOUND).json({
                 success: false,
@@ -626,7 +697,7 @@ const markConversationAsRead = async (req, res) => {
         }
 
         const isParticipant = conversation.participants.some(
-            (p) => p.toString() === req.user._id.toString()
+            (p) => (p?._id || p).toString() === userObjId.toString()
         );
         if (!isParticipant) {
             return res.status(httpStatus.FORBIDDEN).json({
@@ -636,10 +707,10 @@ const markConversationAsRead = async (req, res) => {
         }
 
         const otherParticipantId = conversation.participants.find(
-            (p) => p.toString() !== req.user._id.toString()
+            (p) => p.toString() !== userObjId.toString()
         );
         if (otherParticipantId) {
-            const isBlocked = await Block.isBlockedBidirectional(req.user._id, otherParticipantId);
+            const isBlocked = await Block.isBlockedBidirectional(userObjId, otherParticipantId);
             if (isBlocked) {
                 return res.status(httpStatus.FORBIDDEN).json({
                     success: false,
@@ -669,12 +740,12 @@ const markConversationAsRead = async (req, res) => {
 
         const updateResult = await Message.updateMany(
             {
-                conversation: conversationId,
-                sender: { $ne: req.user._id },
-                readBy: { $ne: req.user._id },
+                conversation: convObjId,
+                sender: { $ne: userObjId },
+                readBy: { $ne: userObjId },
             },
             {
-                $addToSet: { readBy: req.user._id },
+                $addToSet: { readBy: userObjId },
             }
         );
 
@@ -690,13 +761,13 @@ const markConversationAsRead = async (req, res) => {
             }
             broadcast.emit("chat:read", {
                 conversationId,
-                readerId: req.user._id,
+                readerId: userObjId.toString(),
             });
 
-            // Real-time unread count notification specifically to the reader
-            calculateUserUnreadCount(req.user._id)
+            // Real-time authoritative unread count notification specifically to the reader
+            calculateUserUnreadCount(userObjId)
                 .then((counts) => {
-                    io.to(`user:${req.user._id.toString()}`).emit('chat:unread-count', {
+                    io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", {
                         unreadCount: counts.totalUnreadCount,
                         unreadConversationsCount: counts.unreadConversationsCount,
                         conversationsUnread: counts.conversationsUnread,
@@ -719,6 +790,7 @@ const markConversationAsRead = async (req, res) => {
     }
 };
 
+// ==========================================
 // ==========================================
 // 5. REST FALLBACK: SEND MESSAGE
 // ==========================================
@@ -769,7 +841,7 @@ const sendMessageRest = async (req, res) => {
         }
 
         const isParticipant = conversation.participants.some(
-            (p) => p.toString() === req.user._id.toString()
+            (p) => (p?._id || p).toString() === req.user._id.toString()
         );
         if (!isParticipant) {
             return res.status(httpStatus.FORBIDDEN).json({
@@ -852,6 +924,9 @@ const sendMessageRest = async (req, res) => {
         // Update conversation summary
         conversation.lastMessage = newMessage._id;
         conversation.lastMessageAt = newMessage.createdAt;
+        if (conversation.hiddenFor && conversation.hiddenFor.length > 0) {
+            conversation.hiddenFor = [];
+        }
         await conversation.save();
 
         // Attach sender profile without an extra round-trip to database
@@ -912,6 +987,377 @@ const sendMessageRest = async (req, res) => {
     }
 };
 
+
+// ==========================================
+// 6. DELETE MESSAGE FOR ME
+// ==========================================
+const deleteMessageForMe = async (req, res) => {
+    const { conversationId, messageId } = req.params;
+
+    if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId) ||
+        !messageId || !mongoose.Types.ObjectId.isValid(messageId)) {
+        return res.status(httpStatus.BAD_REQUEST).json({
+            success: false,
+            message: "Invalid conversation or message ID",
+        });
+    }
+
+    try {
+        const userObjId = mongoose.Types.ObjectId.isValid(req.user._id)
+            ? new mongoose.Types.ObjectId(req.user._id.toString())
+            : req.user._id;
+        const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+            ? new mongoose.Types.ObjectId(conversationId.toString())
+            : conversationId;
+        const msgObjId = mongoose.Types.ObjectId.isValid(messageId)
+            ? new mongoose.Types.ObjectId(messageId.toString())
+            : messageId;
+
+        const conversation = await Conversation.findById(convObjId);
+        if (!conversation) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "Conversation not found",
+            });
+        }
+
+        const isParticipant = conversation.participants.some(
+            (p) => (p?._id || p).toString() === userObjId.toString()
+        );
+        if (!isParticipant) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                message: "You are not authorized to delete this message",
+            });
+        }
+
+        const message = await Message.findOne({ _id: msgObjId, conversation: convObjId });
+        if (!message) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "Message not found",
+            });
+        }
+
+        await Message.updateOne(
+            { _id: msgObjId },
+            { $addToSet: { deletedFor: userObjId } }
+        );
+
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            io.to(`user:${userObjId.toString()}`).emit("chat:message-deleted", {
+                conversationId: conversationId.toString(),
+                messageId: messageId.toString(),
+                deleteType: "me",
+            });
+
+            calculateUserUnreadCount(userObjId)
+                .then((counts) => {
+                    io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", counts);
+                })
+                .catch(() => {});
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            conversationId: conversationId.toString(),
+            messageId: messageId.toString(),
+            deleteType: "me",
+        });
+    } catch (e) {
+        console.error("Delete message for me error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to delete message for you",
+        });
+    }
+};
+
+// ==========================================
+// 7. DELETE MESSAGE FOR EVERYONE
+// ==========================================
+const deleteMessageForEveryone = async (req, res) => {
+    const { conversationId, messageId } = req.params;
+
+    if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId) ||
+        !messageId || !mongoose.Types.ObjectId.isValid(messageId)) {
+        return res.status(httpStatus.BAD_REQUEST).json({
+            success: false,
+            message: "Invalid conversation or message ID",
+        });
+    }
+
+    try {
+        const userObjId = mongoose.Types.ObjectId.isValid(req.user._id)
+            ? new mongoose.Types.ObjectId(req.user._id.toString())
+            : req.user._id;
+        const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+            ? new mongoose.Types.ObjectId(conversationId.toString())
+            : conversationId;
+        const msgObjId = mongoose.Types.ObjectId.isValid(messageId)
+            ? new mongoose.Types.ObjectId(messageId.toString())
+            : messageId;
+
+        const conversation = await Conversation.findById(convObjId);
+        if (!conversation) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "Conversation not found",
+            });
+        }
+
+        const isParticipant = conversation.participants.some(
+            (p) => (p?._id || p).toString() === userObjId.toString()
+        );
+        if (!isParticipant) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                message: "You are not authorized to delete this message",
+            });
+        }
+
+        const message = await Message.findOne({ _id: msgObjId, conversation: convObjId });
+        if (!message) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "Message not found",
+            });
+        }
+
+        // Security check: Only original sender can delete for everyone
+        if (message.sender.toString() !== userObjId.toString()) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                message: "You can only delete your own messages for everyone",
+            });
+        }
+
+        message.isDeletedForEveryone = true;
+        message.content = "This message was deleted";
+        message.deletedAt = new Date();
+        await message.save();
+
+        const messageDto = toMessageDto(message);
+
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            const payload = {
+                conversationId: conversationId.toString(),
+                messageId: messageId.toString(),
+                deleteType: "everyone",
+                message: messageDto,
+            };
+
+            const roomName = `conversation:${conversationId}`;
+            let broadcast = io.to(roomName);
+            if (Array.isArray(conversation.participants)) {
+                for (const p of conversation.participants) {
+                    broadcast = broadcast.to(`user:${p.toString()}`);
+                }
+            }
+            broadcast.emit("chat:message-deleted", payload);
+
+            // Recompute unread counts for all participants
+            if (Array.isArray(conversation.participants)) {
+                for (const p of conversation.participants) {
+                    calculateUserUnreadCount(p)
+                        .then((counts) => {
+                            io.to(`user:${p.toString()}`).emit("chat:unread-count", counts);
+                        })
+                        .catch(() => {});
+                }
+            }
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            conversationId: conversationId.toString(),
+            messageId: messageId.toString(),
+            deleteType: "everyone",
+            message: messageDto,
+        });
+    } catch (e) {
+        console.error("Delete message for everyone error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to delete message for everyone",
+        });
+    }
+};
+
+// ==========================================
+// 8. CLEAR CHAT HISTORY FOR USER
+// ==========================================
+const clearChat = async (req, res) => {
+    const { conversationId } = req.params;
+
+    if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) {
+        return res.status(httpStatus.BAD_REQUEST).json({
+            success: false,
+            message: "Invalid conversation ID",
+        });
+    }
+
+    try {
+        const userObjId = mongoose.Types.ObjectId.isValid(req.user._id)
+            ? new mongoose.Types.ObjectId(req.user._id.toString())
+            : req.user._id;
+        const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+            ? new mongoose.Types.ObjectId(conversationId.toString())
+            : conversationId;
+
+        const conversation = await Conversation.findById(convObjId);
+        if (!conversation) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "Conversation not found",
+            });
+        }
+
+        const isParticipant = conversation.participants.some(
+            (p) => (p?._id || p).toString() === userObjId.toString()
+        );
+        if (!isParticipant) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                message: "You are not authorized to clear this chat",
+            });
+        }
+
+        const now = new Date();
+
+        if (!Array.isArray(conversation.clearedAt)) {
+            conversation.clearedAt = [];
+        }
+        conversation.clearedAt = conversation.clearedAt.filter(
+            (c) => (c.user?._id || c.user)?.toString() !== userObjId.toString()
+        );
+        conversation.clearedAt.push({ user: userObjId, at: now });
+        await conversation.save();
+
+        await Message.updateMany(
+            { conversation: convObjId },
+            { $addToSet: { deletedFor: userObjId } }
+        );
+
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            io.to(`user:${userObjId.toString()}`).emit("chat:cleared", {
+                conversationId: conversationId.toString(),
+                clearedAt: now,
+            });
+
+            calculateUserUnreadCount(userObjId)
+                .then((counts) => {
+                    io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", counts);
+                })
+                .catch(() => {});
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            conversationId: conversationId.toString(),
+            message: "Chat cleared successfully",
+        });
+    } catch (e) {
+        console.error("Clear chat error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to clear chat",
+        });
+    }
+};
+
+// ==========================================
+// 9. DELETE CHAT (HIDE CONVERSATION FOR USER)
+// ==========================================
+const deleteChat = async (req, res) => {
+    const { conversationId } = req.params;
+
+    if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) {
+        return res.status(httpStatus.BAD_REQUEST).json({
+            success: false,
+            message: "Invalid conversation ID",
+        });
+    }
+
+    try {
+        const userObjId = mongoose.Types.ObjectId.isValid(req.user._id)
+            ? new mongoose.Types.ObjectId(req.user._id.toString())
+            : req.user._id;
+        const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+            ? new mongoose.Types.ObjectId(conversationId.toString())
+            : conversationId;
+
+        const conversation = await Conversation.findById(convObjId);
+        if (!conversation) {
+            return res.status(httpStatus.NOT_FOUND).json({
+                success: false,
+                message: "Conversation not found",
+            });
+        }
+
+        const isParticipant = conversation.participants.some(
+            (p) => (p?._id || p).toString() === userObjId.toString()
+        );
+        if (!isParticipant) {
+            return res.status(httpStatus.FORBIDDEN).json({
+                success: false,
+                message: "You are not authorized to delete this conversation",
+            });
+        }
+
+        const now = new Date();
+
+        if (!Array.isArray(conversation.hiddenFor)) {
+            conversation.hiddenFor = [];
+        }
+        if (!conversation.hiddenFor.some((id) => (id?._id || id)?.toString() === userObjId.toString())) {
+            conversation.hiddenFor.push(userObjId);
+        }
+
+        if (!Array.isArray(conversation.clearedAt)) {
+            conversation.clearedAt = [];
+        }
+        conversation.clearedAt = conversation.clearedAt.filter(
+            (c) => (c.user?._id || c.user)?.toString() !== userObjId.toString()
+        );
+        conversation.clearedAt.push({ user: userObjId, at: now });
+        await conversation.save();
+
+        await Message.updateMany(
+            { conversation: convObjId },
+            { $addToSet: { deletedFor: userObjId } }
+        );
+
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            io.to(`user:${userObjId.toString()}`).emit("chat:deleted", {
+                conversationId: conversationId.toString(),
+            });
+
+            calculateUserUnreadCount(userObjId)
+                .then((counts) => {
+                    io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", counts);
+                })
+                .catch(() => {});
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            conversationId: conversationId.toString(),
+            message: "Conversation deleted successfully",
+        });
+    } catch (e) {
+        console.error("Delete chat error:", e);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to delete conversation",
+        });
+    }
+};
+
 export {
     getConversations,
     getUnreadMessageCount,
@@ -920,5 +1366,10 @@ export {
     getMessages,
     markConversationAsRead,
     sendMessageRest,
+    deleteMessageForMe,
+    deleteMessageForEveryone,
+    clearChat,
+    deleteChat,
 };
+
 

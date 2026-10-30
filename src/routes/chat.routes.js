@@ -6,6 +6,10 @@ import {
     getMessages,
     markConversationAsRead,
     sendMessageRest,
+    deleteMessageForMe,
+    deleteMessageForEveryone,
+    clearChat,
+    deleteChat,
 } from "../controllers/chat.controller.js";
 import { protect } from "../middlewares/auth.middleware.js";
 import { requireEligibility } from "../services/eligibility.service.js";
@@ -24,5 +28,10 @@ router.route("/:conversationId/messages")
     .post(sendMessageRest);
 router.route("/:conversationId/read").put(markConversationAsRead);
 
-export default router;
+// WhatsApp-inspired message and conversation deletion endpoints
+router.route("/:conversationId/messages/:messageId/me").delete(deleteMessageForMe);
+router.route("/:conversationId/messages/:messageId/everyone").delete(deleteMessageForEveryone);
+router.route("/:conversationId/clear").post(clearChat);
+router.route("/:conversationId/delete").post(deleteChat);
 
+export default router;

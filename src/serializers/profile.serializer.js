@@ -134,20 +134,32 @@ export const toSenderProfile = (sender) => {
  * @param {Object|null|undefined} message - Mongoose document or plain object
  * @returns {Object|null}
  */
-export const toMessageDto = (message) => {
+export const toMessageDto = (message, viewerId) => {
     if (!message) return null;
 
     const doc = typeof message.toObject === "function"
         ? message.toObject()
         : (typeof message.toJSON === "function" ? message.toJSON() : message);
 
+    const isDeletedForEveryone = Boolean(doc.isDeletedForEveryone);
+    const content = isDeletedForEveryone ? "This message was deleted" : (doc.content || "");
+    const viewerStr = viewerId ? (viewerId._id || viewerId).toString() : null;
+    const isDeletedForMe = Boolean(
+        viewerStr &&
+        Array.isArray(doc.deletedFor) &&
+        doc.deletedFor.some((id) => (id?._id || id)?.toString() === viewerStr)
+    );
+
     return {
         _id: doc._id ? doc._id.toString() : undefined,
         conversation: doc.conversation ? doc.conversation.toString() : undefined,
         sender: toSenderProfile(doc.sender),
-        content: doc.content || "",
+        content,
         clientTempId: doc.clientTempId || undefined,
-        readBy: Array.isArray(doc.readBy) ? doc.readBy.map((id) => id?.toString() || id) : [],
+        readBy: Array.isArray(doc.readBy) ? doc.readBy.map((id) => (id?._id || id)?.toString() || id) : [],
+        isDeletedForEveryone,
+        isDeletedForMe,
+        deletedAt: doc.deletedAt || null,
         createdAt: doc.createdAt,
         updatedAt: doc.updatedAt,
     };

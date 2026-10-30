@@ -26,6 +26,24 @@ const conversationSchema = new Schema(
             default: Date.now,
             index: true,
         },
+        hiddenFor: [
+            {
+                type: Schema.Types.ObjectId,
+                ref: "User",
+            },
+        ],
+        clearedAt: [
+            {
+                user: {
+                    type: Schema.Types.ObjectId,
+                    ref: "User",
+                },
+                at: {
+                    type: Date,
+                    default: Date.now,
+                },
+            },
+        ],
     },
     {
         timestamps: true,
@@ -34,6 +52,7 @@ const conversationSchema = new Schema(
 
 // Compound index on participants and lastMessageAt for fast sorted conversation feeds
 conversationSchema.index({ participants: 1, lastMessageAt: -1 });
+conversationSchema.index({ hiddenFor: 1 });
 
 const Conversation = mongoose.model("Conversation", conversationSchema);
 

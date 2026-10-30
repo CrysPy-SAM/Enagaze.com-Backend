@@ -355,7 +355,7 @@ export const connectToSocket = (server) => {
                 }
 
                 const isParticipant = conversation.participants.some(
-                    (p) => p.toString() === socket.userId.toString()
+                    (p) => (p?._id || p).toString() === socket.userId.toString()
                 );
 
                 if (!isParticipant) {
@@ -498,7 +498,7 @@ export const connectToSocket = (server) => {
                 }
 
                 const isParticipant = conversation.participants.some(
-                    (p) => p.toString() === socket.userId.toString()
+                    (p) => (p?._id || p).toString() === socket.userId.toString()
                 );
 
                 if (!isParticipant) {
@@ -569,6 +569,9 @@ export const connectToSocket = (server) => {
                 // Update conversation's last message tracking
                 conversation.lastMessage = newMsg._id;
                 conversation.lastMessageAt = newMsg.createdAt;
+                if (conversation.hiddenFor && conversation.hiddenFor.length > 0) {
+                    conversation.hiddenFor = [];
+                }
                 await conversation.save();
 
                 // Attach caller profile without an extra round-trip to database
@@ -683,7 +686,7 @@ export const connectToSocket = (server) => {
                 }
 
                 const isParticipant = conversation.participants.some(
-                    (p) => p.toString() === socket.userId.toString()
+                    (p) => (p?._id || p).toString() === socket.userId.toString()
                 );
                 if (!isParticipant) {
                     const err = { message: "You are not authorized to access this conversation" };
@@ -718,14 +721,21 @@ export const connectToSocket = (server) => {
 
                 // Security: Updates strictly apply to the authenticated socket user's read state
                 // Reader identity cannot be spoofed to alter another participant's read status
+                const userObjId = mongoose.Types.ObjectId.isValid(socket.userId)
+                    ? new mongoose.Types.ObjectId(socket.userId.toString())
+                    : socket.userId;
+                const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+                    ? new mongoose.Types.ObjectId(conversationId.toString())
+                    : conversationId;
+
                 const updateRes = await Message.updateMany(
                     {
-                        conversation: conversationId,
-                        sender: { $ne: socket.userId },
-                        readBy: { $ne: socket.userId },
+                        conversation: convObjId,
+                        sender: { $ne: userObjId },
+                        readBy: { $ne: userObjId },
                     },
                     {
-                        $addToSet: { readBy: socket.userId },
+                        $addToSet: { readBy: userObjId },
                     }
                 );
 
@@ -740,12 +750,12 @@ export const connectToSocket = (server) => {
                 }
                 broadcast.emit("chat:read", {
                     conversationId,
-                    readerId: socket.userId,
+                    readerId: userObjId.toString(),
                 });
-                // Push real-time unread count to reader user room
-                calculateUserUnreadCount(socket.userId)
+                // Push real-time authoritative unread count to reader user room
+                calculateUserUnreadCount(userObjId)
                     .then((counts) => {
-                        io.to(`user:${socket.userId.toString()}`).emit("chat:unread-count", {
+                        io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", {
                             unreadCount: counts.totalUnreadCount,
                             unreadConversationsCount: counts.unreadConversationsCount,
                             conversationsUnread: counts.conversationsUnread,
@@ -754,11 +764,299 @@ export const connectToSocket = (server) => {
                     .catch(() => {});
 
                 if (typeof ack === "function") {
-                    ack({ success: true, conversationId, readerId: socket.userId, modifiedCount: updateRes.modifiedCount });
+                    ack({ success: true, conversationId, readerId: userObjId.toString(), modifiedCount: updateRes.modifiedCount });
                 }
             } catch (e) {
                 console.error("Socket chat:read error:", e);
                 const err = { message: "Failed to mark messages as read" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+            }
+        });
+
+        // Event: Delete Message (Delete for me OR Delete for everyone)
+        socket.on("chat:delete-message", async (data, ack) => {
+            if (!socket.userId) {
+                const err = { message: "Authentication required" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            if (!isPlainObject(data)) {
+                const err = { message: "Invalid payload format: plain object expected" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const { conversationId, messageId, deleteType } = data;
+            if (!isValidObjectId(conversationId) || !isValidObjectId(messageId)) {
+                const err = { message: "Invalid conversation or message ID" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            try {
+                const userObjId = mongoose.Types.ObjectId.isValid(socket.userId)
+                    ? new mongoose.Types.ObjectId(socket.userId.toString())
+                    : socket.userId;
+                const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+                    ? new mongoose.Types.ObjectId(conversationId.toString())
+                    : conversationId;
+                const msgObjId = mongoose.Types.ObjectId.isValid(messageId)
+                    ? new mongoose.Types.ObjectId(messageId.toString())
+                    : messageId;
+
+                const conversation = await Conversation.findById(convObjId);
+                if (!conversation) {
+                    const err = { message: "Conversation not found" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                const isParticipant = conversation.participants.some(
+                    (p) => (p?._id || p).toString() === userObjId.toString()
+                );
+                if (!isParticipant) {
+                    const err = { message: "You are not authorized to delete messages in this conversation" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                const message = await Message.findOne({ _id: msgObjId, conversation: convObjId });
+                if (!message) {
+                    const err = { message: "Message not found" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                if (deleteType === "everyone") {
+                    if (message.sender.toString() !== userObjId.toString()) {
+                        const err = { message: "You can only delete your own messages for everyone" };
+                        socket.emit("chat:error", err);
+                        if (typeof ack === "function") ack({ success: false, ...err });
+                        return;
+                    }
+
+                    message.isDeletedForEveryone = true;
+                    message.content = "This message was deleted";
+                    message.deletedAt = new Date();
+                    await message.save();
+
+                    const messageDto = toMessageDto(message);
+                    const payload = {
+                        conversationId: conversationId.toString(),
+                        messageId: messageId.toString(),
+                        deleteType: "everyone",
+                        message: messageDto,
+                    };
+
+                    const roomName = `conversation:${conversationId}`;
+                    let broadcast = io.to(roomName);
+                    if (Array.isArray(conversation.participants)) {
+                        for (const p of conversation.participants) {
+                            broadcast = broadcast.to(`user:${p.toString()}`);
+                        }
+                    }
+                    broadcast.emit("chat:message-deleted", payload);
+
+                    for (const p of conversation.participants) {
+                        calculateUserUnreadCount(p)
+                            .then((counts) => {
+                                io.to(`user:${p.toString()}`).emit("chat:unread-count", counts);
+                            })
+                            .catch(() => {});
+                    }
+
+                    if (typeof ack === "function") ack({ success: true, ...payload });
+                } else {
+                    // deleteType: "me"
+                    await Message.updateOne({ _id: msgObjId }, { $addToSet: { deletedFor: userObjId } });
+
+                    socket.emit("chat:message-deleted", {
+                        conversationId: conversationId.toString(),
+                        messageId: messageId.toString(),
+                        deleteType: "me",
+                    });
+
+                    calculateUserUnreadCount(userObjId)
+                        .then((counts) => {
+                            io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", counts);
+                        })
+                        .catch(() => {});
+
+                    if (typeof ack === "function") ack({ success: true, conversationId, messageId, deleteType: "me" });
+                }
+            } catch (e) {
+                console.error("Socket chat:delete-message error:", e);
+                const err = { message: "Failed to delete message" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+            }
+        });
+
+        // Event: Clear Chat history
+        socket.on("chat:clear", async (data, ack) => {
+            if (!socket.userId) {
+                const err = { message: "Authentication required" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const { conversationId } = data || {};
+            if (!isValidObjectId(conversationId)) {
+                const err = { message: "Invalid conversation ID" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            try {
+                const userObjId = mongoose.Types.ObjectId.isValid(socket.userId)
+                    ? new mongoose.Types.ObjectId(socket.userId.toString())
+                    : socket.userId;
+                const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+                    ? new mongoose.Types.ObjectId(conversationId.toString())
+                    : conversationId;
+
+                const conversation = await Conversation.findById(convObjId);
+                if (!conversation) {
+                    const err = { message: "Conversation not found" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                const isParticipant = conversation.participants.some(
+                    (p) => (p?._id || p).toString() === userObjId.toString()
+                );
+                if (!isParticipant) {
+                    const err = { message: "Unauthorized" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                const now = new Date();
+                if (!Array.isArray(conversation.clearedAt)) {
+                    conversation.clearedAt = [];
+                }
+                conversation.clearedAt = conversation.clearedAt.filter(
+                    (c) => (c.user?._id || c.user)?.toString() !== userObjId.toString()
+                );
+                conversation.clearedAt.push({ user: userObjId, at: now });
+                await conversation.save();
+
+                await Message.updateMany(
+                    { conversation: convObjId },
+                    { $addToSet: { deletedFor: userObjId } }
+                );
+
+                socket.emit("chat:cleared", {
+                    conversationId: conversationId.toString(),
+                    clearedAt: now,
+                });
+
+                calculateUserUnreadCount(userObjId)
+                    .then((counts) => {
+                        io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", counts);
+                    })
+                    .catch(() => {});
+
+                if (typeof ack === "function") ack({ success: true, conversationId });
+            } catch (e) {
+                console.error("Socket chat:clear error:", e);
+                const err = { message: "Failed to clear chat" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+            }
+        });
+
+        // Event: Delete Chat (Hide for current user)
+        socket.on("chat:delete-conversation", async (data, ack) => {
+            if (!socket.userId) {
+                const err = { message: "Authentication required" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            const { conversationId } = data || {};
+            if (!isValidObjectId(conversationId)) {
+                const err = { message: "Invalid conversation ID" };
+                socket.emit("chat:error", err);
+                if (typeof ack === "function") ack({ success: false, ...err });
+                return;
+            }
+
+            try {
+                const userObjId = mongoose.Types.ObjectId.isValid(socket.userId)
+                    ? new mongoose.Types.ObjectId(socket.userId.toString())
+                    : socket.userId;
+                const convObjId = mongoose.Types.ObjectId.isValid(conversationId)
+                    ? new mongoose.Types.ObjectId(conversationId.toString())
+                    : conversationId;
+
+                const conversation = await Conversation.findById(convObjId);
+                if (!conversation) {
+                    const err = { message: "Conversation not found" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                const isParticipant = conversation.participants.some(
+                    (p) => (p?._id || p).toString() === userObjId.toString()
+                );
+                if (!isParticipant) {
+                    const err = { message: "Unauthorized" };
+                    socket.emit("chat:error", err);
+                    if (typeof ack === "function") ack({ success: false, ...err });
+                    return;
+                }
+
+                const now = new Date();
+                if (!Array.isArray(conversation.hiddenFor)) {
+                    conversation.hiddenFor = [];
+                }
+                if (!conversation.hiddenFor.some((id) => (id?._id || id)?.toString() === userObjId.toString())) {
+                    conversation.hiddenFor.push(userObjId);
+                }
+
+                if (!Array.isArray(conversation.clearedAt)) {
+                    conversation.clearedAt = [];
+                }
+                conversation.clearedAt = conversation.clearedAt.filter(
+                    (c) => (c.user?._id || c.user)?.toString() !== userObjId.toString()
+                );
+                conversation.clearedAt.push({ user: userObjId, at: now });
+                await conversation.save();
+
+                await Message.updateMany(
+                    { conversation: convObjId },
+                    { $addToSet: { deletedFor: userObjId } }
+                );
+
+                socket.emit("chat:deleted", {
+                    conversationId: conversationId.toString(),
+                });
+
+                calculateUserUnreadCount(userObjId)
+                    .then((counts) => {
+                        io.to(`user:${userObjId.toString()}`).emit("chat:unread-count", counts);
+                    })
+                    .catch(() => {});
+
+                if (typeof ack === "function") ack({ success: true, conversationId });
+            } catch (e) {
+                console.error("Socket chat:delete-conversation error:", e);
+                const err = { message: "Failed to delete conversation" };
                 socket.emit("chat:error", err);
                 if (typeof ack === "function") ack({ success: false, ...err });
             }
@@ -804,7 +1102,7 @@ export const connectToSocket = (server) => {
                 }
 
                 const isParticipant = conversation.participants.some(
-                    (p) => p.toString() === socket.userId.toString()
+                    (p) => (p?._id || p).toString() === socket.userId.toString()
                 );
                 if (!isParticipant) {
                     const err = { message: "You are not authorized to emit typing in this conversation" };
