@@ -270,3 +270,19 @@ export const userSearchLimiter = createAdaptiveRateLimiter({
         "Too many search requests. Please slow down."
     ),
 }, "user_search");
+
+/**
+ * Username availability check rate limiter:
+ * Allows up to 60 availability checks per minute per IP to accommodate debounced typing
+ * while protecting against abusive enumeration.
+ */
+export const usernameCheckLimiter = createAdaptiveRateLimiter({
+    windowMs: 60 * 1000,
+    limit: 60,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    skip: () => process.env.NODE_ENV === "test",
+    handler: createRateLimitHandler(
+        "Too many username availability checks. Please wait a moment."
+    ),
+}, "username_check");
