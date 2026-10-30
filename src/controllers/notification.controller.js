@@ -2,9 +2,12 @@ import httpStatus from "http-status";
 import {
     getNotificationsForUser,
     getUnreadNotificationCount,
+    getUnreadNotificationCounts,
     markNotificationAsRead,
     markAllNotificationsAsRead,
+    markNotificationsAsReadByType,
 } from "../services/notification.service.js";
+import { getIO } from "./socketManager.js";
 
 /**
  * GET /api/v1/notifications
@@ -38,11 +41,13 @@ export const getNotificationsHandler = async (req, res) => {
  */
 export const getUnreadCountHandler = async (req, res) => {
     try {
-        const unreadCount = await getUnreadNotificationCount(req.user._id);
+        const counts = await getUnreadNotificationCounts(req.user._id);
 
         return res.status(httpStatus.OK).json({
             success: true,
-            unreadCount,
+            unreadCount: counts.total,
+            unreadLikesCount: counts.likes,
+            unreadRequestsCount: counts.requests,
         });
     } catch (error) {
         console.error("Error in getUnreadCountHandler:", error);
@@ -100,6 +105,50 @@ export const markAllAsReadHandler = async (req, res) => {
         return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
             success: false,
             message: "Failed to mark all notifications as read",
+        });
+    }
+};
+
+/**
+ * PATCH /api/v1/notifications/read-type/:type
+ * Marks all notifications of a specific type (e.g. 'like', 'match_request') as read.
+ */
+export const markTypeAsReadHandler = async (req, res) => {
+    try {
+        const { type } = req.params;
+        const validTypes = ["like", "match", "message", "match_request", "match_accepted", "missed_call"];
+        if (!type || !validTypes.includes(type)) {
+            return res.status(httpStatus.BAD_REQUEST).json({
+                success: false,
+                message: `Invalid notification type: ${type}`,
+            });
+        }
+
+        const updatedCount = await markNotificationsAsReadByType(req.user._id, type);
+        const counts = await getUnreadNotificationCounts(req.user._id);
+
+        const io = req.app?.get("io") || getIO();
+        if (io) {
+            io.to(`user:${req.user._id.toString()}`).emit("notification:counts", {
+                unreadCount: counts.total,
+                unreadLikesCount: counts.likes,
+                unreadRequestsCount: counts.requests,
+            });
+        }
+
+        return res.status(httpStatus.OK).json({
+            success: true,
+            message: `Notifications of type '${type}' marked as read`,
+            updatedCount,
+            unreadCount: counts.total,
+            unreadLikesCount: counts.likes,
+            unreadRequestsCount: counts.requests,
+        });
+    } catch (error) {
+        console.error("Error in markTypeAsReadHandler:", error);
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
+            success: false,
+            message: "Failed to mark notifications by type as read",
         });
     }
 };
