@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
     getConversations,
+    getUnreadMessageCount,
     getOrCreateConversationByMatch,
     getMessages,
     markConversationAsRead,
@@ -16,6 +17,7 @@ router.use(protect);
 router.use(requireEligibility);
 
 router.route("/").get(getConversations);
+router.route("/unread-count").get(getUnreadMessageCount);
 router.route("/match/:matchId").get(getOrCreateConversationByMatch);
 router.route("/:conversationId/messages")
     .get(getMessages)
