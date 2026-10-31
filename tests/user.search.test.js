@@ -116,6 +116,15 @@ describe("Instagram-Inspired Search and People Discovery Suite", () => {
     let inMemoryConversations = [];
     let inMemoryBlockedIds = [];
 
+    const origBlockGetBlockedUserIds = Block.getBlockedUserIds;
+    const origBlockIsBlockedBidirectional = Block.isBlockedBidirectional;
+    const origUserFindById = User.findById;
+    const origUserFind = User.find;
+    const origMatchReqFind = MatchRequest.find;
+    const origMatchFind = Match.find;
+    const origMatchFindOne = Match.findOne;
+    const origConvFind = Conversation.find;
+
     before(async () => {
         app = express();
         app.use(express.json());
@@ -284,6 +293,15 @@ describe("Instagram-Inspired Search and People Discovery Suite", () => {
     });
 
     after(async () => {
+        Block.getBlockedUserIds = origBlockGetBlockedUserIds;
+        Block.isBlockedBidirectional = origBlockIsBlockedBidirectional;
+        User.findById = origUserFindById;
+        User.find = origUserFind;
+        MatchRequest.find = origMatchReqFind;
+        Match.find = origMatchFind;
+        Match.findOne = origMatchFindOne;
+        Conversation.find = origConvFind;
+
         if (server) {
             await new Promise((resolve) => server.close(resolve));
         }
