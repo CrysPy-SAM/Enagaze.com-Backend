@@ -30,13 +30,15 @@ const blockSchema = new Schema(
 blockSchema.index({ blocker: 1, blocked: 1 }, { unique: true });
 blockSchema.index({ blocked: 1 });
 
+const isBlockDbReady = () => Boolean(mongoose.connection?.readyState === 1 || (Block.exists && Block.exists !== mongoose.Model.exists));
+
 /**
  * Check whether either user has blocked the other (bidirectional)
  */
 blockSchema.statics.isBlockedBidirectional = async function (userIdA, userIdB) {
     if (!userIdA || !userIdB) return false;
     if (userIdA.toString() === userIdB.toString()) return false;
-    if (mongoose.connection.readyState === 0) return false;
+    if (!isBlockDbReady()) return false;
 
     const exists = await this.exists({
         $or: [
@@ -51,7 +53,7 @@ blockSchema.statics.isBlockedBidirectional = async function (userIdA, userIdB) {
  * Retrieve all user IDs blocked by or blocking a given user (as array)
  */
 blockSchema.statics.getBlockedUserIds = async function (userId) {
-    if (!userId || mongoose.connection.readyState === 0) return [];
+    if (!userId || !isBlockDbReady()) return [];
 
     const records = await this.find({
         $or: [{ blocker: userId }, { blocked: userId }],
