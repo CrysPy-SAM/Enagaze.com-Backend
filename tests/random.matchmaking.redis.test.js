@@ -244,6 +244,7 @@ describe("Phase 3C.2: Redis-Backed Distributed Random Matchmaking Suite", () => 
     let mockRedis;
     let originalFindById;
     let originalIsBlocked;
+    let originalReadyStateDescriptor;
 
     const mockUser1 = {
         _id: "65cb11111111111111111111",
@@ -281,6 +282,7 @@ describe("Phase 3C.2: Redis-Backed Distributed Random Matchmaking Suite", () => 
         _setClientForTesting(mockRedis);
         _setClientsForTesting({ pubClient: mockRedis, subClient: mockRedis });
 
+        originalReadyStateDescriptor = Object.getOwnPropertyDescriptor(mongoose.connection, "readyState");
         Object.defineProperty(mongoose.connection, "readyState", {
             value: 1,
             configurable: true,
@@ -313,6 +315,12 @@ describe("Phase 3C.2: Redis-Backed Distributed Random Matchmaking Suite", () => 
         User.findById = originalFindById;
         Block.isBlockedBidirectional = originalIsBlocked;
         _resetShutdownForTesting();
+
+        if (originalReadyStateDescriptor) {
+            Object.defineProperty(mongoose.connection, "readyState", originalReadyStateDescriptor);
+        } else {
+            delete mongoose.connection.readyState;
+        }
     });
 
     // =========================================================================
