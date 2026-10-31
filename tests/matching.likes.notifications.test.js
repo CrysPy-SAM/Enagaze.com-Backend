@@ -97,6 +97,19 @@ describe("Prompt 10: Complete Matching, Likes, Notifications & Real-Time Chat Su
     let inMemoryConversations = [];
     let inMemoryBlocks = [];
 
+    const origUserFindById = User.findById;
+    const origUserFind = User.find;
+    const origBlockGetBlockedUserIds = Block.getBlockedUserIds;
+    const origSwipeFind = Swipe.find;
+    const origSwipeFindOne = Swipe.findOne;
+    const origSwipeCreate = Swipe.create;
+    const origMatchFind = Match.find;
+    const origMatchFindOne = Match.findOne;
+    const origMatchCreate = Match.create;
+    const origMatchGetCanonicalPair = Match.getCanonicalPair;
+    const origConvFindOne = Conversation.findOne;
+    const origConvCreate = Conversation.create;
+
     before(async () => {
         app = express();
         app.use(express.json());
@@ -153,6 +166,22 @@ describe("Prompt 10: Complete Matching, Likes, Notifications & Real-Time Chat Su
     });
 
     after(async () => {
+        User.findById = origUserFindById;
+        User.find = origUserFind;
+        Block.getBlockedUserIds = origBlockGetBlockedUserIds;
+        Swipe.find = origSwipeFind;
+        Swipe.findOne = origSwipeFindOne;
+        Swipe.create = origSwipeCreate;
+        Match.find = origMatchFind;
+        Match.findOne = origMatchFindOne;
+        Match.create = origMatchCreate;
+        Match.getCanonicalPair = origMatchGetCanonicalPair;
+        Conversation.findOne = origConvFindOne;
+        Conversation.create = origConvCreate;
+
+        if (ioServer) {
+            await new Promise((resolve) => ioServer.close(resolve));
+        }
         if (server) {
             await new Promise((resolve) => server.close(resolve));
         }
