@@ -100,6 +100,20 @@ describe("Prompt 10: Consent-Based Match Requests, Connections, Chat & Video Cal
     let inMemoryMessages = [];
     let inMemoryBlocks = [];
 
+    const origUserFindById = User.findById;
+    const origUserFind = User.find;
+    const origBlockGetBlockedUserIds = Block.getBlockedUserIds;
+    const origBlockIsBlockedBidirectional = Block.isBlockedBidirectional;
+    const origMatchReqFind = MatchRequest.find;
+    const origMatchReqFindById = MatchRequest.findById;
+    const origMatchReqFindOne = MatchRequest.findOne;
+    const origMatchReqFindOneAndUpdate = MatchRequest.findOneAndUpdate;
+    const origMatchReqCreate = MatchRequest.create;
+    const origMatchFindOne = Match.findOne;
+    const origMatchGetCanonicalPair = Match.getCanonicalPair;
+    const origConvFindOne = Conversation.findOne;
+    const origConvCreate = Conversation.create;
+
     before(async () => {
         app = express();
         app.use(express.json());
@@ -164,6 +178,23 @@ describe("Prompt 10: Consent-Based Match Requests, Connections, Chat & Video Cal
     });
 
     after(async () => {
+        User.findById = origUserFindById;
+        User.find = origUserFind;
+        Block.getBlockedUserIds = origBlockGetBlockedUserIds;
+        Block.isBlockedBidirectional = origBlockIsBlockedBidirectional;
+        MatchRequest.find = origMatchReqFind;
+        MatchRequest.findById = origMatchReqFindById;
+        MatchRequest.findOne = origMatchReqFindOne;
+        MatchRequest.findOneAndUpdate = origMatchReqFindOneAndUpdate;
+        MatchRequest.create = origMatchReqCreate;
+        Match.findOne = origMatchFindOne;
+        Match.getCanonicalPair = origMatchGetCanonicalPair;
+        Conversation.findOne = origConvFindOne;
+        Conversation.create = origConvCreate;
+
+        if (ioServer) {
+            await new Promise((resolve) => ioServer.close(resolve));
+        }
         if (server) {
             await new Promise((resolve) => server.close(resolve));
         }
