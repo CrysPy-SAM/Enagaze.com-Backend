@@ -10,10 +10,18 @@ import { getPresenceForViewer } from "../services/presence.service.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
 import { safeLean } from "../utils/queryHelper.js";
 
+const isChatDbReady = () => Boolean(mongoose.connection?.readyState === 1 || (Conversation.find && Conversation.find !== mongoose.Model.find));
+
 // ==========================================
 // 1. GET ALL CONVERSATIONS FOR CURRENT USER
 // ==========================================
 const getConversations = async (req, res) => {
+    if (!isChatDbReady()) {
+        return res.status(httpStatus.SERVICE_UNAVAILABLE).json({
+            success: false,
+            message: "Database service unavailable",
+        });
+    }
     try {
         const userId = req.user._id;
         const userObjId = mongoose.Types.ObjectId.isValid(userId)
@@ -172,7 +180,7 @@ const getConversations = async (req, res) => {
 // 1b. GET TOTAL UNREAD MESSAGE COUNT FOR CURRENT USER
 // ==========================================
 const calculateUserUnreadCount = async (userId) => {
-    if (!userId) {
+    if (!userId || !isChatDbReady()) {
         return { totalUnreadCount: 0, unreadConversationsCount: 0, conversationsUnread: {} };
     }
 
@@ -265,6 +273,12 @@ const calculateUserUnreadCount = async (userId) => {
 };
 
 const getUnreadMessageCount = async (req, res) => {
+    if (!isChatDbReady()) {
+        return res.status(httpStatus.SERVICE_UNAVAILABLE).json({
+            success: false,
+            message: "Database service unavailable",
+        });
+    }
     try {
         const userId = req.user._id;
         const result = await calculateUserUnreadCount(userId);
@@ -616,6 +630,12 @@ const getMessages = async (req, res) => {
 // 4. MARK CONVERSATION AS READ
 // ==========================================
 const markConversationAsRead = async (req, res) => {
+    if (!isChatDbReady()) {
+        return res.status(httpStatus.SERVICE_UNAVAILABLE).json({
+            success: false,
+            message: "Database service unavailable",
+        });
+    }
     const { conversationId } = req.params;
 
     if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) {
