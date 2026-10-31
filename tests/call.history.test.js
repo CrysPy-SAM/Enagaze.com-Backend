@@ -89,8 +89,10 @@ describe("Phase 2: Persistent Call History & Missed Call Notifications Test Suit
 
     let inMemoryCalls = [];
     let inMemoryNotifications = [];
+    let originalReadyStateDescriptor;
 
     before(async () => {
+        originalReadyStateDescriptor = Object.getOwnPropertyDescriptor(mongoose.connection, "readyState");
         Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
 
         originalUserFindById = User.findById;
@@ -300,6 +302,12 @@ describe("Phase 2: Persistent Call History & Missed Call Notifications Test Suit
 
         if (server) {
             await new Promise((resolve) => server.close(resolve));
+        }
+
+        if (originalReadyStateDescriptor) {
+            Object.defineProperty(mongoose.connection, "readyState", originalReadyStateDescriptor);
+        } else {
+            delete mongoose.connection.readyState;
         }
     });
 
