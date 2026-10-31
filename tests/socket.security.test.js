@@ -433,7 +433,7 @@ describe("Batch 4 Socket.IO Security, Authorization & Abuse Prevention Suite", (
 
             assert.equal(ack.success, true);
             assert.equal(ack.readerId, mockUserA._id, "Ack readerId must be Alice");
-            assert.deepEqual(capturedUpdateDoc.$addToSet, { readBy: mockUserA._id }, "Database readBy MUST add Alice, never spoofed Bob");
+            assert.equal(capturedUpdateDoc.$addToSet?.readBy?.toString(), mockUserA._id, "Database readBy MUST add Alice, never spoofed Bob");
             client.disconnect();
         });
     });
