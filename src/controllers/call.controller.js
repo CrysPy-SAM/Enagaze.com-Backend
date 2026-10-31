@@ -3,6 +3,8 @@ import mongoose from "mongoose";
 import Call from "../models/call.model.js";
 import { Notification } from "../models/notification.model.js";
 
+const isCallDbReady = () => Boolean(mongoose.connection?.readyState === 1 || (Call.findOne && Call.findOne !== mongoose.Model.findOne));
+
 /**
  * Persists initial call record when a direct 1-on-1 call is initiated.
  *
@@ -23,6 +25,9 @@ export const recordCallInitiated = async ({
     callType = "video",
     receiverAlerted = false,
 }) => {
+    if (!isCallDbReady()) {
+        return null;
+    }
     try {
         const callerObjId = new mongoose.Types.ObjectId(callerId);
         const calleeObjId = new mongoose.Types.ObjectId(calleeId);
@@ -63,6 +68,9 @@ export const recordCallInitiated = async ({
  * @returns {Promise<Call|null>}
  */
 export const recordCallAccepted = async ({ callId }) => {
+    if (!isCallDbReady()) {
+        return null;
+    }
     try {
         const call = await Call.findOne({ callId });
         if (!call) return null;
@@ -96,6 +104,9 @@ export const recordCallAccepted = async ({ callId }) => {
  * @returns {Promise<Call|null>}
  */
 export const recordCallEnded = async ({ callId, endReason = "ended", endedByUserId = null, io = null }) => {
+    if (!isCallDbReady()) {
+        return null;
+    }
     try {
         const call = await Call.findOne({ callId });
         if (!call) return null;
@@ -220,8 +231,8 @@ export const recordCallEnded = async ({ callId, endReason = "ended", endedByUser
  * @returns {Promise<number>}
  */
 export const getUnseenMissedCallsCount = async (userId) => {
+    if (!userId || !isCallDbReady()) return 0;
     try {
-        if (!userId) return 0;
         const userObjId = mongoose.isValidObjectId(userId) ? new mongoose.Types.ObjectId(userId) : userId;
         const allUserIds = [userObjId, userId.toString()];
         return await Call.countDocuments({
@@ -240,6 +251,12 @@ export const getUnseenMissedCallsCount = async (userId) => {
  * Fetches paginated, filtered call history for the authenticated user.
  */
 export const getCallHistory = async (req, res) => {
+    if (!isCallDbReady()) {
+        return res.status(httpStatus.SERVICE_UNAVAILABLE).json({
+            success: false,
+            message: "Database service unavailable",
+        });
+    }
     try {
         const userId = req.user._id;
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -344,6 +361,12 @@ export const getCallHistory = async (req, res) => {
  * Returns authoritative count of unseen missed calls.
  */
 export const getMissedCallCount = async (req, res) => {
+    if (!isCallDbReady()) {
+        return res.status(httpStatus.SERVICE_UNAVAILABLE).json({
+            success: false,
+            message: "Database service unavailable",
+        });
+    }
     try {
         const count = await getUnseenMissedCallsCount(req.user._id);
         return res.status(httpStatus.OK).json({
@@ -364,6 +387,12 @@ export const getMissedCallCount = async (req, res) => {
  * Marks all unseen missed calls as seen without deleting call history.
  */
 export const markMissedCallsAsSeen = async (req, res) => {
+    if (!isCallDbReady()) {
+        return res.status(httpStatus.SERVICE_UNAVAILABLE).json({
+            success: false,
+            message: "Database service unavailable",
+        });
+    }
     try {
         const userId = req.user._id;
 
