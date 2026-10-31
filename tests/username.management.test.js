@@ -25,7 +25,7 @@ describe("Username Management & 14-Day Cooldown Policy Test Suite", () => {
 
     before(async () => {
         // Connect to in-memory/test MongoDB or existing mongoose connection
-        if (mongoose.connection.readyState === 0) {
+        if (mongoose.connection.readyState !== 1) {
             const mongoUri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/engaze_test";
             await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 5000 });
         }
