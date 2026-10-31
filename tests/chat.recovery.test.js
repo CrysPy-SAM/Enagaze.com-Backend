@@ -155,7 +155,10 @@ describe("Prompt 9: Reliable Chat Reconnect, Acknowledgement Retry & Message Rec
         [mockUserOutsider._id.toString()]: { ...mockUserOutsider },
     };
 
+    let originalReadyStateDescriptor;
+
     before(async () => {
+        originalReadyStateDescriptor = Object.getOwnPropertyDescriptor(mongoose.connection, "readyState");
         app = express();
         app.use(express.json());
 
@@ -209,6 +212,12 @@ describe("Prompt 9: Reliable Chat Reconnect, Acknowledgement Retry & Message Rec
         }
         if (server) {
             await new Promise((resolve) => server.close(resolve));
+        }
+
+        if (originalReadyStateDescriptor) {
+            Object.defineProperty(mongoose.connection, "readyState", originalReadyStateDescriptor);
+        } else {
+            delete mongoose.connection.readyState;
         }
     });
 
