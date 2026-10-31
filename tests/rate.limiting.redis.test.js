@@ -151,6 +151,7 @@ function createMockRateLimitRedis({ status = "ready", failCommands = false } = {
 describe("Phase 3D: Distributed Rate Limiting with Redis/Valkey Suite", () => {
     let originalEnv;
     let mockRedis;
+    let originalReadyStateDescriptor;
 
     beforeEach(() => {
         originalEnv = { ...process.env };
@@ -164,6 +165,7 @@ describe("Phase 3D: Distributed Rate Limiting with Redis/Valkey Suite", () => {
         _resetRateLimitersForTesting();
         _testingRateLimits.clearAll();
 
+        originalReadyStateDescriptor = Object.getOwnPropertyDescriptor(mongoose.connection, "readyState");
         Object.defineProperty(mongoose.connection, "readyState", {
             value: 1,
             configurable: true,
@@ -178,6 +180,12 @@ describe("Phase 3D: Distributed Rate Limiting with Redis/Valkey Suite", () => {
         _resetRateLimitersForTesting();
         _testingRateLimits.clearAll();
         _resetShutdownForTesting();
+
+        if (originalReadyStateDescriptor) {
+            Object.defineProperty(mongoose.connection, "readyState", originalReadyStateDescriptor);
+        } else {
+            delete mongoose.connection.readyState;
+        }
     });
 
     // =========================================================================
