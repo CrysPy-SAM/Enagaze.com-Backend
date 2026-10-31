@@ -66,8 +66,10 @@ describe("Phase 1: Persistent Unread Message Tracking & Unread Count API Suite",
     let inMemoryMatches = [];
     let inMemoryConversations = [];
     let inMemoryMessages = [];
+    let originalReadyStateDescriptor;
 
     before(async () => {
+        originalReadyStateDescriptor = Object.getOwnPropertyDescriptor(mongoose.connection, "readyState");
         app = express();
         app.use(express.json());
 
@@ -120,6 +122,12 @@ describe("Phase 1: Persistent Unread Message Tracking & Unread Count API Suite",
         }
         if (server) {
             await new Promise((resolve) => server.close(resolve));
+        }
+
+        if (originalReadyStateDescriptor) {
+            Object.defineProperty(mongoose.connection, "readyState", originalReadyStateDescriptor);
+        } else {
+            delete mongoose.connection.readyState;
         }
     });
 
