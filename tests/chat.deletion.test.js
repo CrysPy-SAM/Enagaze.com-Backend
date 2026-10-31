@@ -80,8 +80,10 @@ describe("WhatsApp-Inspired Chat & Message Deletion Test Suite", () => {
 
     let inMemoryConversations = [];
     let inMemoryMessages = [];
+    let originalReadyStateDescriptor;
 
     before(async () => {
+        originalReadyStateDescriptor = Object.getOwnPropertyDescriptor(mongoose.connection, "readyState");
         Object.defineProperty(mongoose.connection, "readyState", { value: 1, configurable: true, writable: true });
 
         originalUserFindById = User.findById;
@@ -334,6 +336,12 @@ describe("WhatsApp-Inspired Chat & Message Deletion Test Suite", () => {
         Message.updateOne = originalMsgUpdateOne;
         Message.countDocuments = originalMsgCountDocuments;
         Message.aggregate = originalMsgAggregate;
+
+        if (originalReadyStateDescriptor) {
+            Object.defineProperty(mongoose.connection, "readyState", originalReadyStateDescriptor);
+        } else {
+            delete mongoose.connection.readyState;
+        }
     });
 
     beforeEach(async () => {
