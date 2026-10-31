@@ -102,6 +102,11 @@ describe("Prompt 17: One-to-One Direct Video Calling for Established Connections
     let inMemoryBlockedPairs = new Set();
     let inMemoryConversations = [];
 
+    const origUserFindById = User.findById;
+    const origMatchFindOne = Match.findOne;
+    const origBlockIsBlockedBidirectional = Block.isBlockedBidirectional;
+    const origConvFindById = Conversation.findById;
+
     before(async () => {
         app = express();
         app.use(express.json());
@@ -151,6 +156,14 @@ describe("Prompt 17: One-to-One Direct Video Calling for Established Connections
     });
 
     after(async () => {
+        User.findById = origUserFindById;
+        Match.findOne = origMatchFindOne;
+        Block.isBlockedBidirectional = origBlockIsBlockedBidirectional;
+        Conversation.findById = origConvFindById;
+
+        if (ioServer) {
+            await new Promise((resolve) => ioServer.close(resolve));
+        }
         if (server) {
             await new Promise((resolve) => server.close(resolve));
         }
