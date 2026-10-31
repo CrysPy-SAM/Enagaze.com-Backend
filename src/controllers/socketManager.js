@@ -1567,8 +1567,10 @@ export const connectToSocket = (server) => {
             if (socket.userId) {
                 await userDisconnected(socket.userId, socket.id, async (lastSeenAt) => {
                     try {
-                        await User.findByIdAndUpdate(socket.userId, { lastSeenAt });
-                        await broadcastPresenceUpdate(io, socket.userId, false, lastSeenAt);
+                        if (mongoose.connection?.readyState === 1) {
+                            await User.findByIdAndUpdate(socket.userId, { lastSeenAt });
+                            await broadcastPresenceUpdate(io, socket.userId, false, lastSeenAt);
+                        }
                     } catch (err) {
                         console.error("Error processing disconnect presence grace expiration:", err);
                     }
