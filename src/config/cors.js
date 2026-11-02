@@ -4,7 +4,7 @@
  * Replaces wildcard/suffix reflection with a strict, exact-origin allowlist.
  */
 
-// Default trusted origins required for production and local development
+// Default trusted origins required for production, mobile app (Capacitor), and local development
 const DEFAULT_ALLOWED_ORIGINS = [
     "https://engaze.date",
     "https://www.engaze.date",
@@ -13,6 +13,10 @@ const DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
+    "https://localhost",
+    "http://localhost",
+    "capacitor://localhost",
+    "ionic://localhost",
 ];
 
 /**

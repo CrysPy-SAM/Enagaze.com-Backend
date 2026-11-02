@@ -518,7 +518,7 @@ const googleLogin = async (req, res) => {
         });
     }
 
-    const configuredClientId = process.env.GOOGLE_CLIENT_ID;
+    const configuredClientId = process.env.GOOGLE_CLIENT_ID || "564036796132-l4ojuk8un6ui6iepgu4ddjq322p8h4vl.apps.googleusercontent.com";
     if (!configuredClientId) {
         console.error("GOOGLE_CLIENT_ID is not configured in backend environment variables.");
         return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({
