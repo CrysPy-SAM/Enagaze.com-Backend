@@ -219,12 +219,12 @@ app.use("/api/v1/users", userRoutes);
 app.get("/api/v1/app-version", (req, res) => {
   res.status(200).json({
     success: true,
-    latestVersion: process.env.APP_LATEST_VERSION || "1.0.0",
-    latestVersionCode: parseInt(process.env.APP_LATEST_VERSION_CODE || "1", 10),
+    latestVersion: process.env.APP_LATEST_VERSION || "1.0.1",
+    latestVersionCode: parseInt(process.env.APP_LATEST_VERSION_CODE || "2", 10),
     minSupportedVersion: process.env.APP_MIN_VERSION || "1.0.0",
     minSupportedVersionCode: parseInt(process.env.APP_MIN_VERSION_CODE || "1", 10),
     apkDownloadUrl: process.env.APP_APK_DOWNLOAD_URL || "https://github.com/CrysPy-SAM/Engaze.com-frontend/releases/latest/download/Engaze.apk",
-    releaseNotes: process.env.APP_RELEASE_NOTES || "Latest performance improvements, responsive mobile layout, and Google authentication.",
+    releaseNotes: process.env.APP_RELEASE_NOTES || "Lands directly on Discover page after login, smooth animations & Google login fixes.",
     forceUpdate: process.env.APP_FORCE_UPDATE === "true",
   });
 });
