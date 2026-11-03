@@ -223,7 +223,7 @@ app.get("/api/v1/app-version", (req, res) => {
     latestVersionCode: parseInt(process.env.APP_LATEST_VERSION_CODE || "1", 10),
     minSupportedVersion: process.env.APP_MIN_VERSION || "1.0.0",
     minSupportedVersionCode: parseInt(process.env.APP_MIN_VERSION_CODE || "1", 10),
-    apkDownloadUrl: process.env.APP_APK_DOWNLOAD_URL || "https://github.com/CrysPy-SAM/Engaze.com-frontend/releases/latest",
+    apkDownloadUrl: process.env.APP_APK_DOWNLOAD_URL || "https://github.com/CrysPy-SAM/Engaze.com-frontend/releases/latest/download/Engaze.apk",
     releaseNotes: process.env.APP_RELEASE_NOTES || "Latest performance improvements, responsive mobile layout, and Google authentication.",
     forceUpdate: process.env.APP_FORCE_UPDATE === "true",
   });
