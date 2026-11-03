@@ -214,6 +214,20 @@ app.use((req, res, next) => {
 app.use("/api/v1", globalApiLimiter);
 
 app.use("/api/v1/users", userRoutes);
+
+// App Version & In-App Update Manifest endpoint
+app.get("/api/v1/app-version", (req, res) => {
+  res.status(200).json({
+    success: true,
+    latestVersion: process.env.APP_LATEST_VERSION || "1.0.0",
+    latestVersionCode: parseInt(process.env.APP_LATEST_VERSION_CODE || "1", 10),
+    minSupportedVersion: process.env.APP_MIN_VERSION || "1.0.0",
+    minSupportedVersionCode: parseInt(process.env.APP_MIN_VERSION_CODE || "1", 10),
+    apkDownloadUrl: process.env.APP_APK_DOWNLOAD_URL || "https://github.com/CrysPy-SAM/Engaze.com-frontend/releases/latest",
+    releaseNotes: process.env.APP_RELEASE_NOTES || "Latest performance improvements, responsive mobile layout, and Google authentication.",
+    forceUpdate: process.env.APP_FORCE_UPDATE === "true",
+  });
+});
 app.use("/api/v1/discovery", discoveryRoutes);
 app.use("/api/v1/matches", matchRoutes);
 app.use("/api/v1/conversations", chatRoutes);
