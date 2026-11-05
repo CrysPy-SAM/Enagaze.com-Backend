@@ -35,6 +35,11 @@ import {
     checkSocketRateLimit,
     clearSocketRateLimits,
 } from "../utils/socketValidator.js";
+import {
+    sendIncomingCallPush,
+    sendCallCancelledPush,
+    sendChatMessagePush,
+} from "../services/fcm.service.js";
 
 let ioInstance = null;
 
@@ -617,6 +622,17 @@ export const connectToSocket = (server) => {
                             });
                         })
                         .catch(() => {});
+
+                    // Background push notification via FCM
+                    sendChatMessagePush({
+                        recipientId: otherParticipantId,
+                        sender: callerUser,
+                        content: messageDto.content,
+                        mediaUrl: messageDto.mediaUrl || null,
+                        conversationId,
+                    }).catch((err) => {
+                        console.error("[FCM] Chat push error:", err);
+                    });
                 }
 
                 if (typeof ack === "function") {
@@ -1295,6 +1311,13 @@ export const connectToSocket = (server) => {
 
                         io.to(`user:${call.callerId}`).emit("call:no-answer", { callId, reason: "timeout" });
                         io.to(`user:${call.calleeId}`).emit("call:ended", { callId, reason: "timeout" });
+
+                        // Dismiss incoming call notification / alert missed call on callee device
+                        sendCallCancelledPush({
+                            calleeId: call.calleeId,
+                            callId,
+                            reason: "missed",
+                        }).catch((err) => console.error("[FCM] Call timeout push error:", err));
                     }
                 }, 35000);
 
@@ -1323,6 +1346,15 @@ export const connectToSocket = (server) => {
                     conversationId: conversationId || null,
                     callType,
                 });
+
+                // Dispatch native FCM high-priority push so Android rings in background or swiped-away
+                sendIncomingCallPush({
+                    calleeId,
+                    caller: toPublicProfile(callerUser),
+                    callId,
+                    callType,
+                    conversationId,
+                }).catch((err) => console.error("[FCM] Call initiate push error:", err));
 
                 if (typeof ack === "function") {
                     ack({ success: true, callId });
@@ -1523,10 +1555,22 @@ export const connectToSocket = (server) => {
 
                     const partnerId = targetUserId || (socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId);
                     io.to(`user:${partnerId.toString()}`).emit("call:ended", { callId: activeId, reason: "ended_by_partner" });
+
+                    // Cancel incoming call push if still ringing or alert partner
+                    sendCallCancelledPush({
+                        calleeId: partnerId,
+                        callId: activeId,
+                        reason: "ended_by_partner",
+                    }).catch((err) => console.error("[FCM] Call end push error:", err));
                 }
                 socket.leave(`direct-call:${activeId}`);
             } else if (targetUserId) {
                 io.to(`user:${targetUserId.toString()}`).emit("call:ended", { callId, reason: "ended_by_partner" });
+                sendCallCancelledPush({
+                    calleeId: targetUserId,
+                    callId,
+                    reason: "ended_by_partner",
+                }).catch((err) => console.error("[FCM] Call end push error:", err));
             }
             if (typeof ack === "function") ack({ success: true });
         });
@@ -1551,10 +1595,21 @@ export const connectToSocket = (server) => {
 
                     const partnerId = targetUserId || (socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId);
                     io.to(`user:${partnerId.toString()}`).emit("call:declined", { callId: activeId, reason: "declined_by_partner" });
+
+                    sendCallCancelledPush({
+                        calleeId: partnerId,
+                        callId: activeId,
+                        reason: "declined",
+                    }).catch((err) => console.error("[FCM] Call decline push error:", err));
                 }
                 socket.leave(`direct-call:${activeId}`);
             } else if (targetUserId) {
                 io.to(`user:${targetUserId.toString()}`).emit("call:declined", { callId, reason: "declined_by_partner" });
+                sendCallCancelledPush({
+                    calleeId: targetUserId,
+                    callId,
+                    reason: "declined",
+                }).catch((err) => console.error("[FCM] Call decline push error:", err));
             }
             if (typeof ack === "function") ack({ success: true });
         });
@@ -1596,6 +1651,12 @@ export const connectToSocket = (server) => {
 
                     const otherUserId = socket.userId.toString() === call.callerId.toString() ? call.calleeId : call.callerId;
                     io.to(`user:${otherUserId}`).emit("call:ended", { callId: directCallId, reason: "partner_disconnected" });
+
+                    sendCallCancelledPush({
+                        calleeId: otherUserId,
+                        callId: directCallId,
+                        reason: "partner_disconnected",
+                    }).catch((err) => console.error("[FCM] Disconnect call push error:", err));
                 }
             }
         });
