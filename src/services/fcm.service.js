@@ -1,4 +1,5 @@
-import admin from "firebase-admin";
+import { initializeApp, cert, getApps } from "firebase-admin/app";
+import { getMessaging } from "firebase-admin/messaging";
 import fs from "fs";
 import path from "path";
 import mongoose from "mongoose";
@@ -8,6 +9,17 @@ let fcmApp = null;
 let isInitialized = false;
 
 /**
+ * Normalizes a service account object (e.g. converting escaped \n to real newlines).
+ */
+const prepareServiceAccount = (serviceAccount) => {
+    if (!serviceAccount || typeof serviceAccount !== "object") return serviceAccount;
+    if (typeof serviceAccount.private_key === "string" && serviceAccount.private_key.includes("\\n")) {
+        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+    }
+    return serviceAccount;
+};
+
+/**
  * Initializes Firebase Admin SDK using environment variables or service account file.
  * Fails gracefully without crashing if credentials are not yet configured.
  */
@@ -15,8 +27,9 @@ export const initFirebaseAdmin = () => {
     if (isInitialized) return fcmApp;
 
     try {
-        if (admin.apps && admin.apps.length > 0) {
-            fcmApp = admin.apps[0];
+        const existingApps = getApps();
+        if (existingApps && existingApps.length > 0) {
+            fcmApp = existingApps[0];
             isInitialized = true;
             return fcmApp;
         }
@@ -27,17 +40,30 @@ export const initFirebaseAdmin = () => {
         const envKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
         if (envKey && envKey.trim()) {
             let keyStr = envKey.trim();
+
+            // Strip enclosing quotes if user passed string wrapped in quotes
+            if (
+                (keyStr.startsWith('"') && keyStr.endsWith('"')) ||
+                (keyStr.startsWith("'") && keyStr.endsWith("'"))
+            ) {
+                keyStr = keyStr.slice(1, -1).trim();
+            }
+
             // Handle Base64 encoded JSON
-            if (keyStr.startsWith("ey") && !keyStr.includes("{")) {
+            if (!keyStr.startsWith("{")) {
                 try {
-                    keyStr = Buffer.from(keyStr, "base64").toString("utf-8");
+                    const decoded = Buffer.from(keyStr, "base64").toString("utf-8");
+                    if (decoded.trim().startsWith("{")) {
+                        keyStr = decoded.trim();
+                    }
                 } catch {
                     // Fall back to raw string
                 }
             }
+
             try {
-                const serviceAccount = JSON.parse(keyStr);
-                credential = admin.credential.cert(serviceAccount);
+                const serviceAccount = prepareServiceAccount(JSON.parse(keyStr));
+                credential = cert(serviceAccount);
             } catch (parseErr) {
                 console.error("[FCM] Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY JSON:", parseErr.message);
             }
@@ -56,8 +82,8 @@ export const initFirebaseAdmin = () => {
                 if (fs.existsSync(p)) {
                     try {
                         const fileContent = fs.readFileSync(p, "utf-8");
-                        const serviceAccount = JSON.parse(fileContent);
-                        credential = admin.credential.cert(serviceAccount);
+                        const serviceAccount = prepareServiceAccount(JSON.parse(fileContent));
+                        credential = cert(serviceAccount);
                         console.log(`[FCM] Loaded credentials from file: ${p}`);
                         break;
                     } catch (fileErr) {
@@ -68,7 +94,7 @@ export const initFirebaseAdmin = () => {
         }
 
         if (credential) {
-            fcmApp = admin.initializeApp({ credential });
+            fcmApp = initializeApp({ credential });
             isInitialized = true;
             console.log("[FCM] Firebase Admin SDK initialized successfully");
         } else {
@@ -154,7 +180,7 @@ export const sendIncomingCallPush = async ({
             return { sentCount: tokens.length, mocked: true };
         }
 
-        const response = await admin.messaging().sendEachForMulticast(payload);
+        const response = await getMessaging(fcmApp).sendEachForMulticast(payload);
         if (response.failureCount > 0) {
             cleanupStaleTokens(tokens, response.responses).catch(() => {});
         }
@@ -199,7 +225,7 @@ export const sendCallCancelledPush = async ({ calleeId, callId, reason = "cancel
             return { sentCount: tokens.length, mocked: true };
         }
 
-        const response = await admin.messaging().sendEachForMulticast(payload);
+        const response = await getMessaging(fcmApp).sendEachForMulticast(payload);
         if (response.failureCount > 0) {
             cleanupStaleTokens(tokens, response.responses).catch(() => {});
         }
@@ -250,7 +276,7 @@ export const sendChatMessagePush = async ({
             return { sentCount: tokens.length, mocked: true };
         }
 
-        const response = await admin.messaging().sendEachForMulticast(payload);
+        const response = await getMessaging(fcmApp).sendEachForMulticast(payload);
         if (response.failureCount > 0) {
             cleanupStaleTokens(tokens, response.responses).catch(() => {});
         }
