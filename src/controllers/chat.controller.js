@@ -9,6 +9,7 @@ import { toPublicProfile, toSenderProfile, toMessageDto } from "../serializers/p
 import { getPresenceForViewer } from "../services/presence.service.js";
 import { checkUserEligibility } from "../services/eligibility.service.js";
 import { safeLean } from "../utils/queryHelper.js";
+import { sendChatMessagePush } from "../services/fcm.service.js";
 
 const isChatDbReady = () => Boolean(mongoose.connection?.readyState === 1 || (Conversation.find && Conversation.find !== mongoose.Model.find));
 
@@ -922,6 +923,23 @@ const sendMessageRest = async (req, res) => {
                 }
             }
             broadcast.emit("chat:new-message", messageDto);
+        }
+
+        // Send background push notification to other participant
+        if (Array.isArray(conversation.participants)) {
+            const otherParticipant = conversation.participants.find(
+                (p) => (p?._id || p).toString() !== req.user._id.toString()
+            );
+            if (otherParticipant) {
+                const recipientId = otherParticipant?._id || otherParticipant;
+                sendChatMessagePush({
+                    recipientId,
+                    sender: req.user,
+                    content: messageDto.content,
+                    mediaUrl: messageDto.mediaUrl || null,
+                    conversationId,
+                }).catch((err) => console.error("[FCM] REST chat push error:", err));
+            }
         }
 
         return res.status(httpStatus.CREATED).json({
