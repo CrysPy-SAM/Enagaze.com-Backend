@@ -17,6 +17,10 @@ import {
     getPublicUserProfile,
 } from "../controllers/userSearch.controller.js";
 import {
+    registerDeviceToken,
+    unregisterDeviceToken,
+} from "../controllers/deviceToken.controller.js";
+import {
     requestUploadUrl,
     confirmUpload,
     removePhoto,
@@ -58,6 +62,11 @@ router.route("/profile/public/:userId")
 router.route("/profile/me")
     .get(protect, getMyProfile)
     .put(protect, updateMyProfile);
+
+// Device push token management
+router.route("/device-token")
+    .post(protect, registerDeviceToken)
+    .delete(protect, unregisterDeviceToken);
 
 // Protected privacy settings endpoints
 router.route("/privacy")
