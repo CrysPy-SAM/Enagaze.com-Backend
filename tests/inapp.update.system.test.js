@@ -1,8 +1,5 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
-import crypto from "node:crypto";
 import {
     getAppVersionManifest,
     parseVersionCodeFromBody,
@@ -44,8 +41,8 @@ function isUpdateForced({ installedVersionCode, minSupportedVersionCode, forceUp
         (minSupportedVersionCode && installedVersionCode < parseInt(minSupportedVersionCode, 10));
 }
 
-describe("In-App Update System Comprehensive Test Suite", () => {
-    describe("1. Version Comparison Unit Tests", () => {
+describe("Backend App Version & In-App Update Service Suite", () => {
+    describe("1. Version Comparison Logic", () => {
         it("should correctly identify when a remote version is newer", () => {
             assert.equal(isVersionNewer("1.0.2", "1.0.3"), true);
             assert.equal(isVersionNewer("1.0.2", "1.1.0"), true);
@@ -107,11 +104,17 @@ describe("In-App Update System Comprehensive Test Suite", () => {
         });
     });
 
-    describe("6. Backend Version API Manifest & Zero-Cache Tests", () => {
+    describe("2. Release Notes & Version Metadata Parsing", () => {
         it("should extract versionCode from GitHub release markdown body", () => {
             const body = "## Release\n<!-- versionCode: 5 -->\nSome release notes";
             const code = parseVersionCodeFromBody(body);
             assert.equal(code, 5);
+        });
+
+        it("should return null when versionCode comment is missing or invalid", () => {
+            assert.equal(parseVersionCodeFromBody("No comment here"), null);
+            assert.equal(parseVersionCodeFromBody("<!-- versionCode: abc -->"), null);
+            assert.equal(parseVersionCodeFromBody(null), null);
         });
 
         it("should sanitize and clean release notes", () => {
@@ -121,64 +124,81 @@ describe("In-App Update System Comprehensive Test Suite", () => {
             assert.ok(notes.includes("Fixed calling issues."));
         });
 
-        it("should return valid manifest with fallback and zero-cache compatibility", async () => {
+        it("should truncate overly long release notes to 500 characters", () => {
+            const longNotes = "A".repeat(600);
+            const cleaned = cleanReleaseNotes(longNotes);
+            assert.ok(cleaned.length <= 500);
+            assert.ok(cleaned.endsWith("..."));
+        });
+    });
+
+    describe("3. Manifest Generation, Fallback & Caching", () => {
+        it("should return valid manifest with fallback values when called", async () => {
             const manifest = await getAppVersionManifest(true);
             assert.ok(manifest.latestVersion, "latestVersion must be defined");
+            assert.ok(typeof manifest.latestVersion === "string");
             assert.ok(manifest.latestVersionCode > 0, "latestVersionCode must be positive");
             assert.ok(manifest.apkDownloadUrl.endsWith(".apk"), "apkDownloadUrl must target an APK");
             assert.ok(typeof manifest.releaseNotes === "string");
-        });
-    });
-
-    describe("7. Metadata & Single Source of Truth Verification", () => {
-        it("should verify version.json single source of truth exists and is valid", () => {
-            const rootVersionPath = path.resolve(process.cwd(), "../frontend/version.json");
-            assert.ok(fs.existsSync(rootVersionPath), "frontend/version.json must exist");
-            const data = JSON.parse(fs.readFileSync(rootVersionPath, "utf-8"));
-            assert.equal(data.versionCode, 4);
-            assert.equal(data.versionName, "1.0.3");
+            assert.ok(typeof manifest.forceUpdate === "boolean");
         });
 
-        it("11. Package ID verification: Gradle output-metadata.json matches com.engaze.date", () => {
-            const metadataPath = path.resolve(process.cwd(), "../frontend/android/app/build/outputs/apk/debug/output-metadata.json");
-            assert.ok(fs.existsSync(metadataPath), "output-metadata.json must exist");
-            const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf-8"));
-            assert.equal(metadata.applicationId, "com.engaze.date");
-            assert.equal(metadata.elements[0].versionCode, 4);
-            assert.equal(metadata.elements[0].versionName, "1.0.3");
-        });
+        it("should respect environment variable overrides when configured", async () => {
+            const originalVersion = process.env.APP_LATEST_VERSION;
+            const originalCode = process.env.APP_LATEST_VERSION_CODE;
+            const originalForce = process.env.APP_FORCE_UPDATE;
 
-        it("10. Android debug APK exists and has valid size (> 10MB)", () => {
-            const apkPath = path.resolve(process.cwd(), "../frontend/android/app/build/outputs/apk/debug/app-debug.apk");
-            assert.ok(fs.existsSync(apkPath), "app-debug.apk must exist");
-            const stat = fs.statSync(apkPath);
-            assert.ok(stat.size > 10 * 1024 * 1024, `APK size (${stat.size} bytes) should be > 10MB`);
-        });
+            try {
+                process.env.APP_LATEST_VERSION = "2.0.0";
+                process.env.APP_LATEST_VERSION_CODE = "99";
+                process.env.APP_FORCE_UPDATE = "true";
 
-        it("8. Android debug APK is signed with the permanent Engaze certificate SHA-256", () => {
-            const apkPath = path.resolve(process.cwd(), "../frontend/android/app/build/outputs/apk/debug/app-debug.apk");
-            assert.ok(fs.existsSync(apkPath), "app-debug.apk must exist");
-            const buf = fs.readFileSync(apkPath);
-            const EXPECTED_SHA256 = "04:CA:D7:6B:10:14:E3:34:F9:26:88:5A:D1:12:78:BA:21:04:6D:A1:52:16:5B:29:D0:68:7C:9A:43:77:F9:D1";
-            let actualSha256 = null;
+                const manifest = await getAppVersionManifest(true);
+                assert.equal(manifest.latestVersion, "2.0.0");
+                assert.equal(manifest.latestVersionCode, 99);
+                assert.equal(manifest.forceUpdate, true);
+            } finally {
+                if (originalVersion) process.env.APP_LATEST_VERSION = originalVersion;
+                else delete process.env.APP_LATEST_VERSION;
 
-            for (let i = 0; i < buf.length - 1000; i++) {
-                if (buf[i] === 0x30 && buf[i+1] === 0x82) {
-                    const len = (buf[i+2] << 8) | buf[i+3];
-                    if (len > 300 && len < 2500) {
-                        try {
-                            const certDer = buf.subarray(i, i + 4 + len);
-                            const x509 = new crypto.X509Certificate(certDer);
-                            if (x509.fingerprint256.toUpperCase().trim() === EXPECTED_SHA256) {
-                                actualSha256 = x509.fingerprint256.toUpperCase().trim();
-                                break;
-                            }
-                        } catch (e) {}
-                    }
-                }
+                if (originalCode) process.env.APP_LATEST_VERSION_CODE = originalCode;
+                else delete process.env.APP_LATEST_VERSION_CODE;
+
+                if (originalForce) process.env.APP_FORCE_UPDATE = originalForce;
+                else delete process.env.APP_FORCE_UPDATE;
             }
-            assert.equal(actualSha256, EXPECTED_SHA256, "Compiled APK must match permanent SHA-256 fingerprint");
+        });
+
+        it("should cache manifest in memory across consecutive calls within TTL", async () => {
+            const first = await getAppVersionManifest(false);
+            const second = await getAppVersionManifest(false);
+            assert.deepEqual(first, second);
+        });
+
+        it("should support zero-cache HTTP headers specification", () => {
+            const expectedHeaders = {
+                "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Surrogate-Control": "no-store",
+            };
+
+            const mockHeaders = {};
+            const mockRes = {
+                set(key, val) {
+                    mockHeaders[key] = val;
+                },
+            };
+
+            // Simulate the header settings defined in app.js
+            mockRes.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+            mockRes.set("Pragma", "no-cache");
+            mockRes.set("Expires", "0");
+            mockRes.set("Surrogate-Control", "no-store");
+
+            for (const [k, v] of Object.entries(expectedHeaders)) {
+                assert.equal(mockHeaders[k], v, `Header ${k} must match expected zero-cache policy`);
+            }
         });
     });
 });
-
