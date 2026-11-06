@@ -263,6 +263,7 @@ export const sendChatMessagePush = async ({
                 conversationId: String(conversationId),
                 senderId: String(sender?._id || sender?.id || ""),
                 senderName: String(senderName),
+                senderPhoto: String(sender?.photos?.[0] || sender?.photo || ""),
                 content: String(messageText),
                 timestamp: String(Date.now()),
             },
