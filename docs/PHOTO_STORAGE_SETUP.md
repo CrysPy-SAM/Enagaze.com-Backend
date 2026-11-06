@@ -65,9 +65,16 @@ Configure these environment variables in your deployment environment (e.g. Rende
      ```json
      [
        {
-         "AllowedHeaders": ["content-type"],
-         "AllowedMethods": ["PUT"],
-         "AllowedOrigins": ["https://engaze.com", "https://engaze-com.vercel.app"],
+         "AllowedHeaders": ["*"],
+         "AllowedMethods": ["PUT", "GET", "HEAD"],
+         "AllowedOrigins": [
+           "https://www.engaze.date",
+           "https://engaze.date",
+           "https://engaze-com.vercel.app",
+           "https://localhost",
+           "capacitor://localhost",
+           "http://localhost"
+         ],
          "ExposeHeaders": ["ETag"],
          "MaxAgeSeconds": 3600
        }
@@ -104,9 +111,16 @@ Configure these environment variables in your deployment environment (e.g. Rende
      ```json
      [
        {
-         "AllowedOrigins": ["https://engaze.com", "https://engaze-com.vercel.app"],
-         "AllowedMethods": ["PUT"],
-         "AllowedHeaders": ["content-type"],
+         "AllowedOrigins": [
+           "https://www.engaze.date",
+           "https://engaze.date",
+           "https://engaze-com.vercel.app",
+           "https://localhost",
+           "capacitor://localhost",
+           "http://localhost"
+         ],
+         "AllowedMethods": ["PUT", "GET", "HEAD"],
+         "AllowedHeaders": ["*"],
          "ExposeHeaders": ["ETag"],
          "MaxAgeSeconds": 3600
        }
