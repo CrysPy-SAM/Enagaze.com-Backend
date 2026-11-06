@@ -17,6 +17,7 @@ import moderationRoutes from "./routes/moderation.routes.js";
 import webrtcRoutes from "./routes/webrtc.routes.js";
 import notificationRoutes from "./routes/notification.routes.js";
 import callRoutes from "./routes/call.routes.js";
+import { getAppVersionManifest } from "./services/appVersion.service.js";
 import { backfillLegacyUsers } from "../scripts/backfillUsernames.js";
 import { validateJwtConfig } from "./config/jwt.js";
 import { getMongoConnectionOptions } from "./config/database.js";
@@ -216,17 +217,30 @@ app.use("/api/v1", globalApiLimiter);
 app.use("/api/v1/users", userRoutes);
 
 // App Version & In-App Update Manifest endpoint
-app.get("/api/v1/app-version", (req, res) => {
-  res.status(200).json({
-    success: true,
-    latestVersion: process.env.APP_LATEST_VERSION || "1.0.2",
-    latestVersionCode: parseInt(process.env.APP_LATEST_VERSION_CODE || "3", 10),
-    minSupportedVersion: process.env.APP_MIN_VERSION || "1.0.0",
-    minSupportedVersionCode: parseInt(process.env.APP_MIN_VERSION_CODE || "1", 10),
-    apkDownloadUrl: process.env.APP_APK_DOWNLOAD_URL || "https://github.com/CrysPy-SAM/Engaze.com-frontend/releases/latest/download/Engaze.apk",
-    releaseNotes: process.env.APP_RELEASE_NOTES || "Native call ringtone & message notifications, discover landing after login.",
-    forceUpdate: process.env.APP_FORCE_UPDATE === "true",
-  });
+app.get("/api/v1/app-version", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.set("Surrogate-Control", "no-store");
+
+  try {
+    const manifest = await getAppVersionManifest();
+    res.status(200).json({
+      success: true,
+      ...manifest,
+    });
+  } catch (err) {
+    res.status(200).json({
+      success: true,
+      latestVersion: process.env.APP_LATEST_VERSION || "1.0.3",
+      latestVersionCode: parseInt(process.env.APP_LATEST_VERSION_CODE || "4", 10),
+      minSupportedVersion: process.env.APP_MIN_VERSION || "1.0.0",
+      minSupportedVersionCode: parseInt(process.env.APP_MIN_VERSION_CODE || "1", 10),
+      apkDownloadUrl: process.env.APP_APK_DOWNLOAD_URL || "https://github.com/CrysPy-SAM/Engaze.com-frontend/releases/latest/download/Engaze.apk",
+      releaseNotes: process.env.APP_RELEASE_NOTES || "WhatsApp-style call and message push notifications, custom brand icon, and performance improvements.",
+      forceUpdate: process.env.APP_FORCE_UPDATE === "true",
+    });
+  }
 });
 app.use("/api/v1/discovery", discoveryRoutes);
 app.use("/api/v1/matches", matchRoutes);
